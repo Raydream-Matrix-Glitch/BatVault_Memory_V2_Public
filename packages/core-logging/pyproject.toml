@@ -1,0 +1,10 @@
+[project]
+name = "core-logging"
+version = "0.1.0"
+description = "Structured logging utilities"
+requires-python = ">=3.11"
+dependencies = ["orjson>=3.9.7"]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

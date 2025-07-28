@@ -1,0 +1,29 @@
+# Base Python image for services
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl build-essential && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -ms /bin/bash appuser
+WORKDIR /app
+
+# Copy shared packages first for layer caching
+COPY packages /app/packages
+
+# Install service deps from pyproject
+# Each service will copy its own pyproject.toml before this step during build context;
+# we install shared editable packages and then the service.
+RUN pip install --no-cache-dir -U pip wheel setuptools
+
+# Install shared packages editable
+RUN pip install --no-cache-dir -e /app/packages/core-config \
+    -e /app/packages/core-logging \
+    -e /app/packages/core-models \
+    -e /app/packages/core-utils
+
+# Service files added by build context (see compose)
+COPY services /app/services
+
+# The service build contexts override CMD
+USER appuser

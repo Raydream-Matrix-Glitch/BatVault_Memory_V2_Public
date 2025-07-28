@@ -1,0 +1,25 @@
+[project]
+name = "api-edge"
+version = "0.1.0"
+description = "API Edge service"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.112.0",
+  "uvicorn[standard]>=0.29.0",
+  "httpx>=0.27.0",
+  "redis>=5.0.3",
+  "pydantic>=2.7.0",
+  "orjson>=3.9.7",
+  "python-arango>=7.9.1",
+  "minio>=7.2.7",
+  "core-config @ file:///app/packages/core-config",
+  "core-logging @ file:///app/packages/core-logging",
+  "core-models @ file:///app/packages/core-models",
+  "core-utils @ file:///app/packages/core-utils",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+pythonpath = [".", "src"]
