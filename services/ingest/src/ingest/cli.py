@@ -11,6 +11,13 @@ from .catalog.field_catalog import build_field_catalog, build_relation_catalog
 logger = get_logger("ingest-cli")
 settings = get_settings()
 
+# ------------------------------------------------------------------
+#  Public regex constants needed by the contract-tests
+# ------------------------------------------------------------------
+
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,}[a-z0-9]$")
+TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$")
+
 # ---------- Alias map (extend as needed) ----------
 ALIASES = {
     "id": ["id", "_id", "key"],

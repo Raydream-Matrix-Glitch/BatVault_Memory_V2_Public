@@ -21,6 +21,11 @@ def build_field_catalog(decisions: Dict, events: Dict, transitions: Dict) -> Dic
     core = ["id", "timestamp", "supported_by", "led_to", "transitions", "based_on", "tags", "from", "to", "relation", "snippet", "description", "decision_maker"]
     for k in core:
         catalog.setdefault(k, [k])
+    # Promote previously unseen canonical fields so that every
+    # observed key is surfaced as <canonical>: [<synonyms…>].
+    for canon, syns in observed.items():
+        if canon not in catalog:
+            catalog[canon] = sorted(syns)
     return catalog
 
 def build_relation_catalog() -> list[str]:

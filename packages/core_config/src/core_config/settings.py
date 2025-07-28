@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     minio_region: str = Field(default="us-east-1", alias="MINIO_REGION")
     minio_retention_days: int = Field(default=14, alias="MINIO_RETENTION_DAYS")
     minio_secure: bool = Field(default=False, alias="MINIO_SECURE")
+    memory_api_url: str = Field(
+        default="http://memory_api:8000", alias="MEMORY_API_URL"
+    )
 
     # LLM / embeddings
     llm_mode: str = Field(default="off", alias="LLM_MODE")

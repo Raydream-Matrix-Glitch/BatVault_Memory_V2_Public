@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir \
     -e /app/packages/core_config \
     -e /app/packages/core_logging \
     -e /app/packages/core_models \
-    -e /app/packages/core_utils
+    -e /app/packages/core_utils \
     -e /app/packages/core_storage
 
 # Now copy service code — this step comes after shared installs to preserve cache

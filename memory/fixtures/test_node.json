@@ -1,0 +1,346 @@
+{
+"events": \[
+{
+"id": "phil-e1",
+"summary": "TV division loss forecast narrows but margins still negative",
+"description": "At a Dec 1 2010 analyst day Philips said its TV business would lose €60-90 m in 2010 on \~€3 bn revenue, implying an adjusted EBITA margin of −2 % to −3 %.",
+"timestamp": "2010-12-01T14:03:00Z",
+"tags": \["market\_analysis", "margin\_warning"],
+"kpis": \[
+{"name": "Adjusted EBITA Margin (TV)", "value": -2.5, "unit": "%", "timestamp": "2010-12-01T14:03:00Z"},
+{"name": "Forecast Loss (mid-point)", "value": 75, "unit": "million EUR", "timestamp": "2010-12-01T14:03:00Z"}
+],
+"led\_to": \["philips-exit-tv-2011"],
+"snippet": "TV unit margin −2 % to −3 %; €60–90 m loss.",
+"x-extra": {}
+},
+{
+"id": "phil-e2",
+"summary": "Samsung and LG surpass 40% global TV share",
+"description": "Market share data showed Samsung and LG jointly captured over 40 % of global TV shipments, signaling dominance by scale players.",
+"timestamp": "2011-03-25T11:00:00Z",
+"tags": \["competitive\_pressure", "market\_share"],
+"led\_to": \["philips-exit-tv-2011"],
+"snippet": "Samsung & LG take 40 %+ share.",
+"x-extra": {}
+},
+{
+"id": "phil-e3",
+"summary": "LED component costs fall 60% since 2009",
+"description": "Internal supply‑chain analysis showed LED package costs had decreased by 60 % between 2009 and 2013, improving gross margins.",
+"timestamp": "2013-03-01T08:00:00Z",
+"tags": \["cost\_reduction", "technology"],
+"led\_to": \["philips-healthtech-focus-2014"],
+"snippet": "Component costs down 60 %.",
+"x-extra": {}
+},
+{
+"id": "phil-e4",
+"summary": "EU energy directives boost LED demand",
+"description": "The EU announced phase‑outs for halogen bulbs by 2016, accelerating commercial adoption of LED lighting solutions.",
+"timestamp": "2013-04-10T10:15:00Z",
+"tags": \["regulation", "demand\_signal"],
+"led\_to": \["philips-healthtech-focus-2014"],
+"snippet": "EU to phase‑out halogens.",
+"x-extra": {}
+},
+{
+"id": "phil-e5",
+"summary": "Lighting sales slip 1 % YoY; EBITA margin 9.7 %",
+"description": "Q3 2014 results showed Lighting comparable sales −1 % YoY despite LED +28 %; adjusted EBITA margin hit 9.7 %.",
+"timestamp": "2014-10-31T13:39:00Z",
+"tags": \["revenue\_trend", "competitive\_pressure"],
+"kpis": \[
+{"name": "Comparable Sales Growth", "value": -1, "unit": "%", "timestamp": "2014-10-31T13:39:00Z"},
+{"name": "Adjusted EBITA Margin", "value": 9.7, "unit": "%", "timestamp": "2014-10-31T13:39:00Z"}
+],
+"led\_to": \["philips-lighting-split-2014"],
+"snippet": "Lighting −1 % YoY; LED +28 %. EBITA 9.7 %.",
+"x-extra": {}
+},
+{
+"id": "phil-e6",
+"summary": "Equity analysts highlight conglomerate discount",
+"description": "Investment banks issued reports valuing Philips higher on a sum‑of‑the‑parts basis if lighting were separated.",
+"timestamp": "2014-11-15T13:20:00Z",
+"tags": \["equity\_analyst", "valuation"],
+"led\_to": \["philips-lighting-split-2014"],
+"snippet": "Analysts see sum‑of‑parts upside.",
+"x-extra": {}
+},
+{
+"id": "phil-e7",
+"summary": "Healthcare segment outperforms in Q2 2018",
+"description": "Philips' Q2 2018 earnings showed the health technology segment grew revenues by 12 %, outpacing legacy units.",
+"timestamp": "2018-07-25T07:30:00Z",
+"tags": \["earnings", "segment\_growth"],
+"led\_to": \["philips-healthtech-focus-2014"],
+"snippet": "Health‑tech up 12 % QoQ.",
+"x-extra": {}
+},
+{
+"id": "phil-e8",
+"summary": "Analysts initiate coverage on Philips as health‑tech pure play",
+"description": "Several brokerages upgraded Philips to 'buy' following the spin‑off, citing strong health‑tech market fundamentals.",
+"timestamp": "2018-08-20T11:00:00Z",
+"tags": \["analyst\_upgrade", "positioning"],
+"led\_to": \["philips-invest-mri-2020"],
+"snippet": "Initiate 'buy' on health‑tech focus.",
+"x-extra": {}
+},
+{
+"id": "phil-e9",
+"summary": "Breakthrough superconducting magnet research published",
+"description": "Philips R\&D team published a paper showing a 20 % resolution gain in ultra‑high‑field MRI magnets.",
+"timestamp": "2020-01-15T14:00:00Z",
+"tags": \["research", "innovation"],
+"led\_to": \["philips-invest-mri-2020"],
+"snippet": "20 % better MRI resolution.",
+"x-extra": {}
+},
+{
+"id": "phil-e10",
+"summary": "WHO projects 30 % rise in MRI demand by 2025",
+"description": "A WHO demographic report forecasted a 30 % increase in MRI utilization in OECD countries over five years.",
+"timestamp": "2019-11-20T10:00:00Z",
+"tags": \["forecast", "healthcare\_trends"],
+"led\_to": \["philips-invest-mri-2020"],
+"snippet": "MRI demand set to jump.",
+"x-extra": {}
+},
+{
+"id": "pan-e1",
+"summary": "Tesla Roadster launch proves EV viability",
+"description": "The December 2009 launch of the Tesla Roadster demonstrated electric cars could match performance of ICE vehicles.",
+"timestamp": "2009-12-17T09:00:00Z",
+"tags": \["market\_validation", "ev\_trend"],
+"led\_to": \["panasonic-tesla-battery-partnership-2010"],
+"snippet": "Roadster hits 0–60 mph in 3.7 s.",
+"x-extra": {}
+},
+{
+"id": "pan-e2",
+"summary": "Panasonic unveils next-gen 18650 cell",
+"description": "Panasonic demonstrated a new 18650 lithium‑ion cell with 15 % higher energy density at CES 2010.",
+"timestamp": "2010-01-05T11:00:00Z",
+"tags": \["technology\_demo", "battery\_r\&d"],
+"led\_to": \["panasonic-tesla-battery-partnership-2010"],
+"snippet": "15 % boost in cell capacity.",
+"x-extra": {}
+},
+{
+"id": "pan-e3",
+"summary": "TV business posts \$913 m operating loss",
+"description": "Ahead of its plasma exit Panasonic disclosed its TV division lost about \$913 m in the prior FY—one driver behind shuttering the business.",
+"timestamp": "2013-10-09T00:00:00Z",
+"tags": \["earnings\_alert", "loss\_mitigation"],
+"kpis": \[
+{"name": "Operating Loss (TV)", "value": 913, "unit": "million USD", "timestamp": "2013-10-09T00:00:00Z"}
+],
+"led\_to": \["panasonic-exit-plasma-2013"],
+"snippet": "Plasma unit −\$913 m op.loss.",
+"x-extra": {}
+},
+{
+"id": "pan-e4",
+"summary": "Board approves AU Automotive acquisition",
+"description": "In April 2014, Panasonic's board green-lit the €1.2 bn purchase of AU Automotive.",
+"timestamp": "2014-04-01T14:00:00Z",
+"tags": \["m\&a", "automotive\_electronics"],
+"led\_to": \["panasonic-automotive-infotainment-acquisition-2014"],
+"snippet": "€1.2 bn for AU Automotive.",
+"x-extra": {}
+},
+{
+"id": "pan-e5",
+"summary": "EU clears AU Automotive deal",
+"description": "EU regulators gave antitrust approval for Panasonic’s AU Automotive acquisition in July 2014.",
+"timestamp": "2014-07-20T12:00:00Z",
+"tags": \["regulatory", "deal\_closure"],
+"led\_to": \["panasonic-automotive-infotainment-acquisition-2014"],
+"snippet": "Regulatory sign-off received.",
+"x-extra": {}
+},
+{
+"id": "pan-e6",
+"summary": "Tesla investor day signals cell demand surge",
+"description": "At Tesla’s June 2017 Investor Day, management forecasted a doubling of battery cell needs by 2020.",
+"timestamp": "2017-06-15T09:30:00Z",
+"tags": \["partner\_update", "capacity\_planning"],
+"led\_to": \["panasonic-ev-battery-gigafactory-2017"],
+"snippet": "Cell demand to double by 2020.",
+"x-extra": {}
+},
+{
+"id": "pan-e7",
+"summary": "Panasonic board approves ₿500 m battery capex",
+"description": "In May 2017, Panasonic earmarked \$500 m for new EV cell production capacity.",
+"timestamp": "2017-05-10T15:00:00Z",
+"tags": \["capex", "production\_scale"],
+"led\_to": \["panasonic-ev-battery-gigafactory-2017"],
+"snippet": "\$500 m for new cell lines.",
+"x-extra": {}
+},
+{
+"id": "pan-e8",
+"summary": "AI supply-chain pilot cuts inventory 15%",
+"description": "A March 2019 pilot of Panasonic’s AI platform yielded a 15 % reduction in warehoused stock.",
+"timestamp": "2019-03-22T08:00:00Z",
+"tags": \["pilot", "ai\_optimization"],
+"led\_to": \["panasonic-ai-supply-chain-2019"],
+"snippet": "Inventory down 15 %.",
+"x-extra": {}
+},
+{
+"id": "pan-e9",
+"summary": "Gartner names digital supply-chain top trend",
+"description": "In August 2019, Gartner identified AI-driven supply chains as the #1 digital priority for manufacturing.",
+"timestamp": "2019-08-22T10:00:00Z",
+"tags": \["industry\_trend", "digital\_transformation"],
+"led\_to": \["panasonic-ai-supply-chain-2019"],
+"snippet": "Supply-chain AI is #1 trend.",
+"x-extra": {}
+}
+],
+"decisions": \[
+{
+"id": "philips-exit-tv-2011",
+"option": "Exit television manufacturing",
+"rationale": "Philips sells a majority stake in its HDTV business to TPV Technology, marking its strategic withdrawal from consumer-electronics TV manufacturing.",
+"timestamp": "2011-04-18T00:00:00Z",
+"decision\_maker": "Frans van Houten",
+"tags": \["portfolio\_shift","consumer\_exit"],
+"supported\_by": \["phil-e1","phil-e2"],
+"based\_on": \[],
+"transitions": \["trans-phil-2011-2014"],
+"deltas": \[
+{"metric": "Adjusted EBITA Margin gap vs Vision-2010 target", "change": -12, "unit": "percentage\_points", "baseline": "Group target ≥10 %"}
+],
+"x-extra": {}
+},
+{
+"id": "philips-lighting-split-2014",
+"option": "Split off lighting business",
+"rationale": "Philips announces the break-up of its 120-year-old company into two entities—standalone lighting and combined healthcare/consumer—so each can pursue distinct capital and growth strategies.",
+"timestamp": "2014-09-23T06:31:00Z",
+"decision\_maker": "Frans van Houten",
+"tags": \["corporate\_restructuring","spin\_off"],
+"supported\_by": \["phil-e3","phil-e4","phil-e5","phil-e6"],
+"based\_on": \["philips-exit-tv-2011"],
+"transitions": \["trans-phil-2011-2014","trans-phil-2014-2016"],
+"deltas": \[
+{"metric": "Lighting Comparable Sales Growth YoY", "change": -1, "unit": "%", "baseline": "Q3 2013"}
+],
+"x-extra": {}
+},
+{
+"id": "philips-spin-off-lighting-2016",
+"option": "Demerge lighting division as Philips Lighting N.V.",
+"rationale": "Completing the 2014 plan, Philips floats 25 % of its lighting arm in an IPO—unlocking €3.4 bn in value and cementing its pure-play HealthTech focus.",
+"timestamp": "2016-05-03T00:00:00Z",
+"decision\_maker": "Frans van Houten",
+"tags": \["ipo","value\_unlock"],
+"supported\_by": \["phil-e5","phil-e6"],
+"based\_on": \["philips-lighting-split-2014"],
+"transitions": \["trans-phil-2014-2016","trans-phil-2016-2018"],
+"x-extra": {}
+},
+{
+"id": "philips-healthtech-focus-2014",
+"option": "Establish HealthTech pure-play",
+"rationale": "Alongside the lighting spin-off, Philips merges its healthcare and consumer-lifestyle operations into a stand-alone HealthTech business to capture higher multiples.",
+"timestamp": "2014-09-23T11:10:00Z",
+"decision\_maker": "Frans van Houten",
+"tags": \["strategic\_focus","branding"],
+"supported\_by": \["phil-e3","phil-e7","phil-e8"],
+"based\_on": \["philips-lighting-split-2014"],
+"transitions": \["trans-phil-2014-2016","trans-phil-2016-2018"],
+"x-extra": {}
+},
+{
+"id": "philips-invest-mri-2020",
+"option": "Invest in next-generation MRI technology",
+"rationale": "Philips launches a €500 m R\&D program for its ultra‑high‑field, helium-free MRI platform following promising early demonstrations and rising clinical demand.",
+"timestamp": "2020-01-15T14:00:00Z",
+"decision\_maker": "Roy Jakobs",
+"tags": \["rd\_investment","health\_tech"],
+"supported\_by": \["phil-e9","phil-e10"],
+"based\_on": \["philips-healthtech-focus-2014"],
+"transitions": \["trans-phil-2018-2020"],
+"x-extra": {}
+},
+{
+"id": "panasonic-tesla-battery-partnership-2010",
+"option": "Partner with Tesla for EV batteries",
+"rationale": "Panasonic and Tesla announce a multi-year collaboration to co-develop nickel-based lithium-ion cells tailored for electric vehicles.",
+"timestamp": "2010-01-07T00:00:00Z",
+"decision\_maker": "Fumio Ohtsubo",
+"tags": \["strategic\_alliance","ev\_batteries"],
+"supported\_by": \["pan-e1","pan-e2"],
+"based\_on": \[],
+"transitions": \["trans-pan-2010-2012"],
+"x-extra": {}
+},
+{
+"id": "panasonic-exit-plasma-2013",
+"option": "Exit plasma TV business",
+"rationale": "Panasonic commits to shutter its loss-making plasma-panel operations by end-of-March 2014, reallocating resources to higher-margin electronics.",
+"timestamp": "2013-10-09T00:00:00Z",
+"decision\_maker": "Kazuhiro Tsuga",
+"tags": \["portfolio\_rationalization","loss\_mitigation"],
+"supported\_by": \["pan-e3"],
+"based\_on": \["panasonic-tesla-battery-partnership-2010"],
+"transitions": \["trans-pan-2010-2012","trans-pan-2012-2014"],
+"deltas": \[
+{"metric": "Operating Profit Δ YoY", "change": -913, "unit": "million USD", "baseline": "prior FY"}
+],
+"x-extra": {}
+},
+{
+"id": "panasonic-automotive-infotainment-acquisition-2014",
+"option": "Acquire AU Automotive for infotainment",
+"rationale": "Panasonic buys AU Automotive to bolster its in-vehicle electronics lineup and capture synergies with its growing EV-battery business.",
+"timestamp": "2014-08-12T13:00:00Z",
+"decision\_maker": "Kazuhiro Tsuga",
+"tags": \["m\_and\_a","automotive\_electronics"],
+"supported\_by": \["pan-e4","pan-e5"],
+"based\_on": \["panasonic-exit-plasma-2013"],
+"transitions": \["trans-pan-2012-2014","trans-pan-2014-2017"],
+"x-extra": {}
+},
+{
+"id": "panasonic-ev-battery-gigafactory-2017",
+"option": "Invest in Gigafactory EV battery plant",
+"rationale": "Panasonic commits capital to scale cell output at Tesla’s Nevada Gigafactory, targeting cost-parity with ICE by 2020.",
+"timestamp": "2017-07-29T11:00:00Z",
+"decision\_maker": "Kazuhiro Tsuga",
+"tags": \["capacity\_expansion","ev\_batteries"],
+"supported\_by": \["pan-e6","pan-e7"],
+"based\_on": \["panasonic-automotive-infotainment-acquisition-2014"],
+"transitions": \["trans-pan-2014-2017","trans-pan-2017-2019"],
+"x-extra": {}
+},
+{
+"id": "panasonic-ai-supply-chain-2019",
+"option": "Implement AI-driven digital supply-chain platform",
+"rationale": "A March 2019 pilot shows 15 % inventory reduction; Panasonic rolls out AI across global supply to boost responsiveness to EV demand swings.",
+"timestamp": "2019-03-22T08:00:00Z",
+"decision\_maker": "Yuki Kusumi",
+"tags": \["digital\_transformation","supply\_chain"],
+"supported\_by": \["pan-e8","pan-e9"],
+"based\_on": \["panasonic-ev-battery-gigafactory-2017"],
+"transitions": \["trans-pan-2017-2019"],
+"x-extra": {}
+}
+],
+"transitions": \[
+{"id": "trans-phil-2011-2014", "from": "philips-exit-tv-2011", "to": "philips-lighting-split-2014", "reason": "TV divestiture freed capital for Lighting/HealthTech split", "timestamp": "2014-09-23T06:31:00Z", "x-extra": {}},
+{"id": "trans-phil-2014-2016", "from": "philips-lighting-split-2014", "to": "philips-spin-off-lighting-2016", "reason": "Spin-off IPO executed to unlock value", "timestamp": "2016-05-03T00:00:00Z", "x-extra": {}},
+{"id": "trans-phil-2016-2018", "from": "philips-spin-off-lighting-2016", "to": "philips-healthtech-focus-2014", "reason": "Completed separation enabled HealthTech pure-play branding", "timestamp": "2018-09-01T12:00:00Z", "x-extra": {}},
+{"id": "trans-phil-2018-2020", "from": "philips-healthtech-focus-2014", "to": "philips-invest-mri-2020", "reason": "HealthTech focus drove major R\&D investment", "timestamp": "2020-01-15T14:00:00Z", "x-extra": {}},
+{"id": "trans-pan-2010-2012", "from": "panasonic-tesla-battery-partnership-2010", "to": "panasonic-exit-plasma-2013", "reason": "Strategic focus shifted to EV batteries from plasma TVs", "timestamp": "2013-10-09T00:00:00Z", "x-extra": {}},
+{"id": "trans-pan-2013-2014", "from": "panasonic-exit-plasma-2013", "to": "panasonic-automotive-infotainment-acquisition-2014", "reason": "Resources reallocated to automotive electronics M\&A", "timestamp": "2014-08-12T13:00:00Z", "x-extra": {}},
+{"id": "trans-pan-2014-2017", "from": "panasonic-automotive-infotainment-acquisition-2014", "to": "panasonic-ev-battery-gigafactory-2017", "reason": "Synergies with Tesla partnership justified capacity build-out", "timestamp": "2017-07-29T11:00:00Z", "x-extra": {}},
+{"id": "trans-pan-2017-2019", "from": "panasonic-ev-battery-gigafactory-2017", "to": "panasonic-ai-supply-chain-2019", "reason": "Scale-up necessitated digital supply-chain optimization", "timestamp": "2019-03-22T08:00:00Z", "x-extra": {}}
+]
+}

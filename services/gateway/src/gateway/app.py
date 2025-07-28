@@ -1,9 +1,10 @@
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, APIRouter
 from fastapi.responses import JSONResponse
 from minio import Minio
 from minio.error import S3Error
 import redis
+import httpx, orjson
 
 from core_logging import get_logger, log_stage
 from core_config import get_settings
@@ -20,7 +21,58 @@ import time
 
 settings = get_settings()
 logger = get_logger("gateway")
+
+# ------------------------------------------------------------------
+#  Lightweight 60-second read-through cache for schema mirrors
+# ------------------------------------------------------------------
+SCHEMA_CACHE_TTL = 60
+try:
+    _schema_cache = redis.Redis.from_url(
+        settings.redis_url, decode_responses=True
+    )
+except Exception:
+    _schema_cache = None
+
 app = FastAPI(title="BatVault Gateway", version="0.1.0")
+
+router = APIRouter(prefix="/v2")
+
+# ------------------------------------------------------------------#
+#  Read-through mirror of Memory-API field / relation catalogs      #
+# ------------------------------------------------------------------#
+
+@router.get("/schema/{kind}")
+async def schema_mirror(kind: str):
+    if kind not in ("fields", "rels"):
+        raise HTTPException(status_code=404, detail="unknown schema kind")
+
+    cache_key = f"schema:{kind}"
+    if _schema_cache:
+        cached = _schema_cache.get(cache_key)
+        if cached:
+            data, etag = orjson.loads(cached)
+            resp = JSONResponse(content=data)
+            if etag:
+                resp.headers["x-snapshot-etag"] = etag
+            return resp
+
+    url = f"{settings.memory_api_url}/api/schema/{kind}"
+    async with httpx.AsyncClient(timeout=5.0) as c:
+        upstream = await c.get(url)
+    if upstream.status_code != 200:
+        raise HTTPException(status_code=502, detail="memory_api unavailable")
+
+    data = upstream.json()
+    etag = upstream.headers.get("x-snapshot-etag", "")
+    if _schema_cache:
+        _schema_cache.setex(cache_key, SCHEMA_CACHE_TTL, orjson.dumps((data, etag)))
+
+    resp = JSONResponse(content=data)
+    if etag:
+        resp.headers["x-snapshot-etag"] = etag
+    return resp
+
+app.include_router(router)
 
 def minio_client() -> Minio:
     return Minio(
@@ -43,6 +95,10 @@ def readyz():
         _ = mc.list_buckets()  # simple reachability
         r = redis.Redis.from_url(settings.redis_url)
         r.ping()
+        # Upstream Memory-API health probe
+        resp = httpx.get(f"{settings.memory_api_url}/healthz", timeout=2.0)
+        if resp.status_code != 200:
+            raise Exception("memory_api unhealthy")
         return {"ready": True}
     except Exception:
         return {"ready": False}
@@ -103,7 +159,12 @@ def ensure_bucket():
 async def ask_why_decision(request: Request):
     t0 = time.perf_counter()
     body = await request.json()
-    anchor_id = (body.get("anchor_id") or body.get("anchor") or "").strip()
+    anchor_id = (
+        body.get("anchor_id")
+        or body.get("decision_ref")
+        or body.get("anchor")
+        or ""
+    ).strip()
     if not anchor_id:
         raise HTTPException(status_code=400, detail="anchor_id required")
 
@@ -142,7 +203,15 @@ async def ask_why_decision(request: Request):
         "latency_ms": latency_ms,
         "request_id": request.headers.get("x-request-id") or "",
         "prompt_fingerprint": pf,
-        "snapshot_etag": "",
+        # Capture latest snapshot-etag so downstream clients
+        # know whether their local caches are stale.
+        "snapshot_etag": (
+            httpx.get(
+                f"{settings.memory_api_url}/api/schema/fields", timeout=3.0
+            ).headers.get("x-snapshot-etag", "")
+            if settings.memory_api_url
+            else ""
+        ),
         "fallback_used": False,
         "validator_notes": errs,
     }
