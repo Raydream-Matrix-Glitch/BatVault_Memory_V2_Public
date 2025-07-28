@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-echo "🔧 Installing BatVault packages & services in editable mode… (services with --no-deps)"
+echo "🔧 Installing BatVault packages & services in editable mode…"
 
 # Core packages
 for pkg in core_config core_utils core_logging core_models; do
@@ -9,7 +9,7 @@ done
 
 # Services
 for svc in api_edge gateway memory_api ingest; do
-  pip install --upgrade --editable "services/${svc}" --no-deps
+  pip install --upgrade --editable "services/${svc}"
 done
 
 echo "✅  Done. Run 'pytest' now and imports should resolve."

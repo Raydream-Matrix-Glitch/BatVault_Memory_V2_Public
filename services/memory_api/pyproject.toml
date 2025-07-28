@@ -12,18 +12,18 @@ dependencies = [
   "orjson>=3.9.7",
   "python-arango>=7.9.1",
   "minio>=7.2.7",
-  "core-config @ file:///app/packages/core_config",
-  "core-logging @ file:///app/packages/core_logging",
-  "core-models @ file:///app/packages/core_models",
-  "core-utils @ file:///app/packages/core_utils",
-]
+  "core-config",
+  "core-logging",
+  "core-models",
+  "core-utils",
+  ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["memory_api*"]
 
 [tool.ruff]
 line-length = 100
 
 [tool.pytest.ini_options]
 pythonpath = [".", "src"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["memory_api*"]
