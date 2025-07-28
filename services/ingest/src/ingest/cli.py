@@ -1,8 +1,8 @@
-import sys, json, hashlib, os, glob, re, time
-from core_logging import get_logger, log_event
+import sys, json, os, glob, re
+from core_logging import get_logger, log_stage
+from core_utils import compute_snapshot_etag_for_files
 
 logger = get_logger("ingest-cli")
-
 ID_RE = re.compile(r"^[a-z0-9_\-:.]{3,128}$")
 
 def validate_doc(doc: dict, path: str) -> list[str]:
@@ -17,15 +17,6 @@ def validate_doc(doc: dict, path: str) -> list[str]:
         errs.append("missing content field (title/text)")
     return errs
 
-def calc_snapshot_etag(files: list[str]) -> str:
-    h = hashlib.sha256()
-    for p in sorted(files):
-        with open(p, "rb") as f:
-            h.update(f.read())
-    # include timestamp per spec (hash + timestamp for churn awareness)
-    h.update(str(int(time.time())).encode())
-    return h.hexdigest()
-
 def seed(path: str) -> int:
     files = [p for p in glob.glob(os.path.join(path, "*.json"))]
     if not files:
@@ -34,7 +25,8 @@ def seed(path: str) -> int:
     all_errs: list[str] = []
     for p in files:
         try:
-            doc = json.load(open(p, "r", encoding="utf-8"))
+            with open(p, "r", encoding="utf-8") as fh:
+                doc = json.load(fh)
         except Exception as e:
             all_errs.append(f"{p}: json error {e}")
             continue
@@ -45,9 +37,10 @@ def seed(path: str) -> int:
         for e in all_errs:
             print(e, file=sys.stderr)
         return 2
-    etag = calc_snapshot_etag(files)
-    log_event(logger, "seed_validation_ok", files=len(files), snapshot_etag=etag)
-    print(json.dumps({"ok": True, "files": len(files), "snapshot_etag": etag}))
+
+    snapshot_etag = compute_snapshot_etag_for_files(files)
+    log_stage(logger, "ingest", "seed_validation_ok", snapshot_etag=snapshot_etag, files=len(files))
+    print(json.dumps({"ok": True, "files": len(files), "snapshot_etag": snapshot_etag}))
     return 0
 
 def main():

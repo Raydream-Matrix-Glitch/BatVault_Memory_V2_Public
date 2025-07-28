@@ -1,5 +1,6 @@
 # Base Python image for services
 FROM python:3.11-slim
+ARG SERVICE_NAME
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl build-essential && rm -rf /var/lib/apt/lists/*
@@ -8,22 +9,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -ms /bin/bash appuser
 WORKDIR /app
 
-# Copy shared packages first for layer caching
+# Copy shared packages first for better layer caching
 COPY packages /app/packages
 
-# Install service deps from pyproject
-# Each service will copy its own pyproject.toml before this step during build context;
-# we install shared editable packages and then the service.
+# Upgrade base tools
 RUN pip install --no-cache-dir -U pip wheel setuptools
 
-# Install shared packages editable
-RUN pip install --no-cache-dir -e /app/packages/core-config \
-    -e /app/packages/core-logging \
-    -e /app/packages/core-models \
-    -e /app/packages/core-utils
+# Install shared packages editable (cache-friendly)
+RUN pip install --no-cache-dir \
+    -e /app/packages/core_config \
+    -e /app/packages/core_logging \
+    -e /app/packages/core_models \
+    -e /app/packages/core_utils
 
-# Service files added by build context (see compose)
+# Now copy service code — this step comes after shared installs to preserve cache
 COPY services /app/services
 
-# The service build contexts override CMD
+# Install service-specific dependencies if SERVICE_NAME is set
+RUN if [ -n "$SERVICE_NAME" ]; then \
+        pip install --no-cache-dir -e "/app/services/${SERVICE_NAME}"; \
+    fi
+
+# The service build context overrides CMD
 USER appuser

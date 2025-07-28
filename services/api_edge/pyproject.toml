@@ -1,7 +1,7 @@
 [project]
-name = "ingest"
+name = "api_edge"
 version = "0.1.0"
-description = "Memory ingest + validation"
+description = "API Edge service"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.112.0",

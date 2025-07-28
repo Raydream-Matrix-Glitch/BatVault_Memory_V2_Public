@@ -12,10 +12,10 @@ dependencies = [
   "orjson>=3.9.7",
   "python-arango>=7.9.1",
   "minio>=7.2.7",
-  "core-config @ file:///app/packages/core-config",
-  "core-logging @ file:///app/packages/core-logging",
-  "core-models @ file:///app/packages/core-models",
-  "core-utils @ file:///app/packages/core-utils",
+  "core-config @ file:///app/packages/core_config",
+  "core-logging @ file:///app/packages/core_logging",
+  "core-models @ file:///app/packages/core_models",
+  "core-utils @ file:///app/packages/core_utils",
 ]
 
 [tool.ruff]

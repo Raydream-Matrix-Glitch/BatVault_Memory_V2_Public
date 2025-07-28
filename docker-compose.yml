@@ -1,27 +1,30 @@
-version: "3.9"
 services:
   arangodb:
-    image: arangodb:3.11
+    image: arangodb:3.12
+    restart: always
+    command: ["arangod","--server.endpoint=tcp://0.0.0.0:8529"]
     environment:
       - ARANGO_ROOT_PASSWORD=${ARANGO_ROOT_PASSWORD:-batvault}
     ports:
       - "8529:8529"
-    healthcheck:
-      test: ["CMD", "bash", "-lc", "curl -s http://localhost:8529/_api/version"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
     volumes:
       - ./docker-data/arangodb:/var/lib/arangodb3
     networks: [batnet]
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks: [batnet]
 
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
       - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
@@ -35,64 +38,137 @@ services:
       test: ["CMD", "bash", "-lc", "curl -s http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
     networks: [batnet]
 
-  api-edge:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.103.1
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./ops/otel/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+    networks: [batnet]
+
+  api_edge:
     build:
-      context: ./services/api-edge
-      dockerfile: ../../ops/docker/Dockerfile.python
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: api_edge
     environment:
       - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=api-edge
     env_file: [.env]
+    command: ["python", "-m", "api_edge.__main__"]
     ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://localhost:8080/healthz"]
+      interval: 10s
+      retries: 5
     depends_on:
-      - gateway
-      - minio
-      - redis
+      gateway:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
     networks: [batnet]
 
   gateway:
     build:
-      context: ./services/gateway
-      dockerfile: ../../ops/docker/Dockerfile.python
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: gateway
     environment:
       - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=gateway
     env_file: [.env]
+    command: ["python", "-m", "gateway.__main__"]
     ports: ["8081:8081"]
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://localhost:8081/healthz"]
+      interval: 10s
+      retries: 5
     depends_on:
-      - memory-api
-      - minio
-      - redis
+      memory_api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
     networks: [batnet]
 
-  memory-api:
+  memory_api:
     build:
-      context: ./services/memory-api
-      dockerfile: ../../ops/docker/Dockerfile.python
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: memory_api
     environment:
       - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=memory-api
     env_file: [.env]
+    command: ["python", "-m", "memory_api.__main__"]
     ports: ["8082:8082"]
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://localhost:8082/healthz"]
+      interval: 10s
+      retries: 5
     depends_on:
-      - arangodb
-      - redis
-      - minio
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
     networks: [batnet]
 
   ingest:
     build:
-      context: ./services/ingest
-      dockerfile: ../../ops/docker/Dockerfile.python
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: ingest
     environment:
       - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=ingest
     env_file: [.env]
+    command: ["python", "-m", "ingest.__main__"]
     ports: ["8083:8083"]
+    healthcheck:
+      test: ["CMD","curl","-fsS","http://localhost:8083/healthz"]
+      interval: 10s
+      retries: 5
     depends_on:
-      - memory-api
+      - memory_api
       - minio
+      - otel-collector
+    restart: unless-stopped
+    networks: [batnet]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    restart: unless-stopped
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+      - "14250:14250"
+      - "14268:14268"
     networks: [batnet]
 
 networks:
   batnet:
     driver: bridge
+
+

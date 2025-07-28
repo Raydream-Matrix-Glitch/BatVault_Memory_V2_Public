@@ -12,7 +12,7 @@ for port in 8080 8081 8082 8083; do
 done
 
 echo "Checking MinIO bucket..."
-if curl -fsS http://localhost:8080/ops/minio/bucket >/dev/null; then
+if curl -fsS -X POST http://localhost:8081/ops/minio/ensure-bucket >/dev/null; then
   echo "Bucket ensured."
 else
   echo "Bucket check failed."; exit 1

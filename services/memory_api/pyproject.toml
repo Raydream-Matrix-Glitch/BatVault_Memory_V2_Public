@@ -1,7 +1,7 @@
 [project]
-name = "ingest"
+name = "memory_api"
 version = "0.1.0"
-description = "Memory ingest + validation"
+description = "Graph + search API over Arango"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.112.0",
