@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     hnsw_m: int = Field(default=16, alias="HNSW_M")
     hnsw_efconstruction: int = Field(default=200, alias="HNSW_EFCONSTRUCTION")
 
+    # Graph/catalog names
+    arango_graph_name: str = Field(default="batvault_graph", alias="ARANGO_GRAPH_NAME")
+    arango_catalog_collection: str = Field(default="catalog", alias="ARANGO_CATALOG_COLLECTION")
+    arango_meta_collection: str = Field(default="meta", alias="ARANGO_META_COLLECTION")
+
     # Redis
     redis_url: str = Field(default="redis://redis:6379/0", alias="REDIS_URL")
 

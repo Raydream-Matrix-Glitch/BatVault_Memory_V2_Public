@@ -1,5 +1,5 @@
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from minio import Minio
 from minio.error import S3Error
@@ -7,6 +7,16 @@ import redis
 
 from core_logging import get_logger, log_stage
 from core_config import get_settings
+from core_utils import prompt_fingerprint
+from .models import (
+    WhyDecisionAnchor,
+    WhyDecisionEvidence,
+    WhyDecisionAnswer,
+    CompletenessFlags,
+    WhyDecisionResponse,
+)
+from .templater import build_allowed_ids, deterministic_short_answer, validate_and_fix
+import time
 
 settings = get_settings()
 logger = get_logger("gateway")
@@ -80,10 +90,81 @@ def ensure_bucket():
     )
 
     return JSONResponse(
-        status_code=200,
-        content={
-            "bucket": bucket,
-            "newly_created": newly_created,
-            "retention_days": days,
-        },
+      status_code=200,
+      content={
+          "bucket": bucket,
+          "newly_created": newly_created,
+          "retention_days": days,
+      },
+  )
+
+# ---------- /v2/ask (templater only; contract-compliant; no LLM) ----------
+@app.post("/v2/ask")
+async def ask_why_decision(request: Request):
+    t0 = time.perf_counter()
+    body = await request.json()
+    anchor_id = (body.get("anchor_id") or body.get("anchor") or "").strip()
+    if not anchor_id:
+        raise HTTPException(status_code=400, detail="anchor_id required")
+
+    policy_id = (body.get("policy_id") or "policy/default").strip()
+    prompt_id = (body.get("prompt_id") or "templater/v0").strip()
+
+    # Build minimal evidence (anchor-only for now)
+    anchor = WhyDecisionAnchor(id=anchor_id)
+    evidence = WhyDecisionEvidence(anchor=anchor)
+    evidence.allowed_ids = build_allowed_ids(evidence)
+
+    # Default supporting = {anchor}
+    answer = WhyDecisionAnswer(short_answer="", supporting_ids=[anchor_id])
+
+    # Deterministic short answer
+    events_n = len(evidence.events)
+    preceding_n = len(evidence.transitions.preceding)
+    succeeding_n = len(evidence.transitions.succeeding)
+    answer.short_answer = deterministic_short_answer(
+        anchor_id, events_n, preceding_n, succeeding_n,
+        len(answer.supporting_ids), len(evidence.allowed_ids)
     )
+
+    # Validator (subset + anchor cited)
+    answer, changed, errs = validate_and_fix(answer, evidence.allowed_ids, anchor_id)
+    pf = prompt_fingerprint(
+        {"intent":"why_decision",
+         "evidence":{"anchor":{"id":anchor_id},"allowed_ids":evidence.allowed_ids}}
+    )
+
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    meta = {
+        "policy_id": policy_id,
+        "prompt_id": prompt_id,
+        "retries": 0,
+        "latency_ms": latency_ms,
+        "request_id": request.headers.get("x-request-id") or "",
+        "prompt_fingerprint": pf,
+        "snapshot_etag": "",
+        "fallback_used": False,
+        "validator_notes": errs,
+    }
+
+    resp = WhyDecisionResponse(
+        evidence=evidence,
+        answer=answer,
+        completeness_flags=CompletenessFlags(
+            has_preceding=preceding_n > 0,
+            has_succeeding=succeeding_n > 0,
+            event_count=events_n
+        ),
+        meta=meta,
+    )
+
+    # Strategic logs
+    log_stage(logger, "prompt", "templater_envelope_ready",
+              request_id=meta["request_id"], prompt_fingerprint=pf,
+              allowed_ids=len(evidence.allowed_ids))
+    log_stage(logger, "validate", "templater_answer_validated",
+              request_id=meta["request_id"], changed=changed, errors=errs)
+    log_stage(logger, "render", "templater_answer_rendered",
+              request_id=meta["request_id"], latency_ms=latency_ms)
+
+    return JSONResponse(resp.model_dump())

@@ -15,7 +15,7 @@ async def readyz():
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get("http://memory_api:8082/healthz")
-            if r.status_code == 200:
+            if r.status_code == 200 and r.json().get("ready"):
                 return {"ready": True}
     except Exception as e:
         pass
