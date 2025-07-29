@@ -1,6 +1,12 @@
 from typing import Any, Dict, List, Optional, Tuple
+import os
+import httpx
 from arango import ArangoClient
 from pydantic import BaseModel
+from core_config import get_settings
+from core_logging import get_logger, log_stage
+
+logger = get_logger("memory_api")
 
 class ArangoStore:
     def __init__(self,
@@ -40,6 +46,80 @@ class ArangoStore:
                 from_vertex_collections=["nodes"],
                 to_vertex_collections=["nodes"],
             )
+        # ------------------------------------------------------------------
+        #  Optional: create HNSW vector index on `nodes.embedding`
+        #  (guarded by env ARANGO_VECTOR_INDEX_ENABLED=true)
+        # ------------------------------------------------------------------
+        if os.getenv("ARANGO_VECTOR_INDEX_ENABLED", "false").lower() == "true":
+            self._maybe_create_vector_index()
+
+    def _count_vectors(self) -> int:
+        """Count docs that actually have an embedding field."""
+        try:
+            cursor = self.db.aql.execute(
+                'RETURN LENGTH(FOR d IN nodes FILTER HAS(d, "embedding") RETURN 1)'
+            )
+            return int(next(cursor))
+        except Exception as exc:
+            log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_estimate_warn", error=str(exc))
+            return 0
+
+    def _maybe_create_vector_index(self) -> None:
+        """Create FAISS IVF index once there are enough training vectors."""
+        cfg = get_settings()
+        url = f"{cfg.arango_url}/_db/{self.db.name}/_api/index"
+        params = {"collection": "nodes"}
+
+        vector_count = self._count_vectors()
+        desired_nlists = int(os.getenv("FAISS_NLISTS", 100))
+        # heuristic: sqrt(N), bounded to desired_nlists and >=1
+        from math import sqrt, floor
+        effective_nlists = max(1, min(desired_nlists, floor(sqrt(vector_count)) if vector_count else 0))
+
+        if vector_count == 0:
+            log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_deferred",
+                      reason="no_vectors", collection="nodes",
+                      desired_nlists=desired_nlists, vector_count=vector_count)
+            return
+
+        payload = {
+            "type": "vector",
+            "name": "idx_nodes_embedding",
+            "fields": ["embedding"],
+            "inBackground": True,
+            "params": {
+                "dimension": int(os.getenv("EMBEDDING_DIM", 384)),
+                "metric": os.getenv("VECTOR_METRIC", "cosine"),   # cosine | l2
+                "nLists": effective_nlists,                       # IVF cluster count
+            },
+        }
+
+        user, pwd = cfg.arango_root_user, cfg.arango_root_password
+        auth = httpx.BasicAuth(user, pwd) if (user and pwd) else None
+
+        try:
+            resp = httpx.post(url, params=params, json=payload, auth=auth, timeout=10.0)
+            common = {
+                "status": resp.status_code,
+                "index_name": payload["name"],
+                "collection": "nodes",
+                "dimension": payload["params"]["dimension"],
+                "metric": payload["params"]["metric"],
+                "nLists": payload["params"]["nLists"],
+                "vector_count": vector_count,
+                "desired_nlists": desired_nlists,
+                "effective_nlists": effective_nlists,
+            }
+            log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_params", **common)
+            if resp.status_code in (200, 201):
+                log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created", **common)
+            elif resp.status_code == 409 or (resp.headers.get("content-type","").startswith("application/json") and resp.json().get("errorNum") == 1210):
+                log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_exists", **common)
+            else:
+                log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_warn",
+                          body=resp.text[:500], **common, payload_schema="vector+params/faiss")
+        except Exception as exc:
+            log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_error", error=str(exc))
 
     # ----------------- Upserts -----------------
     def upsert_node(self, node_id: str, node_type: str, payload: Dict[str, Any]) -> None:

@@ -1,0 +1,9 @@
+{
+  "id": "trans-pan-2017-2019",
+  "from": "panasonic-ev-battery-gigafactory-2017",
+  "to": "panasonic-ai-supply-chain-2019",
+  "relation": "causal",
+  "reason": "Scale-up necessitated digital supply-chain optimization",
+  "timestamp": "2019-03-22T08:00:00Z",
+  "x-extra": {}
+}

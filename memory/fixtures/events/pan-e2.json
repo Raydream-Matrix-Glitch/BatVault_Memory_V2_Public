@@ -1,0 +1,15 @@
+{
+  "id": "pan-e2",
+  "summary": "Panasonic unveils next-gen 18650 cell",
+  "description": "Panasonic demonstrated a new 18650 lithium\u2011ion cell with 15\u202f% higher energy density at CES\u202f2010.",
+  "timestamp": "2010-01-05T11:00:00Z",
+  "tags": [
+    "technology_demo",
+    "battery_rd"
+  ],
+  "led_to": [
+    "panasonic-tesla-battery-partnership-2010"
+  ],
+  "snippet": "15\u202f% boost in cell capacity.",
+  "x-extra": {}
+}

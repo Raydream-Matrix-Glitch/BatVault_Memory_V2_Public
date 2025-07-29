@@ -1,0 +1,15 @@
+{
+  "id": "pan-e9",
+  "summary": "Gartner names digital supply-chain top trend",
+  "description": "In August\u202f2019, Gartner identified AI-driven supply chains as the #1 digital priority for manufacturing.",
+  "timestamp": "2019-08-22T10:00:00Z",
+  "tags": [
+    "industry_trend",
+    "digital_transformation"
+  ],
+  "led_to": [
+    "panasonic-ai-supply-chain-2019"
+  ],
+  "snippet": "Supply-chain AI is #1 trend.",
+  "x-extra": {}
+}

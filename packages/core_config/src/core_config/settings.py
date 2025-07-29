@@ -20,13 +20,28 @@ class Settings(BaseSettings):
     arango_db: str = Field(default="batvault", alias="ARANGO_DB")
     arango_root_user: str = Field(default="root", alias="ARANGO_ROOT_USER")
     arango_root_password: str = Field(default="batvault", alias="ARANGO_ROOT_PASSWORD")
+    # Convenience aliases so other layers can reference a generic
+    # “username / password” without caring about the role name.
+    @property
+    def arango_username(self) -> str:  # noqa: D401
+        """Return the configured root user (alias)."""
+        return self.arango_root_user
 
+    @property
+    def arango_password(self) -> str:  # noqa: D401
+        """Return the configured root password (alias)."""
+        return self.arango_root_password
+    
+    @property
+    def embedding_dimension(self) -> int:   # noqa: N802
+        """Alias kept for legacy code paths that used
+        `settings.embedding_dimension`."""
+        return self.embedding_dim
+    
     arango_vector_index_enabled: bool = Field(default=True, alias="ARANGO_VECTOR_INDEX_ENABLED")
     embedding_dim: int = Field(default=384, alias="EMBEDDING_DIM")
     vector_metric: str = Field(default="cosine", alias="VECTOR_METRIC")
-    vector_engine: str = Field(default="hnsw", alias="VECTOR_ENGINE")
-    hnsw_m: int = Field(default=16, alias="HNSW_M")
-    hnsw_efconstruction: int = Field(default=200, alias="HNSW_EFCONSTRUCTION")
+    faiss_nlists: int = Field(default=100, alias="FAISS_NLISTS")
 
     # Graph/catalog names
     arango_graph_name: str = Field(default="batvault_graph", alias="ARANGO_GRAPH_NAME")

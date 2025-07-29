@@ -1,0 +1,15 @@
+{
+  "id": "phil-e10",
+  "summary": "WHO projects 30\u202f% rise in MRI demand by 2025",
+  "description": "A WHO demographic report forecasted a 30\u202f% increase in MRI utilization in OECD countries over five years.",
+  "timestamp": "2019-11-20T10:00:00Z",
+  "tags": [
+    "forecast",
+    "healthcare_trends"
+  ],
+  "led_to": [
+    "philips-invest-mri-2020"
+  ],
+  "snippet": "MRI demand set to jump.",
+  "x-extra": {}
+}

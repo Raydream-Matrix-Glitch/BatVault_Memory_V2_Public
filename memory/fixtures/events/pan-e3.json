@@ -1,0 +1,23 @@
+{
+  "id": "pan-e3",
+  "summary": "TV business posts $913\u202fm operating loss",
+  "description": "Ahead of its plasma exit Panasonic disclosed its TV division lost about $913\u202fm in the prior FY\u2014one driver behind shuttering the business.",
+  "timestamp": "2013-10-09T00:00:00Z",
+  "tags": [
+    "earnings_alert",
+    "loss_mitigation"
+  ],
+  "kpis": [
+    {
+      "name": "Operating Loss (TV)",
+      "value": 913,
+      "unit": "million USD",
+      "timestamp": "2013-10-09T00:00:00Z"
+    }
+  ],
+  "led_to": [
+    "panasonic-exit-plasma-2012"
+  ],
+  "snippet": "Plasma unit \u2212$913\u202fm op.loss.",
+  "x-extra": {}
+}

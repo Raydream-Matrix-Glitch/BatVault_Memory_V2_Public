@@ -1,0 +1,9 @@
+{
+  "id": "trans-pan-2014-2017",
+  "from": "panasonic-automotive-infotainment-acquisition-2014",
+  "to": "panasonic-ev-battery-gigafactory-2017",
+  "relation": "causal",
+  "reason": "Synergies with Tesla partnership justified capacity build-out",
+  "timestamp": "2017-07-29T11:00:00Z",
+  "x-extra": {}
+}

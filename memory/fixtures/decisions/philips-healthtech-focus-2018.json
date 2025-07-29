@@ -1,0 +1,23 @@
+{
+  "id": "philips-healthtech-focus-2018",
+  "option": "Rebrand and focus on health technology",
+  "rationale": "With lighting separated, management committed to a pure-play health-tech identity to capture higher valuation multiples.",
+  "timestamp": "2018-09-01T12:00:00Z",
+  "decision_maker": "Frans van Houten",
+  "tags": [
+    "strategic_focus",
+    "branding"
+  ],
+  "supported_by": [
+    "phil-e7",
+    "phil-e8"
+  ],
+  "based_on": [
+    "philips-spin-off-lighting-2016"
+  ],
+  "transitions": [
+    "trans-phil-2016-2018",
+    "trans-phil-2018-2020"
+  ],
+  "x-extra": {}
+}

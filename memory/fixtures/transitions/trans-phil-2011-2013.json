@@ -1,0 +1,9 @@
+{
+  "id": "trans-phil-2011-2013",
+  "from": "philips-exit-tv-2011",
+  "to": "philips-lighting-split-2016",
+  "relation": "causal",
+  "reason": "TV divestiture freed capital for Lighting/HealthTech split",
+  "timestamp": "2014-09-23T06:31:00Z",
+  "x-extra": {}
+}

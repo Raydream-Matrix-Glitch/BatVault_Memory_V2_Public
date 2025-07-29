@@ -16,50 +16,8 @@ def store() -> ArangoStore:
 
 @app.on_event("startup")
 async def bootstrap_arango():
-    # Ensure DB/collections via ArangoStore init
+    # Ensure DB/collections via ArangoStore init (it handles vector index creation)
     _ = store()
-    # Best-effort vector index bootstrap (HNSW) with audit logs
-    if not settings.arango_vector_index_enabled:
-        return
-    base_url = f"{settings.arango_url}/_db/{settings.arango_db}"
-    payload = {
-        "type": "vector",
-        "name": "idx_nodes_embedding_hnsw",
-        "fields": ["embedding"],
-        "inBackground": True,
-        "unique": False,
-        "sparse": True,
-        "estimates": True,
-        "storedValues": [],
-        "vecType": "float32",
-        "dimension": settings.embedding_dim,
-        "metric": settings.vector_metric,    # cosine|euclidean|dot
-        "engine": settings.vector_engine,    # hnsw|flat
-        "M": settings.hnsw_m,
-        "efConstruction": settings.hnsw_efconstruction,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(f"{base_url}/_api/index?collection=nodes", json=payload)
-            common = dict(
-                status=r.status_code,
-                dimension=settings.embedding_dim,
-                metric=settings.vector_metric,
-                engine=settings.vector_engine,
-                m=settings.hnsw_m,
-                efConstruction=settings.hnsw_efconstruction,
-                index_name="idx_nodes_embedding_hnsw",
-                collection="nodes",
-            )
-            if r.status_code in (200, 201):
-                log_stage(logger, "bootstrap", "arango_vector_index_created", **common)
-            elif r.status_code == 409:
-                log_stage(logger, "bootstrap", "arango_vector_index_exists", **common)
-            else:
-                log_stage(logger, "bootstrap", "arango_vector_index_warn",
-                          body=r.text[:200], **common)
-    except Exception as e:
-        log_stage(logger, "bootstrap", "arango_vector_index_error", error=str(e))
 
 @app.get("/healthz")
 def healthz():

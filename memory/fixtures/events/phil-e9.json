@@ -1,0 +1,15 @@
+{
+  "id": "phil-e9",
+  "summary": "Breakthrough superconducting magnet research published",
+  "description": "Philips R&D team published a paper showing a 20\u202f% resolution gain in ultra\u2011high\u2011field MRI magnets.",
+  "timestamp": "2020-01-15T14:00:00Z",
+  "tags": [
+    "research",
+    "innovation"
+  ],
+  "led_to": [
+    "philips-invest-mri-2020"
+  ],
+  "snippet": "20\u202f% better MRI resolution.",
+  "x-extra": {}
+}

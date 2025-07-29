@@ -1,10 +1,14 @@
 services:
   arangodb:
-    image: arangodb:3.12
+    image: arangodb:3.12.4
     restart: always
-    command: ["arangod","--server.endpoint=tcp://0.0.0.0:8529"]
     environment:
       - ARANGO_ROOT_PASSWORD=${ARANGO_ROOT_PASSWORD:-batvault}
+    command: >
+      arangod
+      --server.endpoint=tcp://0.0.0.0:8529
+      --server.authentication=false
+      --experimental-vector-index
     ports:
       - "8529:8529"
     volumes:

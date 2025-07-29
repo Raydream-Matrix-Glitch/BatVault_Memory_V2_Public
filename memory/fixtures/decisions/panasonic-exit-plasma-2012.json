@@ -1,0 +1,22 @@
+{
+  "id": "panasonic-exit-plasma-2012",
+  "option": "Exit plasma TV production",
+  "rationale": "Declining demand and heavy losses in plasma panels necessitated a strategic withdrawal to focus resources on automotive and battery growth.",
+  "timestamp": "2012-04-30T09:00:00Z",
+  "decision_maker": "Kazuhiro Tsuga",
+  "tags": [
+    "portfolio_rationalization",
+    "loss_mitigation"
+  ],
+  "supported_by": [
+    "pan-e2"
+  ],
+  "based_on": [
+    "panasonic-tesla-battery-partnership-2010"
+  ],
+  "transitions": [
+    "trans-pan-2010-2012",
+    "trans-pan-2012-2014"
+  ],
+  "x-extra": {}
+}

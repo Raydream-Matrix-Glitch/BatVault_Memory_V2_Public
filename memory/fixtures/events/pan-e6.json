@@ -1,0 +1,15 @@
+{
+  "id": "pan-e6",
+  "summary": "Tesla investor day signals cell demand surge",
+  "description": "At Tesla\u2019s June\u202f2017 Investor Day, management forecasted a doubling of battery cell needs by 2020.",
+  "timestamp": "2017-06-15T09:30:00Z",
+  "tags": [
+    "partner_update",
+    "capacity_planning"
+  ],
+  "led_to": [
+    "panasonic-ev-battery-gigafactory-2017"
+  ],
+  "snippet": "Cell demand to double by 2020.",
+  "x-extra": {}
+}
