@@ -1,0 +1,4 @@
+# requirements/dev.txt
+pytest>=8.4
+pytest-cov>=4.0
+ruff>=0.0

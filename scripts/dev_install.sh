@@ -3,7 +3,7 @@ set -euo pipefail
 echo "🔧 Installing BatVault packages & services in editable mode…"
 
 # Core packages
-for pkg in core_config core_utils core_logging core_models; do
+for pkg in core_config core_utils core_logging core_models core_storage; do
   pip install --upgrade --editable "packages/${pkg}"
 done
 

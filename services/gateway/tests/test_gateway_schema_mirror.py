@@ -1,8 +1,3 @@
-"""
-Validates the Gateway's read-through schema mirror
-(`/v2/schema/{fields|rels}`) without hitting a live Memory-API.
-"""
-
 from types import SimpleNamespace
 
 import httpx

@@ -1,15 +1,27 @@
-from ingest.pipeline.normalize import normalize_decision, normalize_event, normalize_transition, derive_backlinks
+import json, pathlib
+from jsonschema import Draft202012Validator as V
+from ingest.cli import load_schema
 
-def test_orphan_event_and_decision_empty_arrays_ok():
-    d = {"id":"pause-paas-rollout-2024-q3","option":"Pause","timestamp":"2024-07-20T14:30:00Z","supported_by":[],"transitions":[]}
-    e = {"id":"B-E1","description":"Q2 overspend 40%","timestamp":"2024-07-19T08:00:00Z","led_to":[]}
-    t = {"id":"trans-123","from":"enter-cloud-market-2024-q1","to":"pause-paas-rollout-2024-q3","relation":"causal","timestamp":"2024-08-12T09:05:00Z"}
+ROOT = pathlib.Path(__file__).parents[3] / "memory" / "events"
 
-    nd = normalize_decision(d); ne = normalize_event(e); nt = normalize_transition(t)
-    decisions = {nd["id"]: nd}; events = {ne["id"]: ne}; transitions = {nt["id"]: nt}
-    derive_backlinks(decisions, events, transitions)
 
-    assert decisions[nd["id"]]["supported_by"] == []  # empty array allowed
-    assert events[ne["id"]]["led_to"] == []          # empty array allowed
-    # transition should be attached to decision 'to'
-    assert "trans-123" in decisions["pause-paas-rollout-2024-q3"]["transitions"]
+def _load(path: pathlib.Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def test_orphan_events_validate_and_detect():
+    """
+    Orphan = event with led_to missing or [].  The pipeline must accept them
+    (spec §6.2) and they must validate against the Event schema.
+    """
+    events = [_load(p) for p in ROOT.glob("*.json")]
+    orphans = [e for e in events if not e.get("led_to")]
+
+    # We purposefully added exactly two orphan fixtures.
+    ids = {e["id"] for e in orphans}
+    assert {"phil-e11", "pan-e10"} <= ids
+
+    schema = load_schema("event")
+    for evt in orphans:
+        V(schema).validate(evt)          # must pass strict schema check
+        assert evt.get("led_to", []) == []  # explicit orphan

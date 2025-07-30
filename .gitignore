@@ -6,6 +6,8 @@ __pycache__/
 .venv*/
 .env
 *.log
+.pytest_cache/
+build/
 
 # Node
 node_modules/

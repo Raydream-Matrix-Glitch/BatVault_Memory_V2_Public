@@ -1,24 +1,47 @@
+from typing import Dict
 from core_storage import ArangoStore
 
-def upsert_all(store: ArangoStore, decisions: dict, events: dict, transitions: dict) -> None:
-    # Nodes
-    for did, d in decisions.items():
-        store.upsert_node(did, "decision", d)
-    for eid, e in events.items():
-        store.upsert_node(eid, "event", e)
-    for tid, t in transitions.items():
-        store.upsert_node(tid, "transition", t)
 
-    # Edges (LED_TO from event to decision)
+def upsert_all(
+    store: ArangoStore,
+    decisions: Dict[str, dict],
+    events: Dict[str, dict],
+    transitions: Dict[str, dict],
+    snapshot_etag: str,
+) -> None:
+    """
+    Write (or replace) every node & edge for the current fixture batch,
+    tagging each document with the batch-unique ``snapshot_etag`` so that
+    stale records can be swept later.
+    """
+
+    # ---------------------------  Nodes  ---------------------------
+    for did, d in decisions.items():
+        doc = dict(d)
+        doc["snapshot_etag"] = snapshot_etag
+        store.upsert_node(did, "decision", doc)
+
+    for eid, e in events.items():
+        doc = dict(e)
+        doc["snapshot_etag"] = snapshot_etag
+        store.upsert_node(eid, "event", doc)
+
+    for tid, t in transitions.items():
+        doc = dict(t)
+        doc["snapshot_etag"] = snapshot_etag
+        store.upsert_node(tid, "transition", doc)
+
+    # ---------------------------  Edges  ---------------------------
+    # LED_TO  (event → decision)
     for eid, e in events.items():
         for did in e.get("led_to", []):
-            if did in decisions:
-                edge_id = f"ledto:{eid}->{did}"
-                store.upsert_edge(edge_id, eid, did, "LED_TO", {"reason": None})
+            edge_id = f"ledto:{eid}->{did}"
+            payload = {"reason": None, "snapshot_etag": snapshot_etag}
+            store.upsert_edge(edge_id, eid, did, "LED_TO", payload)
 
-    # Edges (CAUSAL_PRECEDES) for transitions
+    # CAUSAL_PRECEDES  (transition)
     for tid, t in transitions.items():
         fr, to = t["from"], t["to"]
-        if fr in decisions and to in decisions:
-            edge_id = f"transition:{tid}"
-            store.upsert_edge(edge_id, fr, to, "CAUSAL_PRECEDES", {"relation": t.get("relation")})
+        edge_id = f"transition:{tid}"
+        payload = {"relation": t.get("relation"), "snapshot_etag": snapshot_etag}
+        store.upsert_edge(edge_id, fr, to, "CAUSAL_PRECEDES", payload)

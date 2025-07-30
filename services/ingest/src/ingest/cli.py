@@ -1,4 +1,5 @@
-import sys, json, os, glob, re, time
+import sys, json, os, glob, re, time, argparse, hashlib
+from importlib import resources 
 from jsonschema import Draft202012Validator
 from core_logging import get_logger, log_stage
 from core_utils import compute_snapshot_etag_for_files, slugify_id
@@ -7,6 +8,7 @@ from core_config import get_settings
 from .pipeline.normalize import normalize_decision, normalize_event, normalize_transition, derive_backlinks
 from .pipeline.graph_upsert import upsert_all
 from .catalog.field_catalog import build_field_catalog, build_relation_catalog
+
 
 logger = get_logger("ingest-cli")
 settings = get_settings()
@@ -59,9 +61,12 @@ def canonicalize(doc: dict) -> tuple[dict, dict]:
     return out, hits
 
 def load_schema(name: str) -> dict:
-    base = os.path.join(os.path.dirname(__file__), "..", "schemas", "json-v2")
-    with open(os.path.join(base, f"{name}.schema.json"), "r", encoding="utf-8") as f:
-        return json.load(f)
+    """
+    Works both from the repo **and** once the package is installed in site-packages.
+    """
+    pkg = "ingest.schemas.json_v2"
+    path = resources.files(pkg).joinpath(f"{name}.schema.json")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 SC_DECISION = load_schema("decision")
 SC_EVENT = load_schema("event")
@@ -74,9 +79,19 @@ def validate_doc(doc: dict, kind: str, path: str) -> list[str]:
     return errs
 
 def seed(path: str) -> int:
-    files = sorted(glob.glob(os.path.join(path, "*.json")))
+    # Recursively gather all JSON fixtures from nested subfolders
+    files = sorted(
+        glob.glob(os.path.join(path, "**", "*.json"), recursive=True)
+    )
     if not files:
-        print("No JSON files found.", file=sys.stderr); return 1
+        # strategic structured logging for fast triage
+        log_stage(
+            logger, "ingest", "fixture_scan_empty",
+            search_path=os.path.abspath(path),
+            deterministic_id=slugify_id(os.path.abspath(path)),
+        )
+        print(f"No JSON files found under {path}", file=sys.stderr)
+        return 1
 
     raw_decisions, raw_events, raw_transitions = {}, {}, {}
     errors = []
@@ -149,8 +164,19 @@ def seed(path: str) -> int:
     store = ArangoStore(settings.arango_url, settings.arango_root_user, settings.arango_root_password,
                         settings.arango_db, settings.arango_graph_name,
                         settings.arango_catalog_collection, settings.arango_meta_collection)
-    upsert_all(store, decisions, events, transitions)
+    upsert_all(store, decisions, events, transitions, snapshot_etag)
     store.set_snapshot_etag(snapshot_etag)
+
+    # --------------------  sweep out stale docs  -------------------
+    removed_nodes, removed_edges = store.prune_stale(snapshot_etag)
+    log_stage(
+        logger,
+        "ingest",
+        "prune_stale",
+        snapshot_etag=snapshot_etag,
+        removed_nodes=removed_nodes,
+        removed_edges=removed_edges,
+    )
 
     # Catalogs
     fields = build_field_catalog(decisions, events, transitions)
@@ -164,11 +190,53 @@ def seed(path: str) -> int:
     print(json.dumps({"ok": True, "files": len(files), "snapshot_etag": snapshot_etag}))
     return 0
 
-def main():
-    if len(sys.argv) < 3 or sys.argv[1] != "seed":
-        print("usage: python -m ingest.cli seed <dir>", file=sys.stderr)
-        sys.exit(1)
-    sys.exit(seed(sys.argv[2]))
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="ingest-cli",
+        description="Seed Batvault graph from fixture directory",
+    )
+    parser.add_argument("command", choices=["seed"], help="Currently only 'seed' is supported")
+    parser.add_argument("dir", help="Directory that contains decision/event/transition JSON files")
+    parser.add_argument(
+        "--arango-url",
+        help="Override the ARANGO_URL env var for this run "
+             "(e.g. --arango-url http://localhost:8529)",
+    )
+    args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    #  Strategic logging – resolved Arango URL
+    # ------------------------------------------------------------------
+    if args.arango_url:
+        settings.arango_url = args.arango_url        # runtime override
+        logger.info(
+            "override_arango_url",
+            extra={
+                "stage": "ingest",
+                "arango_url": settings.arango_url,
+                "deterministic_id": _stable_id(settings.arango_url),
+            },
+        )
+    else:
+        logger.info(
+            "resolved_arango_url",
+            extra={
+                "stage": "ingest",
+                "arango_url": settings.arango_url,
+                "deterministic_id": _stable_id(settings.arango_url),
+            },
+        )
+    
+    if args.command == "seed":
+        sys.exit(seed(args.dir))
+
+# ------------------------------------------------------------------
+#  helpers
+# ------------------------------------------------------------------
+
+def _stable_id(value: str) -> str:
+    """Return an 8‑char deterministic slug for log correlation."""
+    return hashlib.sha1(value.encode()).hexdigest()[:8]
 
 if __name__ == "__main__":
     main()

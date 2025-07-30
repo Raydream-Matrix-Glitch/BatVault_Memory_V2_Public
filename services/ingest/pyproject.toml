@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=65.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ingest"
 version = "0.1.0"
@@ -12,10 +16,13 @@ dependencies = [
   "orjson>=3.9.7",
   "python-arango>=7.9.1",
   "minio>=7.2.7",
-  "core-config",
-  "core-logging",
-  "core-models",
-  "core-utils",
+  "jsonschema>=4.22.0",
+  "python-dateutil>=2.9.0",
+  "core_config",
+  "core_logging",
+  "core_models",
+  "core_utils",
+  "core_storage",
   ]
 
 [tool.setuptools.packages.find]
@@ -24,6 +31,3 @@ include = ["ingest*"]
 
 [tool.ruff]
 line-length = 100
-
-[tool.pytest.ini_options]
-pythonpath = [".", "src"]

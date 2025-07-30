@@ -1,0 +1,20 @@
+# Web framework & ASGI server
+fastapi
+uvicorn
+
+# HTTP client
+httpx
+
+# Database / storage drivers
+python-arango
+redis
+minio
+
+# Data validation & serialization
+pydantic
+pydantic-settings
+jsonschema
+orjson
+
+# Utilities
+python-dateutil

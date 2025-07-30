@@ -2,7 +2,7 @@ import re
 from ingest.cli import ID_RE, TS_RE
 
 def test_id_regex_ok():
-    assert ID_RE.match("pause-paas-rollout-2024-q3")
+    assert ID_RE.match("panasonic-automotive-infotainment-acquisition-2014")
     assert not ID_RE.match("Bad_ID")
     assert not ID_RE.match("ab")  # too short
 

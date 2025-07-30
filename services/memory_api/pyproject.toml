@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=65.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "memory_api"
 version = "0.1.0"
@@ -12,10 +16,11 @@ dependencies = [
   "orjson>=3.9.7",
   "python-arango>=7.9.1",
   "minio>=7.2.7",
-  "core-config",
-  "core-logging",
-  "core-models",
-  "core-utils",
+  "core_config",
+  "core_logging",
+  "core_models",
+  "core_utils",
+  "core_storage",
   ]
 
 [tool.setuptools.packages.find]
@@ -24,6 +29,3 @@ include = ["memory_api*"]
 
 [tool.ruff]
 line-length = 100
-
-[tool.pytest.ini_options]
-pythonpath = [".", "src"]

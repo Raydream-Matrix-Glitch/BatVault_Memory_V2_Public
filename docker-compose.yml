@@ -158,6 +158,8 @@ services:
       - minio
       - otel-collector
     restart: unless-stopped
+    volumes:
+      - ./memory/fixtures:/app/memory/fixtures:ro
     networks: [batnet]
 
   jaeger:

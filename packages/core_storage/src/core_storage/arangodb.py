@@ -1,11 +1,12 @@
 from typing import Any, Dict, List, Optional, Tuple
-import os
+import os, re, hashlib, logging
 import httpx
 from arango import ArangoClient
 from pydantic import BaseModel
 from core_config import get_settings
 from core_logging import get_logger, log_stage
 
+logger = logging.getLogger("core_storage")
 logger = get_logger("memory_api")
 
 class ArangoStore:
@@ -129,14 +130,53 @@ class ArangoStore:
         col = self.db.collection("nodes")
         col.insert(doc, overwrite=True)
 
-    def upsert_edge(self, edge_id: str, from_id: str, to_id: str, rel_type: str, payload: Dict[str, Any]) -> None:
+    def upsert_edge(
+        self,
+        edge_id: str,
+        from_id: str,
+        to_id: str,
+        rel_type: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        # ------------------------------------------------------------------
+        #  Sanitise the edge _key so it complies with Arango’s
+        #  `^[A‑Za‑z0‑9_:\.\-]+$` regex and ≤ 254 bytes.
+        # ------------------------------------------------------------------
+        safe_key = self._safe_key(edge_id)
+        if safe_key != edge_id:  # strategic structured log for auditing
+            logger.info(
+                "edge_key_sanitised",
+                extra={
+                    "raw": edge_id,
+                    "sanitised": safe_key,
+                    "stage": "storage",
+                },
+            )
+
         doc = dict(payload)
-        doc["_key"] = edge_id
+        doc["_key"] = safe_key
         doc["_from"] = f"nodes/{from_id}"
         doc["_to"] = f"nodes/{to_id}"
         doc["type"] = rel_type
-        col = self.db.collection("edges")
-        col.insert(doc, overwrite=True)
+        self.db.collection("edges").insert(doc, overwrite=True)
+
+    # ---------------------------------------------------------------
+    #  helpers
+    # ---------------------------------------------------------------
+
+    _ILLEGAL_CHARS = re.compile(r"[^A-Za-z0-9_\-:\.]")
+
+    def _safe_key(self, raw: str) -> str:
+        """
+        • Replace every illegal char with “_”.
+        • If the result exceeds 254 bytes, truncate and append an 8‑char hash
+          so the transformation stays deterministic.
+        """
+        cleaned = self._ILLEGAL_CHARS.sub("_", raw)
+        if len(cleaned.encode()) <= 254:
+            return cleaned
+        digest = hashlib.sha1(cleaned.encode()).hexdigest()[:8]
+        return f"{cleaned[:245]}_{digest}"
 
     # ----------------- Catalogs -----------------
     def set_field_catalog(self, catalog: Dict[str, List[str]]) -> None:
@@ -164,6 +204,62 @@ class ArangoStore:
     def get_snapshot_etag(self) -> Optional[str]:
         doc = self.db.collection(self.meta_col).get("snapshot")
         return doc.get("etag") if doc else None
+    # ------------------------------------------------------------------
+    #  Snapshot GC – drop anything whose stamp ≠ the current batch
+    # ------------------------------------------------------------------
+    def prune_stale(self, snapshot_etag: str) -> Tuple[int, int]:
+        """
+        Delete nodes **and** edges whose ``snapshot_etag`` is missing
+        or different from the stamp supplied.  
+        Returns ``(nodes_removed, edges_removed)`` for audit-logs.
+        """
+        # Nodes ----------------------------------------------------------
+        nodes_removed = int(
+            next(
+                self.db.aql.execute(
+                    """
+                    RETURN LENGTH(
+                      FOR d IN nodes
+                        FILTER !HAS(d,'snapshot_etag') || d.snapshot_etag != @etag
+                        RETURN 1
+                    )""",
+                    bind_vars={"etag": snapshot_etag},
+                )
+            )
+        )
+        self.db.aql.execute(
+            """
+            FOR d IN nodes
+              FILTER !HAS(d,'snapshot_etag') || d.snapshot_etag != @etag
+              REMOVE d IN nodes
+            """,
+            bind_vars={"etag": snapshot_etag},
+        )
+
+        # Edges ----------------------------------------------------------
+        edges_removed = int(
+            next(
+                self.db.aql.execute(
+                    """
+                    RETURN LENGTH(
+                      FOR e IN edges
+                        FILTER !HAS(e,'snapshot_etag') || e.snapshot_etag != @etag
+                        RETURN 1
+                    )""",
+                    bind_vars={"etag": snapshot_etag},
+                )
+            )
+        )
+        self.db.aql.execute(
+            """
+            FOR e IN edges
+              FILTER !HAS(e,'snapshot_etag') || e.snapshot_etag != @etag
+              REMOVE e IN edges
+            """,
+            bind_vars={"etag": snapshot_etag},
+        )
+
+        return nodes_removed, edges_removed
 
     # ----------------- Enrichment (envelopes) -----------------
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
