@@ -1,35 +1,53 @@
+import io
+import time
+import uuid
 from datetime import datetime
-import uuid, io
-from fastapi import FastAPI, HTTPException, Request, APIRouter
+from typing import Any, Dict, List, Optional
+
+import httpx
+import orjson
+import redis
+from fastapi import FastAPI, HTTPException, APIRouter
 from fastapi.responses import JSONResponse
 from minio import Minio
 from minio.error import S3Error
-import redis
-import httpx, orjson
-import time, importlib.metadata as _md, io
-from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, model_validator
 
-
-from core_logging import get_logger, log_stage
+import importlib.metadata as _md
 from core_config import get_settings
-from .models import (
+from core_config.constants import SELECTOR_MODEL_ID
+from core_logging import get_logger, log_stage, trace_span
+from core_utils.fingerprints import canonical_json
+from core_validator import validate_response
+from .evidence import EvidenceBuilder
+from .load_shed import should_load_shed
+from .prompt_envelope import build_prompt_envelope
+from .selector import bundle_size_bytes, truncate_evidence
+from .templater import deterministic_short_answer, validate_and_fix
+from core_models.models import (
     WhyDecisionAnchor,
     WhyDecisionEvidence,
     WhyDecisionAnswer,
     CompletenessFlags,
     WhyDecisionResponse,
 )
-from .evidence import EvidenceBuilder
-from .selector import bundle_size_bytes
-from .prompt_envelope import build_envelope
-from .templater import deterministic_short_answer, validate_and_fix
-from core_validator import validate_response
-from core_config.constants import SELECTOR_MODEL_ID
 
 
 settings = get_settings()
 logger = get_logger("gateway")
+
+# ——— helper to write audit-trail artefacts to MinIO ———
+def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]):
+    client = minio_client()
+    for name, blob in artefacts.items():
+        client.put_object(
+            settings.minio_bucket,
+            f"{request_id}/{name}",
+            io.BytesIO(blob),
+            length=len(blob),
+            content_type="application/json",
+        )
+
 _evidence_builder = EvidenceBuilder()
 
 # ------------------------------------------------------------------
@@ -53,6 +71,7 @@ router = APIRouter(prefix="/v2")
 # ------------------------------------------------------------------#
 
 @router.get("/schema/{kind}")
+@log_stage(logger, "gateway", "schema_mirror")
 async def schema_mirror(kind: str):
     if kind not in ("fields", "rels"):
         raise HTTPException(status_code=404, detail="unknown schema kind")
@@ -166,17 +185,40 @@ def _compute_allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
             seen.add(i)
     return out
 
-@router.post("/ask", response_model=WhyDecisionResponse)
-def ask(req: AskIn):
+@router.post("/v2/ask", response_model=WhyDecisionResponse)
+@trace_span("ask")
+async def ask(req: AskIn):
     t0 = time.perf_counter()
     request_id = req.request_id or uuid.uuid4().hex
+    # ——— initial gateway entry log ———
+    log_stage(
+        logger,
+        "gateway",
+        "ask",
+        request_id=request_id,
+        intent=req.intent,
+    )
+
+    # ---------- load-shedding gate -------------------------------------
+    if should_load_shed():
+        retry_after = getattr(settings, "load_shed_retry_after_seconds", 1)
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+            content={
+                "detail": "Service overloaded",
+                "meta": {"load_shed": True},
+            },
+        )
+
     # ------------------------------------------------ evidence ----------- #
     if req.evidence is None and req.anchor_id:
-        ev = _evidence_builder.build(req.anchor_id)
+        ev = await _evidence_builder.build(req.anchor_id)
     else:
         ev = req.evidence or WhyDecisionEvidence(anchor=WhyDecisionAnchor(id=req.anchor_id))
 
-    selector_meta: Dict[str, Any] = getattr(ev, "_selector_meta", {})
+    # ------------ selector (truncate & score) ----------------------------- #
+    ev, selector_meta = truncate_evidence(ev)
 
 
     # Ensure allowed_ids is the exact union required by the spec
@@ -199,7 +241,12 @@ def ask(req: AskIn):
 
     # Validate & repair if helper is available; else enforce subset rule here
     try:
-        ans = validate_and_fix(ev, ans)
+            # proper signature: (answer, allowed_ids, anchor_id)
+            ans, _changed, _errs = validate_and_fix(
+                ans,
+                allowed,
+                ev.anchor.id,
+            )
     except Exception:
         # Enforce subset and non-empty supporting_ids deterministically
         ans.supporting_ids = [i for i in ans.supporting_ids if i in allowed] or supporting
@@ -212,31 +259,28 @@ def ask(req: AskIn):
                               event_count=len(ev.events or []))
 
     # ---------- canonical prompt envelope + fingerprint -------- #
-    envelope, pf, bundle_fp = build_envelope(
-        intent=req.intent,
+    envelope = build_prompt_envelope(
         question=f"Why was decision {ev.anchor.id} made?",
-        evidence=ev.model_dump(mode='python'),
+        evidence=ev.model_dump(mode="python"),
+        snapshot_etag=getattr(ev, "snapshot_etag", "unknown"),
+        intent=req.intent,
         allowed_ids=allowed,
         retries=getattr(ev, "_retry_count", 0),
     )
+ 
+    # ——— render prompt stub & raw LLM JSON placeholder for M3 ——— #
+    prompt = canonical_json(envelope).encode()
+    raw_json: Dict[str, Any] = {}
 
     # ---------- persist envelope to MinIO (audit-trail §8.3) --- #
     try:
-        client = minio_client()
-        def _put(name: str, blob: bytes):
-            mc.put_object(
-                settings.minio_bucket,
-                f"{request_id}/{name}",
-                io.BytesIO(blob),
-                length=len(blob),
-                content_type="application/json",
-            )
-
-        _put("envelope.json",  orjson.dumps(envelope))
-        _put("response.json",  resp.model_dump_json().encode())
-        if meta.get("validator_errors"):
-            _put("validator_report.json", orjson.dumps({"errors": meta["validator_errors"]}))
-    except Exception as exc:            # non-blocking
+        _minio_put_batch(request_id, {
+            "envelope.json":  orjson.dumps(envelope),
+            "response.json":  resp.model_dump_json().encode(),
+            **({"validator_report.json": orjson.dumps({"errors": meta["validator_errors"]})}
+               if meta.get("validator_errors") else {}),
+        })
+    except Exception as exc:
         logger.warning("minio_put_envelope_failed", extra={"error": str(exc)})
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -245,22 +289,21 @@ def ask(req: AskIn):
     except _md.PackageNotFoundError:
         sdk_version = "unknown"
     meta = {
-        "policy_id":       envelope["policy_id"],
-        "prompt_id":       envelope["prompt_id"],
-        "prompt_fingerprint": pf,
-        "bundle_fingerprint": bundle_fp,
+        "policy_id": envelope["policy_id"],
+        "prompt_id": envelope["prompt_id"],
+        "prompt_fingerprint": envelope["_fingerprints"]["prompt_fingerprint"],
+        "bundle_fingerprint": envelope["_fingerprints"]["bundle_fingerprint"],
         "bundle_size_bytes": bundle_size_bytes(ev),
-        "snapshot_etag":   getattr(ev, "snapshot_etag", "unknown"),
+        "snapshot_etag": envelope["_fingerprints"]["snapshot_etag"],
         "fallback_used":   False,
         "retries":         getattr(ev, "_retry_count", 0),   # B-8
         "gateway_version": app.version,
         "sdk_version":     sdk_version,
         "selector_model_id": SELECTOR_MODEL_ID,
-        "gateway_version":  app.version,
-        "sdk_version":      "1.0.0",
         "latency_ms":      latency_ms,
-        **selector_meta,
+        "selector_meta":      selector_meta,
     }
+    meta["load_shed"] = should_load_shed()
 
     resp = WhyDecisionResponse(
         intent=req.intent,
@@ -275,20 +318,44 @@ def ask(req: AskIn):
     if not valid:
         logger.warning("validator_errors", extra={"errors": errors, "request_id": request_id})
         try:
-            ans_fixed = validate_and_fix(ev, resp.answer)
+            # apply validator with correct arguments & unpack results
+            answer, changed, errs = validate_and_fix(
+                resp.answer,
+                ev.allowed_ids,
+                ev.anchor.id,
+            )
+            resp.answer = answer
+            resp.meta["fallback_used"]   = changed
+            resp.meta["validator_errors"] = errs
         except Exception:
             ans_fixed = ans
-        resp.answer = ans_fixed
-        resp.meta["fallback_used"]   = True
-        resp.meta["validator_errors"] = errors
-
     log_stage(
-        logger, "ask", "templater_contract",
+        logger, "gateway", "templater_contract",
         request_id=request_id,
         intent=req.intent,
         allowed_count=len(allowed),
         supporting_count=len(resp.answer.supporting_ids),
     )
+
+    # ---------- persist artefacts to MinIO (audit-trail) --------------- #
+    try:
+        client = minio_client()
+        def _put(name: str, blob: bytes):
+            client.put_object(
+                settings.minio_bucket,
+                f"{request_id}/{name}",
+                io.BytesIO(blob),
+                length=len(blob),
+                content_type="application/json",
+            )
+
+        _put("envelope.json", orjson.dumps(envelope))
+        _put("response.json", resp.model_dump_json().encode())
+        if meta.get("validator_errors"):
+            _put("validator_report.json", orjson.dumps({"errors": meta["validator_errors"]}))
+    except Exception as exc:  # non-blocking
+        logger.warning("minio_put_envelope_failed", extra={"error": str(exc)})
+
     return resp
 
 app.include_router(router)
@@ -323,6 +390,7 @@ def readyz():
         return {"ready": False}
 
 @app.post("/ops/minio/ensure-bucket")
+@log_stage(logger, "gateway", "ensure_bucket")
 def ensure_bucket():
     """Create (if needed) and tag the artefact bucket; idempotent."""
     client = minio_client()
@@ -375,6 +443,7 @@ def ensure_bucket():
 
 # ---------- /v2/query (resolver-first NL path) ----------
 @app.post("/v2/query")
+@log_stage(logger, "gateway", "v2_query")
 def v2_query(payload: dict):
     """Natural‑language query resolver: BM25/Vector (first pass)."""
     log_stage(logger, "gateway", "v2_query_in", request_id=payload.get("request_id"))

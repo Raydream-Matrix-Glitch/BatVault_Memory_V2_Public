@@ -1,0 +1,44 @@
+{
+  "title": "PromptEnvelope",
+  "type": "object",
+  "properties": {
+    "prompt_version": {
+      "title": "Prompt Version",
+      "type": "string"
+    },
+    "intent": {
+      "title": "Intent",
+      "type": "string"
+    },
+    "question": {
+      "title": "Question",
+      "type": "string"
+    },
+    "evidence": {
+      "title": "Evidence",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "allowed_ids": {
+      "title": "Allowed Ids",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "constraints": {
+      "title": "Constraints",
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "prompt_version",
+    "intent",
+    "question",
+    "evidence",
+    "allowed_ids",
+    "constraints"
+  ],
+  "additionalProperties": false
+}

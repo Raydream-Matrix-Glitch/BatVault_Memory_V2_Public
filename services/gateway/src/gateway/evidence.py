@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-import httpx, orjson, redis, hashlib, random, time
+# async support for HTTP + jittered sleeps
+import asyncio
+import httpx
+import orjson
+import redis
+import hashlib
+import random
+import time
 from typing import List, Dict, Any, Optional, Tuple
 from pydantic import ValidationError
 
@@ -35,7 +42,7 @@ class EvidenceBuilder:
     """Collect & return a **validated** evidence bundle for *anchor_id*."""
 
     def __init__(self) -> None:
-        self._client = httpx.Client(timeout=3.0, base_url=settings.memory_api_url)
+        # Keep Redis client sync; HTTPX moved to async in build()
         try:
             self._redis: Optional[redis.Redis] = redis.Redis.from_url(settings.redis_url)
         except Exception:  # pragma: no cover
@@ -44,9 +51,9 @@ class EvidenceBuilder:
     # ------------------------------------------------------------------ #
     #  Public API                                                        #
     # ------------------------------------------------------------------ #
-    def build(self, anchor_id: str) -> WhyDecisionEvidence:
+    async def build(self, anchor_id: str) -> WhyDecisionEvidence:
         """
-        Two-key Redis cache (§H3):
+        Two-key Redis cache (§H3), with async HTTP fetch + retry.
            ① alias_key  –›   composite_key
            ② composite_key –› evidence JSON
         Both keys share the same TTL (15 min).
@@ -68,8 +75,44 @@ class EvidenceBuilder:
             except Exception:
                 logger.warning("redis read error – bypassing cache", exc_info=True)
 
-        # ---------- cache-miss ➜ upstream fetch (+1 retry) -------------
-        ev, snapshot_etag, retry_count = self._collect_from_upstream(anchor_id)
+        # ---------- cache-miss ➜ async upstream fetch (+1 retry) -------------
+        client = httpx.AsyncClient(timeout=httpx.Timeout(0.25), base_url=settings.memory_api_url)
+        # fetch anchor with one retry
+        for attempt in range(2):
+            resp_anchor = await client.get(f"/api/enrich/decision/{anchor_id}")
+            if resp_anchor.status_code == 200:
+                retry_count = attempt
+                break
+            if attempt == 1:
+                resp_anchor.raise_for_status()
+            await asyncio.sleep(random.uniform(0.05, 0.30))
+
+        resp_anchor.raise_for_status()
+        snapshot_etag = resp_anchor.headers.get("snapshot_etag", "unknown")
+
+        # parse anchor
+        anchor = WhyDecisionAnchor(**resp_anchor.json())
+        # fetch neighbors
+        resp_neigh = await client.post(
+            "/api/graph/expand_candidates",
+            json={"id": anchor_id, "k": 1},
+        )
+        resp_neigh.raise_for_status()
+        neigh = resp_neigh.json()
+        events    = neigh.get("events", [])
+        trans_pre = neigh.get("preceding", [])
+        trans_suc = neigh.get("succeeding", [])
+
+        await client.aclose()
+
+        # build the Pydantic model
+        ev = WhyDecisionEvidence(
+            anchor=anchor,
+            events=events,
+            transitions=WhyDecisionTransitions(preceding=trans_pre, succeeding=trans_suc),
+        )
+        ev.snapshot_etag = snapshot_etag
+        ev.__dict__["_retry_count"] = retry_count
         ev.snapshot_etag = snapshot_etag           # B-6
         ev.__dict__["_retry_count"] = retry_count  # B-8
 

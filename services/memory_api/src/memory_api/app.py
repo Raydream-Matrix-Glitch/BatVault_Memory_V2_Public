@@ -143,7 +143,7 @@ def relation_catalog(request):
 
 
 # ------------------ Resolver ------------------
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,}[a-z0-9]$")
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
 @app.post("/api/resolve/text")
 async def resolve_text(payload: dict, response: Response):
     from core_logging import trace_span
@@ -202,7 +202,7 @@ async def resolve_text(payload: dict, response: Response):
     except Exception as e:
         # Unit-test friendly fallback: return empty contract (no DB required)
         log_stage(logger, "resolver", "fallback_empty", error=type(e).__name__)
-        doc = {"query": q, "matches": [], "vector_used": bool(use_vector)}
+        doc = {"query": q}
     try:
         etag = store().get_snapshot_etag()
     except Exception:

@@ -31,6 +31,10 @@ def upsert_all(
         doc["snapshot_etag"] = snapshot_etag
         store.upsert_node(tid, "transition", doc)
 
+    # Derive reciprocal links before persisting
+    from ingest.pipeline.derive_links import derive_links
+    derive_links(decisions, events, transitions)
+
     # ---------------------------  Edges  ---------------------------
     # LED_TO  (event → decision)
     for eid, e in events.items():

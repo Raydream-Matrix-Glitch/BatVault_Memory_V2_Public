@@ -1,4 +1,4 @@
-# V2 Batvault Memory - Core Specification
+# V2 Batvault Memory - Core Specification (Updated)
 
 ## 1. System Overview
 
@@ -31,25 +31,58 @@
 - **Cache**: Redis 7
 - **Artifacts**: MinIO/S3
 
-## 4. API Contracts
+## 4. Configuration Constants
 
-### 4.1. Structured Endpoint
+### 4.1. Performance & Size Budgets
+```python
+# Evidence size management
+MAX_PROMPT_BYTES = 8192            # Hard limit for evidence bundle size
+SELECTOR_TRUNCATION_THRESHOLD = 6144  # Start truncating before hard limit
+MIN_EVIDENCE_ITEMS = 1             # Always keep anchor + 1 supporting item
+SIM_DIM = 768                      # Vector dimension for HNSW index
+
+# Performance budgets (milliseconds)
+TTFB_SLUG_MS = 600                 # Known slug lookup
+TTFB_SEARCH_MS = 2500              # Text search
+P95_ASK_MS = 3000                  # /v2/ask total
+P95_QUERY_MS = 4500                # /v2/query total
+
+# Stage timeouts
+TIMEOUT_SEARCH_MS = 800
+TIMEOUT_GRAPH_EXPAND_MS = 250
+TIMEOUT_ENRICH_MS = 600
+TIMEOUT_LLM_MS = 1500
+TIMEOUT_VALIDATOR_MS = 300
+```
+
+### 4.2. Cache TTLs
+```python
+# Cache policies (seconds)
+CACHE_TTL_RESOLVER = 300           # 5min - normalized decision_ref
+CACHE_TTL_EVIDENCE = 900           # 15min - evidence bundles
+CACHE_TTL_LLM_JSON = 120           # 2min - hot anchors
+CACHE_TTL_EXPAND = 60              # 1min - graph expansion results
+```
+
+## 5. API Contracts
+
+### 5.1. Structured Endpoint
 
 ```http
 POST /v2/ask
 {
   "intent": "why_decision|who_decided|when_decided|chains",
-  "decision_ref": "pause-paas-rollout-2024-q3",
+  "decision_ref": "panasonic-exit-plasma-2012",
   "options": {"llm_mode": "auto|off|force", "timeout_ms": 3500}
 }
 ```
 
-### 4.2. Natural Language Endpoint
+### 5.2. Natural Language Endpoint
 
 ```http
 POST /v2/query
 {
-  "text": "Why was the PaaS rollout paused?"
+  "text": "Why did Panasonic exit plasma TV production?"
 }
 ```
 
@@ -57,14 +90,14 @@ POST /v2/query
 - `search_similar(query_text: string, k: int=3)` → vector search
 - `get_graph_neighbors(node_id: string, k: int=3)` → graph traversal
 
-### 4.3. Response Schema
+### 5.3. Response Schema
 
 ```json
 {
   "intent": "why_decision",
   "evidence": {
-    "anchor": {"id": "...", "option": "...", "rationale": "..."},
-    "events": [{"id": "...", "summary": "...", "timestamp": "..."}],
+    "anchor": {"id": "...", "option": "...", "rationale": "...", "tags": [...]},
+    "events": [{"id": "...", "summary": "...", "timestamp": "...", "snippet": "..."}],
     "transitions": {"preceding": [], "succeeding": []},
     "allowed_ids": ["anchor-id", "event-1"]
   },
@@ -84,25 +117,60 @@ POST /v2/query
     "snapshot_etag": "sha256:...",
     "fallback_used": false,
     "retries": 0,
-    "latency_ms": 1250
+    "latency_ms": 1250,
+    "evidence_metrics": {
+      "total_neighbors_found": 12,
+      "selector_truncation": true,
+      "final_evidence_count": 8,
+      "dropped_evidence_ids": ["low-score-event-1"],
+      "bundle_size_bytes": 7680,
+      "max_prompt_bytes": 8192
+    },
+    "model_metrics": {
+      "resolver_confidence": 0.85,
+      "selector_model_id": "selector_v1",
+      "resolver_model_id": "bi_encoder_v1"
+    },
+    "stage_timings": {
+      "resolve_ms": 120,
+      "expand_ms": 80,
+      "enrich_ms": 200,
+      "bundle_ms": 50,
+      "llm_ms": 800,
+      "validate_ms": 30
+    }
   }
 }
 ```
 
-## 5. Evidence Rules & Quotas
+## 6. Evidence Rules & Quotas
 
-### 5.1. Intent Quotas
+### 6.1. Intent Quotas (Enhanced)
 
-| Intent | k | Events | Preceding | Succeeding |
-|--------|---|--------|-----------|------------|
-| `why_decision` | 1 | unbounded* | unbounded* | unbounded* |
-| `who_decided` | 1 | unbounded* | 0 | 0 |
-| `when_decided` | 1 | unbounded* | unbounded* | unbounded* |
-| `chains` | unlimited | unbounded* | N/A | N/A |
+| Intent | k-limit | Events | Preceding | Succeeding | Max Bundle Size | Notes |
+|--------|---------|--------|-----------|------------|----------------|-------|
+| `why_decision` | 1 | unbounded* | unbounded* | unbounded* | 8192 bytes | Core reasoning |
+| `who_decided` | 1 | unbounded* | 0 | 0 | 8192 bytes | Decision makers |
+| `when_decided` | 1 | unbounded* | unbounded* | unbounded* | 8192 bytes | Timeline context |
+| `chains` | unlimited | unbounded* | N/A | N/A | 16384 bytes | Full chains |
 
-*Gateway may truncate to meet prompt-size or latency budgets; logs `selector_truncation=true` when evidence is dropped.
+*Subject to selector truncation when bundle exceeds max size; logs `selector_truncation=true` when evidence is dropped.
 
-### 5.2. Validation Rules
+### 6.2. Evidence Size Management
+
+#### 6.2.1. Truncation Behavior
+- **Collection Phase**: Planner expands k=1 and collects ALL neighbors (unbounded)
+- **Size Check**: If `json.dumps(bundle).length > MAX_PROMPT_BYTES`, selector truncates
+- **Truncation Logic**: Drop lowest-scoring items until size fits prompt budget
+- **Logging**: Set `selector_truncation=true` when evidence is dropped
+- **ID Updates**: `allowed_ids` reflects final post-truncation evidence set
+
+#### 6.2.2. Selector Model (Weak AI)
+**Type**: GBDT/logistic regression for evidence scoring
+**Features**: Text similarity, graph degree, recency delta, tag overlap
+**Fallback**: Deterministic sort (recency + similarity) if model unavailable
+
+### 6.3. Validation Rules
 
 **Response Validation**:
 - `supporting_ids ⊆ allowed_ids` (strict subset)
@@ -113,54 +181,79 @@ POST /v2/query
 
 | Field | Rule | Purpose |
 |-------|------|---------|
-| `id` | `/^[a-z0-9][a-z0-9-]{2,}[a-z0-9]$/` | Unique lookup |
+| `id` | `/^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$/` | Unique lookup (allows underscores) |
 | `timestamp` | ISO-8601 UTC (`Z`) | Ordering/recency |
 | Content fields* | ≥1 non-whitespace char | Prevents empty stubs |
+| `tags` | Array of strings (optional) | Categorization |
+| `x-extra` | Object (optional) | Extension field |
 
-*Content fields: `rationale`, `description`, `reason`, `summary`
+*Content fields: `rationale`, `description`, `reason`, `summary`, `snippet`
 
 **Link Validation** (Updated):
-If `supported_by`, `led_to`, `transitions`, `from`, or `to` **exist and are non-empty**, each ID must be resolvable; otherwise the field may be omitted or an empty array. This allows for orphaned events (no `led_to` yet) and standalone decisions (no `transitions`).
+If `supported_by`, `based_on`, `led_to`, `transitions`, `from`, or `to` **exist and are non-empty**, each ID must be resolvable; otherwise the field may be omitted or an empty array. This allows for orphaned events (no `led_to` yet) and standalone decisions (no `transitions`).
 
-## 6. JSON Authoring Schemas
+## 7. JSON Authoring Schemas
 
-### 6.1. Decision (with optional/empty arrays)
+### 7.1. Decision (updated with new fields)
 ```json
 {
-  "id": "pause-paas-rollout-2024-q3",
-  "option": "Pause PaaS rollout",
-  "rationale": "Q2 financials revealed cashflow guard-rails...",
-  "timestamp": "2024-07-20T14:30:00Z",
-  "decision_maker": "Bob",
-  "supported_by": ["B-E1", "B-E2"],
-  "transitions": []  // Empty array is valid - no succeeding decision yet
+  "id": "panasonic-exit-plasma-2012",
+  "option": "Exit plasma TV production",
+  "rationale": "Declining demand and heavy losses in plasma panels necessitated a strategic withdrawal to focus resources on automotive and battery growth.",
+  "timestamp": "2012-04-30T09:00:00Z",
+  "decision_maker": "Kazuhiro Tsuga",
+  "tags": [
+    "portfolio_rationalization",
+    "loss_mitigation"
+  ],
+  "supported_by": [
+    "pan-e2"
+  ],
+  "based_on": [
+    "panasonic-tesla-battery-partnership-2010"
+  ],
+  "transitions": [
+    "trans-pan-2010-2012",
+    "trans-pan-2012-2014"
+  ],
+  "x-extra": {}
 }
 ```
 
-### 6.2. Event (orphan example)
+### 7.2. Event (updated with new fields)
 ```json
 {
-  "id": "B-E1",
-  "summary": "Q2 report shows 40% infra overspend",
-  "description": "Q2 financial report shows...",
-  "timestamp": "2024-07-19T08:00:00Z",
-  "led_to": []  // Empty array is valid - no decision made yet based on this event
+  "id": "pan-e4",
+  "summary": "Board approves AU Automotive acquisition",
+  "description": "In April 2014, Panasonic's board green-lit the €1.2 bn purchase of AU Automotive.",
+  "timestamp": "2014-04-01T14:00:00Z",
+  "tags": [
+    "m_and_a",
+    "automotive_electronics"
+  ],
+  "led_to": [
+    "panasonic-automotive-infotainment-acquisition-2014"
+  ],
+  "snippet": "€1.2 bn for AU Automotive.",
+  "x-extra": {}
 }
 ```
 
-### 6.3. Transition
+### 7.3. Transition (updated with x-extra)
 ```json
 {
-  "id": "trans-123",
-  "from": "enter-cloud-market-2024-q1",
-  "to": "pause-paas-rollout-2024-q3",
+  "id": "trans-pan-2010-2012",
+  "from": "panasonic-tesla-battery-partnership-2010",
+  "to": "panasonic-exit-plasma-2012",
   "relation": "causal",
-  "reason": "Guard-rail breached...",
-  "timestamp": "2024-08-12T09:05:00Z"
+  "reason": "Strategic focus shifted to EV batteries from plasma TVs",
+  "timestamp": "2013-10-09T00:00:00Z",
+  "tags": ["strategic_pivot"],
+  "x-extra": {}
 }
 ```
 
-### 6.4. Orphan Handling Examples
+### 7.4. Orphan Handling Examples
 
 **First Decision (no predecessor)**:
 ```json
@@ -170,8 +263,11 @@ If `supported_by`, `led_to`, `transitions`, `from`, or `to` **exist and are non-
   "rationale": "Market opportunity identified...",
   "timestamp": "2024-01-15T10:00:00Z",
   "decision_maker": "Alice",
+  "tags": ["strategic_expansion"],
   "supported_by": ["market-research-event"],
-  "transitions": []  // No preceding decision
+  "based_on": [],
+  "transitions": [],
+  "x-extra": {}
 }
 ```
 
@@ -182,11 +278,14 @@ If `supported_by`, `led_to`, `transitions`, `from`, or `to` **exist and are non-
   "summary": "Security audit reveals vulnerabilities",
   "description": "Annual security audit identified critical vulnerabilities...", 
   "timestamp": "2024-07-25T14:00:00Z",
-  "led_to": []  // No decision made yet - still being evaluated
+  "tags": ["security", "compliance"],
+  "led_to": [],
+  "snippet": "Critical vulnerabilities found.",
+  "x-extra": {}
 }
 ```
 
-## 7. Memory API Endpoints
+## 8. Memory API Endpoints
 
 - `GET /api/enrich/{type}/{id}` → normalized envelope
 - `POST /api/graph/expand_candidates` → k=1 traversal (AQL)
@@ -194,16 +293,37 @@ If `supported_by`, `led_to`, `transitions`, `from`, or `to` **exist and are non-
 - `GET /api/schema/fields` → field catalog
 - `GET /api/schema/rels` → relation catalog
 
-## 8. Prompt & Audit System
+## 9. Weak AI Component Specifications
 
-### 8.1. Prompt Envelope
+### 9.1. Resolver Models
+**Bi-encoder**: `sentence-transformers/all-MiniLM-L6-v2` for decision similarity
+**Cross-encoder**: `cross-encoder/ms-marco-MiniLM-L-6-v2` for reranking
+**BM25 Fallback**: Always available lexical search when embeddings fail
+
+### 9.2. Evidence Selector
+**Purpose**: Score and rank evidence when truncation is needed
+**Model Types**: GBDT (primary) → logistic regression → deterministic fallback
+**Features**:
+- `text_similarity`: cosine(event_text, anchor_rationale)  
+- `graph_degree`: in/out degree of nodes
+- `recency_delta`: days between event and anchor timestamps
+- `tag_overlap`: intersection(event.tags, anchor.tags)
+
+### 9.3. Graph Embeddings (Future)
+**Methods**: Node2Vec or LightGCN for graph representation learning
+**Dimensions**: 128d for graph structure features
+**Purpose**: Enhanced similarity and recommendation features
+
+## 10. Prompt & Audit System
+
+### 10.1. Prompt Envelope
 ```json
 {
   "prompt_version": "why_v1",
   "intent": "why_decision",
-  "question": "Why was the PaaS rollout paused?",
+  "question": "Why did Panasonic exit plasma TV production?",
   "evidence": { /* minimal bundle */ },
-  "allowed_ids": ["pause-123", "event-1"],
+  "allowed_ids": ["panasonic-exit-plasma-2012", "pan-e2"],
   "constraints": {
     "output_schema": "WhyDecisionAnswer@1",
     "max_tokens": 256
@@ -211,65 +331,152 @@ If `supported_by`, `led_to`, `transitions`, `from`, or `to` **exist and are non-
 }
 ```
 
-### 8.2. Deterministic IDs
+### 10.2. Deterministic IDs
 - `prompt_fingerprint`: SHA-256 of canonical envelope
 - `snapshot_etag`: Content hash + timestamp of JSON corpus
 - `bundle_fingerprint`: SHA-256 of evidence bundle
 - `request_id`: Per-request trace ID
 
-### 8.3. Artifacts (per request_id)
-- Prompt envelope (canonical JSON)
-- Rendered prompt (exact LLM input)
-- Raw LLM JSON output
-- Validator report
-- Final response JSON
+### 10.3. Artifact Retention & Audit
 
-## 9. Performance & Reliability
+#### 10.3.1. Artifact Types (Per Request)
+- **Prompt Envelope**: Canonical JSON with deterministic fingerprint
+- **Rendered Prompt**: Exact string/bytes sent to LLM
+- **Raw LLM JSON**: Unprocessed model output
+- **Validator Report**: Schema validation results, ID scope checks
+- **Final Response**: Complete response sent to client
+- **Evidence Bundle**: Pre and post-truncation versions
 
-### 9.1. Performance Targets
+#### 10.3.2. Storage Strategy
+**Location**: MinIO/S3 with request_id-based keys
+**Format**: `/{bucket}/{request_id}/{artifact_type}.json`
+**Retention**: Configurable per tenant (default 14 days)
+**Access Control**: `private|org|public` visibility levels
+
+#### 10.3.3. Fingerprint Tracking
+**Prompt Fingerprint**: SHA-256 of canonical envelope
+**Bundle Fingerprint**: SHA-256 of evidence bundle
+**Request Linking**: Chain related requests via fingerprints
+
+## 11. Performance & Reliability
+
+### 11.1. Performance Targets
 - **TTFB**: ≤600ms (known slug), ≤2.5s (search)
 - **p95 Total**: ≤3.0s (`/v2/ask`), ≤4.5s (`/v2/query`)
 - **Model Inference**: ≤5ms (resolver), ≤2ms (selector)
 
-### 9.2. Fallback Strategy
+### 11.2. Fallback Strategy
 1. **LLM Failures**: Auto-retry ≤2 times → templated answer
 2. **Model Failures**: Weak AI → deterministic methods
 3. **Timeout**: Return partial evidence with `completeness_flags`
 
-### 9.3. Caching
+### 11.3. Caching
 - **Resolver**: 5min TTL
 - **Evidence Bundle**: 15min TTL, invalidate on `snapshot_etag` change
 - **LLM JSON**: 2min TTL for hot anchors
+- **Graph Expansion**: 1min TTL for k=1 results
 
-## 10. Configuration & Intent Registry
+### 11.4. Load Shedding & Circuit Breakers
+
+#### 11.4.1. Auto Load-Shedding
+**Trigger Conditions**:
+- Queue depth > threshold
+- Stage timeouts exceeded
+- External service failures
+
+**Actions**:
+- Set `llm_mode=off` (switch to templater)
+- Skip expensive operations (embeddings, complex graph traversals)
+- Return `meta.load_shed=true` in responses
+
+#### 11.4.2. Circuit Breaker States
+**Closed**: Normal operation, all features enabled
+**Open**: Failures detected, fallback to basic operations
+**Half-Open**: Testing recovery, gradual feature re-enablement
+
+## 12. Configuration & Intent Registry
 
 **Intent Registry**: Policy-as-data configuration via `registry.json` (JSON format for consistency, not watched by snapshot watcher)
 
 **Environment**: `SNAPSHOT_EXT=json`, watcher globs `**/*.json`
 
-## 11. Acceptance Criteria
+**Feature Flags**:
+```python
+ENABLE_EMBEDDINGS = True          # Vector search vs BM25 only
+ENABLE_SELECTOR_MODEL = True      # Learned vs deterministic selection  
+ENABLE_GRAPH_EMBEDDINGS = False   # Graph ML features
+ENABLE_LOAD_SHEDDING = True       # Auto fallback under load
+ENABLE_ARTIFACT_RETENTION = True  # Store audit artifacts
+ENABLE_CACHING = True             # Redis caching layer
+```
 
-### 11.1. Functional Requirements
+## 13. Testing Framework
+
+### 13.1. Golden Test Structure
+```
+/tests/golden/
+  why_decision_panasonic_plasma.json      # Core plasma TV exit case
+  why_decision_with_based_on.json         # Decision chains
+  why_decision_tags_filtering.json        # Tag-based evidence
+  who_decided_anchor_v1.json              # Decision maker identification  
+  when_decided_anchor_v1.json             # Timeline reconstruction
+  event_with_snippet_display.json         # Snippet field usage
+```
+
+### 13.2. Test Requirements
+**Coverage**: `coverage = 1.0` and `completeness_debt = 0` on all golden tests
+**Reproducibility**: Identical results across runs with same input
+**Performance**: All golden tests must meet latency SLOs
+
+### 13.3. Validation Tests
+**Schema Tests**: All response schemas validated
+**Cross-link Tests**: Bidirectional relationship enforcement  
+**Orphan Tests**: Isolated events/decisions handled gracefully
+**New Field Tests**: Tags, snippets, x-extra processing
+
+## 14. Acceptance Criteria
+
+### 14.1. Functional Requirements
 1. `/v2/ask` with known slug returns in ≤3.0s p95, `fallback_used=false`
 2. `/v2/query` natural language routing works for basic intents
 3. Invalid LLM JSON triggers fallback, never returns user-visible errors
 4. New JSON fields auto-appear in `/v2/schema/fields` (zero code changes)
 
-### 11.2. Quality Gates
+### 14.2. Quality Gates
 5. Golden tests pass: `coverage=1.0`, `completeness_debt=0`
 6. All responses include audit metadata: `prompt_id`, `policy_id`, `prompt_fingerprint`
 7. Complete artifact retention for every request
 8. Health endpoints ready with ArangoDB dependency checks
 
-### 11.3. Data Quality & Orphan Handling
+### 14.3. Data Quality & Orphan Handling
 9. All timestamps in UTC (`Z`) format
 10. Event summary auto-repair if missing/empty
-11. Cross-link reciprocity: `event.led_to ↔ decision.supported_by` (where both exist)
-12. k=1 expansion collects all neighbours; gateway may truncate for prompt‑size or latency budgets (logs selector_truncation=true).
+11. Cross-link reciprocity: `event.led_to ↔ decision.supported_by` and `decision.based_on ↔ prior_decision.transitions` (where both exist)
+12. k=1 expansion collects all neighbours; gateway may truncate for prompt-size or latency budgets (logs `selector_truncation=true`)
 13. Orphaned events and decisions are valid and handled gracefully
 14. Empty link arrays (`[]`) are valid; omitted fields are treated as empty arrays
+15. Tags and snippets are optional enrichment fields
+16. The `x-extra` field provides extensibility without schema changes
 
-## 12. Service Structure
+## 15. Key Schema Changes Summary
+
+### 15.1. New Fields Added
+- **Decision**: `tags`, `based_on`, `x-extra`
+- **Event**: `tags`, `snippet`, `x-extra` 
+- **Transition**: `tags`, `x-extra`
+
+### 15.2. Field Purpose Updates
+- **`based_on`**: References to prior decisions that influenced this decision (complements `supported_by` events)
+- **`tags`**: Categorical labels for filtering and grouping
+- **`snippet`**: Brief extract for display in evidence bundles
+- **`x-extra`**: Extension object for custom fields without schema migration
+
+### 15.3. Validation Updates
+- ID regex allows underscores: `/^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$/`
+- `snippet` added to content field validation
+- Cross-link reciprocity extended to `based_on ↔ transitions` relationships
+
+## 16. Service Structure
 
 ```
 /services
@@ -284,11 +491,15 @@ If `supported_by`, `led_to`, `transitions`, `from`, or `to` **exist and are non-
 /packages
   /core-storage     # ArangoDB graph + vector adapters
   /core-models      # Pydantic schemas
+  /core-logging     # Structured logging with OTEL
+  /core-config      # Configuration management
+  /core-errors      # Error handling
+  /core-ids         # Deterministic ID generation
 /memory
   /{decisions,events,transitions}/*.json
 ```
 
-## 13. Development Setup
+## 17. Development Setup
 
 **Prerequisites**: Docker Compose with ArangoDB, Redis, MinIO
 
@@ -301,25 +512,48 @@ docker-compose up -d
 
 **Environment**: `SNAPSHOT_EXT=json`, watcher globs `**/*.json`
 
-## 14. Missing Test Cases (Implementation TODO)
+## 18. Production Readiness
 
-### 14.1. Validator Unit Tests
+### 18.1. Monitoring & Alerting
+**SLOs**: TTFB, total latency, fallback rate, cache hit rate
+**Alerting**: Breach notifications, model drift detection
+**Dashboards**: Stage timings, evidence truncation rates, model performance
+
+### 18.2. Security & Privacy
+- **Authentication**: Bearer/JWT tokens at API edge
+- **CORS**: Configurable allow-list for frontend origins
+- **PII Handling**: Best-effort redaction in audit artifacts
+- **Data Retention**: Configurable per-tenant policies
+
+### 18.3. Production Checklist
+- [ ] All golden tests passing at 100% coverage
+- [ ] Performance SLOs met under realistic load
+- [ ] Complete monitoring and alerting configured
+- [ ] Security review completed
+- [ ] Documentation complete and validated
+- [ ] Disaster recovery procedures tested
+
+## 19. Implementation Test Cases
+
+### 19.1. Validator Unit Tests
 - `decision_no_transitions.json` (empty array validation)
 - `event_orphan.json` (no `led_to` validation)
-- `decision_missing_transitions_field.json` (omitted field validation)
+- `decision_with_tags.json` (tags array validation)
+- `decision_based_on_validation.json` (based_on link validation)
+- `event_with_snippet.json` (snippet field validation)
 
-### 14.2. Golden Test Cases
-- `why_decision_orphan_event.json` (should return empty transitions, single event)
-- `why_decision_standalone.json` (first decision, no predecessors)
-- `why_decision_many_events.json` (decision with >3 supporting events, tests unbounded collection)
-- `why_decision_branching_transitions.json` (multiple preceding/succeeding decisions)
+### 19.2. Golden Test Cases
+- `why_decision_panasonic_plasma.json` (plasma TV exit with automotive pivot context)
+- `why_decision_with_based_on.json` (decision influenced by prior decisions)
+- `why_decision_tags_filtering.json` (evidence filtering by tags)
+- `event_with_snippet_display.json` (snippet field in evidence bundle)
 
-### 14.3. Router Contract Tests
-- `test_query_intent.py` → text: "Why did we pause PaaS?" → expects Memory API calls + final WhyDecisionResponse@1 body
-- Ensure `/v2/query` triggers both `search_similar` AND `get_graph_neighbors` calls and merges results
+### 19.3. Router Contract Tests
+- `test_query_panasonic.py` → text: "Why did Panasonic exit plasma?" → expects Memory API calls + final WhyDecisionResponse@1 body
+- Cross-link validation for `based_on` relationships
 
-### 14.4. Back-link Derivation Tests
-- Snapshot where only one side exists → ingest logs `link_missing` warning rather than failing
-- Test bidirectional link repair when backlinks are missing
+### 19.4. Back-link Derivation Tests
+- Bidirectional repair for `based_on ↔ transitions` relationships
+- Tag-based evidence enrichment and filtering
 
-This specification defines the core system contracts and requirements with explicit orphan handling. See `/docs/adr/` for architectural decisions, ML roadmap, and detailed UX specifications.
+This updated specification provides complete alignment with the technical specification and requirements checklist, incorporating all performance budgets, weak AI components, enhanced observability, and comprehensive testing requirements.

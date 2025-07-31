@@ -1,374 +1,773 @@
-# V2 Batvault Memory - Implementation Requirements Checklist
+# V2 Batvault Memory - Technical Specification (Updated)
 
-## A. Core API & Endpoints
+## A. Scope & North Star
 
-### API Edge Service
-- [ ] `POST /v2/ask` endpoint with structured intent-based queries
-- [ ] `POST /v2/query` endpoint with natural language input and LLM function routing
-- [ ] HTTP middleware: auth, rate-limiting, idempotency, CORS
-- [ ] Idempotency: Keys + request hash → dedupe concurrent identical calls (Redis/LFU guard)
-- [ ] Bearer/JWT authentication at API edge
-- [ ] CORS allow-list for frontend origins
-- [ ] Request/response envelope schemas (Pydantic/OpenAPI)
-- [ ] Health endpoints: `GET /healthz` (process up) and `GET /readyz` (dependencies ready)
+**Vision**: One endpoint, intent-first, JSON-only, FE formats UI
 
-### Gateway Service
-- [ ] Intent resolution and routing system
-- [ ] LLM function routing for natural language queries
-- [ ] Evidence planner with schema-agnostic Graph Query Plan compilation
-- [ ] Evidence bundle builder with k=1 neighbor collection
-- [ ] Prompt envelope builder (canonical JSON, versioned)
-- [ ] LLM client with JSON-only mode, retries, validation
-- [ ] Validator with blocking schema/ID scope checks
-- [ ] Renderer for streaming tokenized responses
-- [ ] Fallback templater for deterministic answers
+- **Single Endpoint**: `POST /v2/ask` with intent (e.g., `why_decision`, `who_decided`, `when_decided`, `chains`) + options
+- **Natural Language Gateway**: `POST /v2/query` with LLM function routing for text queries
+- **Planner-lite** builds a schema-agnostic Graph Query Plan (k=1 for "why")
+- **Evidence Bundle** (deterministic, cacheable) → micro-LLM (JSON-only) or deterministic templater
+- **Blocking validation** + deterministic fallback
+- **Structured logging** across all stages; artifact retention for audit & learning
+- **Orphan-tolerant**: Events without decisions, decisions without predecessors/successors are valid
 
-## B. Data Models & Schemas
+## A1. Components & Boundaries (Normative Responsibilities)
 
-### JSON Schema Definitions
-- [ ] `WhyDecisionEvidence@1` schema
-- [ ] `WhyDecisionAnswer@1` schema  
-- [ ] `WhyDecisionResponse@1` schema
-- [ ] Error envelope schema with consistent error codes
-- [ ] Intent registry (data-driven configuration)
-- [ ] Intent quota table with k-limits for all intents:
+| Component | Responsibilities |
+|-----------|------------------|
+| **API Edge** | HTTP, auth, rate-limit, idempotency, streams rendered tokens only |
+| **Gateway** | resolve → plan → exec graph → build bundle → prompt → LLM → validate → render → stream; writes artifacts |
+| **Intent Router** | LLM function routing for natural language queries; calls Memory API |
+| **Storage/Catalog** | JSON watcher → field/relation catalogs + ETag snapshot; write to ArangoDB (graph+vector) |
 
-| Intent | K-limit | Scope |
-|--------|---------|-------|
-| `why_decision` | k=1 | Unbounded events + transitions |
-| `who_decided` | k=1 | Decision makers + context |
-| `when_decided` | k=1 | Timeline + related decisions |
+## A1.1. Weak AI Philosophy
 
-- [ ] Prompt envelope schema (versioned, auditable)
+**LLM does one thing only:** produce the `answer.short_answer` JSON (and only when `llm_mode!=off`).
 
-### Response Contracts
-- [ ] Evidence bundle: `{anchor, events[], transitions{preceding|succeeding}, allowed_ids[]}`
-- [ ] Answer object: `{short_answer, supporting_ids[]}`
-- [ ] Meta object: `{policy_id, prompt_id, retries, latency_ms, fallback_used}`
-- [ ] Completeness flags: `{has_preceding, has_succeeding, event_count}`
+**Everything else is "weak AI"** (small, cheap models) or deterministic logic:
+* Keeps p95 latency by avoiding heavy calls for search, ranking, or validation
+* Gives you clear fallbacks: if a weak model is missing or low‑confidence, we fall back to the **deterministic templater + rule pipeline**
 
-## C. Storage & Data Layer
+## A2. Project Structure
 
-### ArangoDB Setup
-- [ ] Graph collections for decisions, events, transitions
-- [ ] Vector indexes with SIM_DIM = 768 dimensions for HNSW
-- [ ] AQL query compilation for k=1 traversals
-- [ ] Graph operations (upsert nodes/edges)
-- [ ] Vector search operations
-- [ ] Connection health checks and readiness probes
+```
+/services
+  /api-edge
+    /routes
+    /middleware (auth, rate-limit, idempotency)
+    /adapters (gateway client)
+    /schemas (request/response envelopes from core-models)
+    /tests/{unit,integration}
+  /gateway
+    /intents/registry.json            # policy-as-data; prompt_id, graph_scope (JSON format, not watched by snapshot)
+    /planner/                         # resolve → plan → exec (SA-GQL compiler)
+    /resolver/                        # weak AI models for anchor resolution
+      embedding_model.py              # bi-encoder for decision search
+      reranker.py                     # cross-encoder for ambiguous cases
+      fallback_search.py              # BM25 lexical search
+    /evidence/                        # bundle builder (k=1 for why), cache
+      selector_model.py               # learned scorer for event/transition selection
+    /embeddings/                      # graph representation learning
+      graph_vectors.py                # Node2Vec/LightGCN embeddings
+    /prompt/                          # system templates, JSON-only user msg composer
+    /trace/                           # Trace & Envelope builders, artifact sink
+    /llm/                             # client, retries, JSON validation
+    /validator/                       # schema + id-scope + mandatory IDs
+    /renderer/                        # short_answer → streamed text
+    /intent_router/                   # LLM function routing for /v2/query
+    /endpoints/                       # query.py, ask.py
+    /telemetry/                       # service-specific meters and spans
+    /tests/{unit,integration,golden}
+  /ingest
+    /schemas/json-v2/*.json           # authoring schemas for decisions/events/transitions
+    /pipeline/                        # parse, validate, alias, derive, index
+      graph_upsert.py                 # ArangoDB graph operations
+      vector_upsert.py                # ArangoDB vector operations
+    /catalog/                         # fields/relations
+    /api/                             # normalize/enrich/expand, schema endpoints
+    /tests/{unit,contract}
+  /memory-api
+    /tests/{unit,integration,contract}
+/packages
+  /core-logging
+  /core-telemetry
+  /core-config
+  /core-errors
+  /core-ids
+  /core-models                        # Pydantic/OpenAPI for wire contracts only
+    /schemas/                         # JSON schemas (single source of truth)
+  /core-storage                       # ArangoDB adapters
+    graph_store.py                    # Graph operations
+    vector_store.py                   # Vector search operations
+/apps
+  /frontend
+    /src
+    /public
+    /e2e
+    Dockerfile
+/ops
+  /docker/                           # Dockerfiles per service
+  /compose/docker-compose.yml        # includes ArangoDB service
+  /otel/collector.yaml
+  /minio/                            # artifact store bootstrapping
+/scripts
+  /seed_memory.sh                    # loads /memory into ingest
+  /smoke.sh                          # end-to-end check in compose
+/docs
+  /openapi/                          # generated OpenAPI for API edge + memory API
+/tests
+  /golden/why_decision_panasonic_plasma.json
+  /golden/why_decision_with_based_on.json
+  /golden/who_decided_anchor_v1.json
+  /golden/when_decided_anchor_v1.json
+  /e2e/compose/                      # black-box API tests
+/memory
+  /decisions/*.json
+  /events/*.json
+  /transitions/*.json
+```
 
-### Memory API Service
-- [ ] `GET /api/enrich/decision/{id}` - normalized decision envelopes
-- [ ] `GET /api/enrich/event/{id}` - normalized event envelopes
-- [ ] `GET /api/enrich/transition/{id}` - normalized transition envelopes
-- [ ] `POST /api/graph/expand_candidates` - k=1 neighborhood expansion
-- [ ] `POST /api/resolve/text` - vector similarity search
-- [ ] `GET /api/schema/fields` - field catalog endpoint
-- [ ] `GET /api/schema/rels` - relation catalog endpoint
+## B. Deliverables (MVP → Ready for Growth)
 
-## D. Ingest Pipeline
+### B1. API & Contracts
 
-### JSON Processing Pipeline
-- [ ] File watcher with snapshot ETag generation
-- [ ] JSON parsing with file/line diagnostics
-- [ ] Strict validation (ID regex, enums, referential integrity)
-- [ ] Artifact validation (ID, timestamp, content field requirements)
-- [ ] Normalization/aliasing (schema-agnostic field mapping)
-- [ ] Text processing (NFKC, trim, collapse whitespace, length limits)
-- [ ] Timestamp parsing to ISO-8601 UTC
-- [ ] Tag processing (lowercase, slugify, dedupe, sort)
+**Core Endpoints**:
+- `/v2/ask` (structured endpoint with explicit intent)
+- `/v2/query` (natural language endpoint with LLM function routing)
+- Shared JSON models (Pydantic/OpenAPI)
 
-### Data Derivation
-- [ ] Backlink enforcement (`event.led_to ↔ decision.supported_by`)
-- [ ] Transition cross-references in related decisions
-- [ ] Field catalog generation (semantic names → aliases)
-- [ ] Relation catalog generation (available edge types)
-- [ ] Event summary repair (derive from description if missing)
+**Query Endpoint Contract**:
+```json
+POST /v2/query
+{
+  "text": "Why did Panasonic exit plasma TV production?"
+}
 
-### Persistence
-- [ ] ArangoDB node/edge upserts
-- [ ] Vector index building/refreshing
-- [ ] Content-addressable snapshot storage
-- [ ] BM25 text indexing
-- [ ] Adjacency list generation
+Response:
+{
+  "intent": "why_decision",
+  "evidence": { /* Evidence Bundle */ },
+  "answer": { /* Answer object */ },
+  "completeness_flags": { /* flags */ },
+  "meta": {
+    "function_calls": ["search_similar", "get_graph_neighbors"],
+    "routing_confidence": 0.85,
+    "policy_id": "query_v1",
+    "prompt_id": "router_v1",
+    "retries": 0,
+    "latency_ms": 1250
+  }
+}
+```
 
-## E. Weak AI Components
+**LLM Function Routing**:
+- `search_similar(query_text: string, k: int=3)` → Memory API `/api/resolve/text` or ArangoDB vector search
+- `get_graph_neighbors(node_id: string, k: int=3)` → Memory API `/api/graph/expand_candidates` or AQL traversal
 
-### Resolver Models
-- [ ] Bi-encoder for decision similarity search
-- [ ] Cross-encoder for reranking ambiguous cases
-- [ ] BM25 lexical search fallback
-- [ ] Anchor resolution with precedence rules (slug → skip search)
+**Data Models**:
+- **Evidence**: `{anchor, events[], transitions{preceding|succeeding}, allowed_ids[]}`
+- **Answer**: `{short_answer, supporting_ids[]}`
+- **Response**: `{intent, evidence, answer, completeness_flags, meta{policy_id, prompt_id, retries, latency_ms}}`
+- **Intent Registry**: Data-driven; add intents via config, not code
 
-### Evidence Selection
-- [ ] Learned scorer for event/transition selection (GBDT/logistic regression)
-- [ ] Feature extraction (text similarity, graph features, tag overlap)
-- [ ] Evidence truncation constants:
-  - [ ] MAX_PROMPT_BYTES = 8192 (hard limit for bundle size)
-  - [ ] SELECTOR_TRUNCATION_THRESHOLD = 6144 (start truncating before hard limit)
-  - [ ] MIN_EVIDENCE_ITEMS = 1 (always keep anchor + 1 supporting item)
-  - [ ] SIM_DIM = 768 (vector dimension for HNSW index)
-- [ ] Deterministic fallback (recency + similarity sorting)
+### B2. Evidence Planner (Schema-Agnostic)
 
-### Graph Embeddings
-- [ ] Node2Vec/LightGCN embeddings for graph representation learning
-- [ ] Vector similarity computation for related content discovery
+**Components**:
 
-## F. LLM Integration
+**Anchor Resolver**: Precedence rule - if decision_ref is known slug → skip search; else run exactly one cheap decision search
 
-### LLM Client
-- [ ] JSON-only mode enforcement
-- [ ] Temperature=0 for deterministic outputs
-- [ ] Token limits and budget management
-- [ ] Retry logic (≤2 retries) with exponential backoff
-- [ ] Raw response capturing for audit
+**Graph Scope**: Per intent (k, directions, relationships, unbounded collection)
 
-### Validation System
-- [ ] Schema validation against answer schemas
-- [ ] ID scope validation (`supporting_ids ⊆ allowed_ids`)
-- [ ] Mandatory ID enforcement (anchor + present transitions)
-- [ ] Blocking validation with deterministic fallback
+**Field/Relation Catalog**: Auto-derived from JSON docs
+- `get_field(node, "rationale|owner|decider|timestamp|reason|phase|...")`
+- Relations: `LED_TO`, `CAUSAL_PRECEDES` (in/out), `CHAIN_NEXT` (for "chains")
 
-## G. Observability & Audit
+**Compilation**: To SA-GQL (compiles to AQL for k=1 traversals; vector search uses ArangoDB vector API)
 
-### Structured Logging
-- [ ] OpenTelemetry spans across all stages
-- [ ] Deterministic request IDs and fingerprints
-- [ ] Stage-specific metadata (resolver confidence, selector features)
-- [ ] Evidence bundling metrics with complete field set:
-  - [ ] `total_neighbors_found` - count before any filtering
-  - [ ] `selector_truncation` - boolean flag when evidence dropped
-  - [ ] `final_evidence_count` - count after truncation
-  - [ ] `dropped_evidence_ids[]` - IDs of items removed
-  - [ ] `bundle_size_bytes` - final bundle size
-  - [ ] `max_prompt_bytes` - configured limit (8192)
-- [ ] Snapshot ETag tracking in all logs
+**Bundle Cache**: Per decision (short TTL; invalidated on snapshot ETag change)
 
-### Artifact Retention
-- [ ] Query & resolver results storage
-- [ ] Graph plan persistence
-- [ ] Evidence bundle storage (pre/post limits)
-- [ ] Prompt envelope archival
-- [ ] Raw LLM JSON retention
-- [ ] Validator report storage
-- [ ] Final response JSON archival
-- [ ] Artifact storage in MinIO/S3 with request_id keys
+**Evidence Collection** (for why_decision):
+- k=1 neighbors; collect all events and transitions
+- `allowed_ids = exact union of {anchor.id} ∪ events[].id ∪ present transition ids` (post-truncation if applied)
+- **Soft Limits**: If `json.dumps(bundle).length > MAX_PROMPT_BYTES`, selector truncates lowest-scoring items
+- **Logging**: `selector_truncation=true` when evidence is dropped for size/latency budgets
 
-### Metrics & Monitoring
-- [ ] TTFB and total latency tracking
-- [ ] Retry and fallback usage metrics
-- [ ] Coverage and completeness scoring
-- [ ] Cache hit rate monitoring
-- [ ] Weak AI model performance metrics
-- [ ] Dashboards for latency SLOs and error rates
-- [ ] Alerts for fallback spikes and model drift
+### B2.1. Weak AI Components (Gateway Services)
 
-## H. Performance & Reliability
+**Event/Transition Selector v0** (learned scorer):
 
-### Performance Requirements
-- [ ] `/v2/ask` p95 latency ≤3.0s for known slugs
-- [ ] `/v2/query` p95 latency ≤4.0s for natural language
-- [ ] TTFB ≤600ms (slug) / ≤2.5s (search)
-- [ ] Stage timeouts: Search 800ms, Graph 250ms, Enrich 600ms, LLM 1500ms, Validator 300ms
+**Where**: Gateway: Evidence Bundle builder, when bundle size exceeds prompt budget
 
-### Caching Strategy
-- [ ] Resolver cache (5min TTL, normalized decision_ref keys)
-- [ ] Evidence bundle cache (15min TTL, invalidate on snapshot ETag change)
-- [ ] LLM JSON cache (2min TTL for hot anchors)
-- [ ] Redis integration for distributed caching
+**What**: A small GBDT / logistic regression or tiny MLP that scores all k=1 neighbors; features:
+- Text similarity (cosine between event/transition text and anchor rationale/question)
+- Graph features (in/out degree, recency delta)
+- Tags overlap (finance/risk/etc.)
+- Historical click/feedback priors (later)
 
-### Load Shedding
-- [ ] Auto load-shedding to templater mode under stress
-- [ ] Circuit breakers for external dependencies
-- [ ] Queue depth monitoring and throttling
-- [ ] `meta.load_shed=true` flag in responses
+**Behavior**: Collect all neighbors first, then truncate only if bundle size > MAX_PROMPT_BYTES
 
-## I. Quality Assurance
+**Fallback**: Simple deterministic sort (recency + similarity)
 
-### Testing Requirements
-- [ ] Golden tests for Why/Who/When intents with named fixtures
-- [ ] Coverage = 1.0 and completeness_debt = 0 on fixtures
-- [ ] Unit tests for all components
-- [ ] Integration tests for service boundaries
-- [ ] Contract tests for API compatibility
-- [ ] End-to-end tests in Docker Compose environment
+**Why**: Preserves all relevant evidence unless prompt size forces truncation
 
-### Validation Gates
-- [ ] Schema-agnostic proof: new JSON fields appear without code changes
-- [ ] Function routing correctly maps natural language to Memory API calls
-- [ ] All timestamps returned as ISO-8601 UTC
-- [ ] Cross-link reciprocity enforcement
-- [ ] Catalog endpoints reflect current JSON structure
+**Logs**: `selector_model_id`, `selector_truncation`, feature snapshot for dropped items (auditable)
 
-## J. JSON Authoring Schemas
+**Location**: `/services/gateway/evidence/selector_model.py`
 
-### Decision Schema
-- [ ] ID validation (slug regex pattern)
-- [ ] Required fields: id, option, rationale, timestamp, decision_maker
-- [ ] Optional fields: tags, supported_by, based_on, transitions
-- [ ] x-extra extensibility field
+### B3. Answerers (Pluggable Strategies)
 
-### Event Schema
-- [ ] Required fields: id, summary, description, timestamp
-- [ ] Optional fields: tags, led_to, snippet
-- [ ] Summary repair logic when missing or equals ID
-- [ ] x-extra extensibility field
+**Strategy Options**:
+- **Templater**: Deterministic fallback; compose `short_answer` from evidence
+- **LLM Micro-summarizer**: JSON-only; temp=0; max_tokens small; `allowed_ids` enforced
+- **Auto Policy**: Try LLM → on failure retry ≤2 → fallback to templater
 
-### Transition Schema
-- [ ] Required fields: id, from, to, relation, reason, timestamp
-- [ ] Relation enum validation (causal, alternative, chain_next)
-- [ ] Optional fields: tags
-- [ ] x-extra extensibility field
+### B4. Validator (Blocking)
 
-## K. Infrastructure & Deployment
+**Validation Rules** (testable):
+- **Schema Check**: Validate against `WhyDecisionAnswer@1`
+- **ID Scope**: `supporting_ids ⊆ allowed_ids`
+- **Mandatory IDs**: `anchor.id` must be cited; any present preceding/succeeding transition IDs must be cited
+- **Failure Actions**: Deterministic retries → fallback templater → never stream junk
 
-### Technology Stack
-- [ ] Python 3.11 services (FastAPI/Uvicorn)
-- [ ] Node 20 frontend (Next.js/React)
-- [ ] ArangoDB Community Edition
-- [ ] Redis 7 for caching
-- [ ] MinIO for artifact storage
+**Artifact-Level Validation (Ingest)**:
 
-### Containerization
-- [ ] Dockerfiles for each service
-- [ ] Docker Compose configuration with all services
-- [ ] ArangoDB service configuration
-- [ ] MinIO artifact store bootstrapping
-- [ ] OpenTelemetry collector configuration
+| Field | Rule | Rationale |
+|-------|------|-----------|
+| `id` | Non-empty, slug-regex (`^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$`) | Unique lookup key (allows underscores) |
+| `timestamp` | ISO-8601 UTC (`Z`) | Enables correct ordering & recency logic |
+| Content fields* | ≥1 non-whitespace char after trim | Prevents useless stubs that defeat downstream similarity checks |
+| `tags` | Array of strings (optional) | Categorization |
+| `x-extra` | Object (optional) | Extension field |
 
-### Development Environment
-- [ ] `docker-compose up` → working system in <5 minutes
-- [ ] Seed data loading script (`/scripts/seed_memory.sh`)
-- [ ] Smoke test script (`/scripts/smoke.sh`)
-- [ ] Hot reload for development
+*Content fields: `rationale`, `description`, `reason`, `summary`, `snippet`
 
-## L. Advanced Features
+**Link Validation** (Updated): If `supported_by`, `based_on`, `led_to`, `transitions`, `from`, or `to` **exist and are non-empty**, each ID must be resolvable; otherwise the field may be omitted or an empty array. This allows for orphaned events (no `led_to` yet) and standalone decisions (no `transitions`).
 
-### Streaming & Real-time
-- [ ] Server-sent events (SSE) for response streaming
-- [ ] Progressive token rendering
-- [ ] Frontend audit drawer with trace viewer
-- [ ] Real-time completeness flag updates
+Everything else (tags, x-extra, links) stays **extensible** and validated only if present.
 
-### Security & Privacy
-- [ ] Request fingerprinting and deduplication
-- [ ] PII redaction in prompt envelopes
-- [ ] Reversible hash salts per request
-- [ ] Tenant-level artifact retention policies (`retention_days` default 14)
-- [ ] Artifact visibility controls (`private|org|public`)
+### B5. Observability & Audit
 
-### Configuration Management
-- [ ] Feature flags for per-intent rollouts
-- [ ] A/B testing harness at policy layer
-- [ ] Intent registry as data-driven configuration
-- [ ] Environment-specific configuration management
+**Structured Spans (OpenTelemetry)**: 
+`resolve → plan → exec → enrich → bundle → prompt → llm → validate → render → stream`
 
-## M. Documentation & API
+**Deterministic IDs** (always include in meta and span attributes):
+- `request_id`, `prompt_fingerprint`, `plan_fingerprint`, `bundle_fingerprint`
+- `snapshot_etag`, `prompt_id`, `policy_id`
+- `resolver_model_id`, `selector_model_id` (when weak AI models used)
 
-### API Documentation
-- [ ] OpenAPI specification generation
-- [ ] Interactive API documentation
-- [ ] Schema documentation with examples
-- [ ] Error code reference guide
+**Per-Request Artifacts** (persisted with `request_id`):
+- Query & resolver result (including weak AI model scores)
+- Graph Plan
+- Evidence Bundle (pre/post limits, with selector feature snapshots)
+- Prompt Envelope (see Section J)
+- Raw LLM JSON
+- Validator report
+- Final Response JSON
 
-### Developer Experience
-- [ ] Clear project structure with service boundaries
-- [ ] Comprehensive README with setup instructions
-- [ ] API client examples and SDKs
-- [ ] Troubleshooting guides and runbooks
+**Artifacts**: Written to s3://{bucket}/{request_id}/... (or MinIO) and referenced in the Replay endpoint.
 
-## L. Front-end & Streaming Integration
-- [ ] Build static assets into `/public` (Next.js `out/` or Vite `dist/`).
-- [ ] Serve them from the Edge service at `/` via a catch-all route.
-- [ ] Use native `EventSource('/v2/ask?...')` in the browser to subscribe to SSE.
-- [ ] Provide a React hook or equivalent for token-by-token rendering:
-      ```ts
-      function useSSE(url: string, onMessage: (msg: Token) => void) {
-        useEffect(() => {
-          const es = new EventSource(url);
-          es.onmessage = e => onMessage(JSON.parse(e.data));
-          return () => es.close();
-        }, [url]);
-      }
-      ```
-- [ ] Lazy-load the graph component (D3/vx) and on node-click call  
-      `/api/graph/expand_candidates` → merge neighbors into the graph.
+**Generic Log Envelope**:
+```json
+{
+  "timestamp": "2024-07-28T14:30:00Z",
+  "level": "INFO",
+  "service": "gateway",
+  "request_id": "req_...",
+  "snapshot_etag": "sha256:abc123...",
+  "stage": "resolve|plan|exec|bundle|prompt|llm|validate|render",
+  "latency_ms": 123,
+  "meta": {
+    // Stage-specific fields: resolver_confidence, selector_features, etc.
+    // NEW FIELDS FOR EVIDENCE BUNDLING:
+    "total_neighbors_found": 12,
+    "selector_truncation": true,
+    "final_evidence_count": 8,
+    "dropped_evidence_ids": ["low-score-event-1"],
+    "bundle_size_bytes": 7680,
+    "max_prompt_bytes": 8192
+  }
+}
+```
 
-## M. LLM Deployment & Hosting
-- [ ] **Model**: Mistral-7B-Instruct quantized to 8-bit (fits ~6–7 GB on RTX 4080).  
-- [ ] **Serving**: Hugging Face Text-Generation-Inference Docker image with GPU (CUDA) support.  
-- [ ] **Compose** snippet example:
-    ```yaml
-    llm:
-      image: ghcr.io/huggingface/text-generation-inference:latest
-      runtime: nvidia
-      environment:
-        - MODEL_ID=mistralai/Mistral-7B-Instruct
-        - QUANTIZATION=8bit
-      ports:
-        - "8080:8080"
-      deploy:
-        resources:
-          reservations:
-            devices:
-              - driver: nvidia
-                count: 1
-                capabilities: [gpu]
-    ```
-- [ ] **Endpoint**: `/v1/models/Mistral-7B-Instruct:predict` with streaming enabled.  
-- [ ] **Feature-flag**: `ENABLE_EMBEDDINGS=true` (for vector search, not for LLM).  
-- [ ] **Fallback**: when `llm_mode=off` or LLM fails, use templater.
+**Metrics**:
+- TTFB, total latency, retries, fallback_used
+- Coverage, completeness, cache hit rate
+- Weak AI model performance: resolver_confidence, selector_accuracy, reranker_precision
+- Dashboards + alerts on latency SLOs, error rate, fallback spikes, model drift
 
-## N. MicroK8s vs Docker-Compose POC
-- [ ] **Infrastructure**:  
-    - Edge & Gateway services → deploy on MicroK8s  
-    - LLM service → deploy via Docker-Compose on WSL2 (GPU passthrough)  
-- [ ] **Networking**: ensure MicroK8s pods can reach `localhost:8080` (LLM).  
-- [ ] **Deployment script**: update `docker-compose.yml` to include `llm` service with `runtime: nvidia`.
+## C. The Auditable Prompt Builder
 
-## Success Criteria
+**Goal**: Every token that hits the LLM is reconstructible, signed, and explainable.
 
-### Final Acceptance
-- [ ] All golden tests pass with 100% coverage
-- [ ] Performance requirements met under load testing
-- [ ] Complete audit trail for 100% of requests
-- [ ] Schema-agnostic functionality demonstrated
-- [ ] Fallback rate <5% under normal operations
-- [ ] End-to-end Docker Compose deployment working
-- [ ] Production readiness checklist completed
+### 1. Prompt Envelope (Canonical JSON Object, Versioned)
 
-### Additional Information (appended) - IMPORTANT
+```json
+{
+  "prompt_version": "why_v1",
+  "intent": "why_decision",
+  "policy": {"json_mode": true, "retries": 2, "temperature": 0.0},
+  "question": "Why did Panasonic exit plasma TV production?",
+  "evidence": { /* Evidence Bundle (minified) */ },
+  "allowed_ids": ["panasonic-exit-plasma-2012","pan-e2","trans-pan-2010-2012"],
+  "constraints": {
+    "output_schema": "WhyDecisionAnswer@1",
+    "max_tokens": 256,
+    "forbidden_text": ["```","<xml>"]
+  },
+  "explanations": {
+    "why_these_fields": "k=1 neighbors only; minimal fields required for causality",
+    "why_these_ids": "anchor, direct events, in/out transitions"
+  }
+}
+```
 
-## F. Front-end Integration
+### 2. Canonicalization & Fingerprinting
 
-- **Static build**: Produce a `/public` bundle (e.g. Next.js `out/` or Vite `dist/`).  
-- **Serving**: Edge service hosts `/index.html` and assets at `/` via a catch-all route.  
-- **Streaming**: Front-end subscribes to SSE on `/v2/ask?…` using native `EventSource`.  
-- **Rendering**: Client renders each JSON‐token chunk as it arrives (plain text, code blocks, etc.).  
-- **Graph UI**: Lazy-load D3/vx component; on node click call `/api/graph/expand_candidates` and merge neighbors.
+- **Deterministic Processing**: Key ordering + normalized whitespace → `canonical_json`
+- **Fingerprinting**: SHA-256 over `canonical_json` → `prompt_fingerprint`
+- **Snapshot Strategy**: Combine content hash + timestamp into `snapshot_etag` to avoid collision edge-cases
+- **Storage**: Store both Envelope and fingerprint; include fingerprint in all logs
 
-## G. LLM Deployment & Hosting
+### 3. Rendering
 
-- **Model**: Mistral-7B-Instruct (8-bit quantized) for ~6–7 GB VRAM footprint on RTX 4080.  
-- **Server**: Use HuggingFace Text-Generation-Inference Docker image with GPU mode.  
-- **Compose snippet**:
-  ```yaml
-  llm:
-    image: ghcr.io/huggingface/text-generation-inference:latest
-    runtime: nvidia
-    environment:
-      - MODEL_ID=mistralai/Mistral-7B-Instruct
-      - QUANTIZATION=8bit
-    ports:
-      - "8080:8080"
-  ```
-- **Endpoint**: `/v1/models/Mistral-7B-Instruct:predict` (streaming).  
-- **Fallback**: When `llm_mode=off` or on failure, gateway uses the templater service.
+**LLM Input Structure**:
+- **System**: "JSON-only; emit Answer schema; use only allowed_ids."
+- **User**: The Prompt Envelope (or minimal required sub-object)
+- **Persistence**: Store Rendered Prompt (exact string/bytes sent) alongside Envelope
 
-## H. Deployment POC: MicroK8s + Docker-Compose
+### 4. Audit UX
 
-- **Infra split**:  
-  - Edge & Gateway run on MicroK8s.  
-  - LLM service runs via Docker-Compose on WSL2 with `runtime: nvidia`.  
-- **Networking**: Ensure MicroK8s pods can reach the LLM endpoint at `localhost:8080`.  
-- **Compose**: Include `llm` service alongside existing `arangodb`, `redis`, etc., so `docker-compose up` brings up the full POC stack.
+**Trace Viewer Flow**: 
+`Envelope → rendered prompt → raw LLM JSON → validation report → final response`
+
+**Explainability**: "Explain" button derives why each token/ID is present from Envelope's explanations and Plan
+
+### 5. Safety & Privacy
+
+- **Redaction**: Best-effort in Envelope ("PII" fields list; reversible hash salts per request if needed)
+- **Security**: No secrets in prompt; secrets only in transport layer config
+
+## D. Easy Adds That Pay Off
+
+**Performance & Reliability**:
+- **Idempotency**: Keys + request hash → dedupe concurrent identical calls
+- **Storage**: Content-addressable storage for artifacts (fingerprint-named objects)
+- **Caching**: TTL caching at three layers: resolver, bundle, LLM JSON (for hot anchors)
+
+**Development & Testing**:
+- **Feature Flags**: Per-intent prompt/policy rollouts (why_v1, why_v2)
+- **Golden Tests**: Frozen Evidence Bundles → expected Answers for CI gatekeeping
+- **A/B Testing**: Harness at policy layer (templater vs LLM vs learned)
+
+**Quality & Performance**:
+- **Latency Budgeting**: Token-budget table before LLM step; auto-shrink evidence if over budget
+- **Quality Guard**: Compare LLM answer to templated baseline; flag big divergences
+- **Explainability Flags**: `{"missing_preceding": true, "missing_succeeding": false, "event_count": 1}`
+
+**Evaluation**:
+- **Offline Eval**: Export (Envelope, LLM JSON, Validator report) for batch scoring
+
+## E. Future-Ready (No Heuristics, Just Intelligence)
+
+**ML Evolution Path**:
+- Swap Resolver and Selector for learned models (same inputs, same outputs)
+- Train summarizer on Envelope→Answer pairs; API and contracts stay unchanged
+- Add chains via virtual view (walk `CAUSAL_PRECEDES`) or materialized `CHAIN_NEXT` edge
+
+## F. Explicit Contracts & Schemas
+
+### F1. JSON Schemas (Normative, Versioned)
+
+**WhyDecisionEvidence@1**:
+- `anchor`: `{id, option?, rationale?, timestamp?, decision_maker?, tags[]?}`
+- `events[]`: `{id, summary?, timestamp?, led_to? [anchor.id], snippet?, tags[]?}` (unbounded*)
+- `transitions.preceding?/succeeding?`: `{id, from, to, reason?, timestamp?, tags[]?}` (unbounded*)
+- `allowed_ids[]`: Must equal `{anchor.id} ∪ events[].id ∪ present transitions' ids`
+- **Constraints**: All IDs are non-empty strings
+
+**WhyDecisionAnswer@1**:
+- `short_answer`: ≤320 chars
+- `supporting_ids[]`: minItems≥1, items⊆allowed_ids
+- `rationale_note?`: ≤280 chars
+
+**WhyDecisionResponse@1**:
+- `{intent, evidence, answer, completeness_flags, meta}`
+- `completeness_flags`: `{has_preceding: bool, has_succeeding: bool, event_count: int}`
+- `meta`: `{policy_id, prompt_id, retries, latency_ms, prompt_fingerprint, snapshot_etag, fallback_used}` (all required)
+
+### F2. Error Envelope (Consistent Across Intents)
+
+```json
+{
+  "error": {
+    "code": "LLM_JSON_INVALID",
+    "message": "...",
+    "details": {"reasons": ["schema:...","unsupported_ids:..."]},
+    "request_id": "..."
+  }
+}
+```
+
+**Error Codes**: `ANCHOR_NOT_FOUND`, `TIMEOUT`, `LLM_JSON_INVALID`, `VALIDATION_FAILED`, `RATE_LIMITED`
+
+## G. Streaming & Fallback Semantics
+
+**JSON Mode Behavior**:
+- Buffer model output → validate → stream rendered `short_answer` (tokenized)
+- If validation fails after ≤2 retries → emit templated answer
+- Set `meta.fallback_used=true` & `error=null`
+
+**Deterministic Fallback Triggers**:
+1. JSON parse error
+2. Schema error  
+3. `supporting_ids ⊄ allowed_ids`
+4. Missing mandatory IDs (anchor + present transitions)
+
+## H. Performance & Timeouts
+
+### H1. Performance Budgets (Request-Level)
+- **TTFB**: ≤600ms (slug) / ≤2.5s (search)
+- **p95 Total**: ≤3.0s (`/v2/ask`), ≤4.5s (`/v2/query`) - updated for larger evidence
+
+### H2. Stage Timeouts
+- Search: 800ms
+- Graph expand: 250ms
+- Enrich: 600ms
+- LLM: 1500ms (including retries)
+- Validator: 300ms
+
+### H3. Retry & Cache Policy
+
+**Retries**:
+- **LLM JSON retries**: ≤2
+- **HTTP calls**: Single retry with jittered backoff (cap 300ms)
+
+**Cache Keys & TTLs**:
+- **Resolver**: `key = normalize(decision_ref)`, TTL 5min
+- **Evidence Bundle**: `key = (decision_id, intent, graph_scope, snapshot_etag, truncation_applied)`, TTL 15min, invalidate on snapshot ETag change
+- **LLM JSON**: `key = (intent, decision_id, question, bundle_fingerprint, prompt_id)`, TTL 2min (hot anchors)
+
+## I. Schema-Agnostic Implementation
+
+### I1. Field Catalog Contract
+- **Endpoints**: 
+  - Memory API serves `/api/schema/*` (authoritative)
+  - Gateway mirrors at `/v2/schema/*` (read-through cache)
+  - API edge proxies requests
+- **Purpose**: Publish stable semantic names and current JSON aliases
+- **Example**: `rationale → ["rationale","why","reasoning"]`
+- **Schema-Agnostic Proof**: Adding new JSON field appears with zero code changes
+
+### I2. SA-GQL Shape
+```json
+{
+  "from": "decision:<id>",
+  "out": [
+    {"rel": "LED_TO", "type": "event"},
+    {"rel": "CAUSAL_PRECEDES", "dir": "in", "type": "transition"},
+    {"rel": "CAUSAL_PRECEDES", "dir": "out", "type": "transition"}
+  ],
+  "prompt_budget": {
+    "max_prompt_bytes": 8192,
+    "selector_truncation_enabled": true
+  }
+}
+```
+
+**Execution**: Compiles to AQL for k=1 traversals; vector search uses ArangoDB vector API. No limit fields - caller may set max for performance, but default is unbounded collection.
+
+## J. Ingest V2 (JSON authoring & service)
+
+**Goal:** Authors write concise JSON; ingest guarantees correctness, derives cross-links, and publishes a stable graph plus a **Field/Relation Catalog**. The gateway remains schema‑agnostic.
+
+### J1. Pipeline (with structured logs per stage)
+1) **Watch & snapshot** → compute `snapshot_etag` for this batch; include in all downstream logs/artifacts
+2) **Parse** → JSON → objects; track file/line for diagnostics
+3) **Validate** (STRICT mode; fail closed):
+   - ID regex: `^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$`, global uniqueness (allows underscores)
+   - Enums: `relation ∈ {causal, alternative, chain_next}`
+   - Referential integrity: if array **exists and is non‑empty**, each ID must resolve; empty array or missing field is allowed
+   - **Artifact validation**: ID, timestamp, content field requirements per table above
+4) **Normalize/alias** (schema‑agnostic support):
+   - Map synonyms into core names (e.g., `title→option`, `why|reasoning→rationale`); keep originals in `x-extra`
+   - Text: NFKC, trim, collapse whitespace; bounded lengths (rationale ≤600 chars; reason ≤280; summaries ≤120)
+   - Timestamps: parse common formats → ISO‑8601 UTC (`Z`)
+   - Tags: lowercase slugify; dedupe; sort
+5) **Derive**:
+   - Backlinks: ensure `event.led_to ↔ decision.supported_by`; ensure `transition.{from,to}` appears in both decisions' `transitions[]`
+   - **Field Catalog**: publish semantic names → detected aliases
+   - **Relation Catalog**: publish available edge types (`LED_TO`, `CAUSAL_PRECEDES` in/out, `CHAIN_NEXT`)
+6) **Persist**:
+   - **ArangoDB upserts**: nodes/edges to Arango graph; build/refresh vector indexes
+   - Content‑addressable snapshot keyed by `snapshot_etag`
+   - Indexes: text (BM25), vector embeddings (ArangoDB), adjacency lists (AQL)
+7) **Serve** (Memory API v2):
+   - `/api/graph/expand_candidates` (AQL traversal for k=1)
+   - `/api/enrich/{type}/{id}` → normalized envelopes (Decision/Event/Transition)
+   - `/api/schema/fields`, `/api/schema/rels` → catalogs
+   - `/api/resolve/text` → ArangoDB vector search
+
+**Logging per batch:** `{snapshot_etag, files_seen, nodes_loaded, edges_loaded, warnings, errors, timings}`
+
+## K. JSON V2 Authoring Schemas (normative)
+
+> Minimal, predictable authoring; ingest handles aliasing/derivations. Authors may include `x-extra` for future fields.
+
+### K1. Decision (Updated with New Fields)
+```json
+{
+  "id": "panasonic-exit-plasma-2012",
+  "option": "Exit plasma TV production",
+  "rationale": "Declining demand and heavy losses in plasma panels necessitated a strategic withdrawal to focus resources on automotive and battery growth.",
+  "timestamp": "2012-04-30T09:00:00Z",
+  "decision_maker": "Kazuhiro Tsuga",
+  "tags": ["portfolio_rationalization", "loss_mitigation"],
+  "supported_by": ["pan-e2"],
+  "based_on": ["panasonic-tesla-battery-partnership-2010"],
+  "transitions": ["trans-pan-2010-2012", "trans-pan-2012-2014"],
+  "x-extra": {}
+}
+```
+
+### K2. Event (Updated with New Fields)
+```json
+{
+  "id": "pan-e4",
+  "summary": "Board approves AU Automotive acquisition",
+  "description": "In April 2014, Panasonic's board green-lit the €1.2 bn purchase of AU Automotive.",
+  "timestamp": "2014-04-01T14:00:00Z",
+  "tags": ["m_and_a", "automotive_electronics"],
+  "led_to": ["panasonic-automotive-infotainment-acquisition-2014"],
+  "snippet": "€1.2 bn for AU Automotive.",
+  "x-extra": {}
+}
+```
+
+### K3. Transition (Updated with x-extra)
+```json
+{
+  "id": "trans-pan-2010-2012",
+  "from": "panasonic-tesla-battery-partnership-2010",
+  "to": "panasonic-exit-plasma-2012",
+  "relation": "causal",
+  "reason": "Strategic focus shifted to EV batteries from plasma TVs",
+  "timestamp": "2013-10-09T00:00:00Z",
+  "tags": ["strategic_pivot"],
+  "x-extra": {}
+}
+```
+
+### K4. Orphan Handling Examples
+
+**First Decision (no predecessor)**:
+```json
+{
+  "id": "initial-cloud-decision-2024",
+  "option": "Enter cloud market",
+  "rationale": "Market opportunity identified...",
+  "timestamp": "2024-01-15T10:00:00Z",
+  "decision_maker": "Alice",
+  "tags": ["strategic_expansion"],
+  "supported_by": ["market-research-event"],
+  "based_on": [],
+  "transitions": [],
+  "x-extra": {}
+}
+```
+
+**Pending Event (no decision yet)**:
+```json
+{
+  "id": "pending-security-audit",
+  "summary": "Security audit reveals vulnerabilities",
+  "description": "Annual security audit identified critical vulnerabilities...", 
+  "timestamp": "2024-07-25T14:00:00Z",
+  "tags": ["security", "compliance"],
+  "led_to": [],
+  "snippet": "Critical vulnerabilities found.",
+  "x-extra": {}
+}
+```
+
+## L. Memory API v2 (Normalization & Catalog)
+
+**Principle:** The API always returns **normalized, small envelopes**. Gateway composes Evidence Bundles from these.
+
+### L1. Endpoints
+- `GET /api/enrich/decision/{id}` →  
+  `{id, option, rationale, timestamp, decision_maker?, tags[], supported_by[], based_on[], transitions[]}`
+- `GET /api/enrich/event/{id}` →  
+  `{id, summary, description?, timestamp, tags[], led_to[], snippet?}`
+- `GET /api/enrich/transition/{id}` →  
+  `{id, from, to, relation, reason, timestamp, tags[]}`
+- `POST /api/graph/expand_candidates` → k=1 neighborhood using AQL traversal
+- `POST /api/resolve/text` → ArangoDB vector search
+- `GET /api/schema/fields` → Field Catalog (semantic name → aliases)
+- `GET /api/schema/rels` → Relation Catalog (edge types available)
+
+**Implementation notes**: 
+- `/api/graph/expand_candidates` executes AQL
+- `/api/enrich/*` reads envelopes from ArangoDB
+- `/api/resolve/text` queries ArangoDB's vector API
+
+### L2. Normalization rules (applied by API)
+**IDs:** NFKC → lowercase → trim → spaces/punct → `-` or `_` → collapse; regex `^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$`
+**Text:** trim, collapse internal whitespace; rationale ≤600, reason ≤280, summary/snippet ≤120; preserve punctuation
+**Timestamps:** parse input → ISO‑8601 UTC (`Z`); include `x-extra.source_tz` if converted
+**Tags:** lowercase slugs; dedupe; sort
+**Aliases:** `title→option`, `why|reasoning→rationale`, etc., via Field Catalog
+**Cross‑links:** enforce `event.led_to ↔ decision.supported_by`; ensure transitions appear in both `from/to` decisions' `transitions[]`; extend to `decision.based_on ↔ prior_decision.transitions[]`
+**Event summary repair:** if `summary` missing or equals the ID, set `summary = clipped(description, 96)`; derive `snippet` from first sentence if missing
+
+### L3. Structured logging (per call)
+Log `{snapshot_etag, node_id, before_aliases, after_normalization, derived_links[], warnings[], errors[]}`, plus timings.
+
+## M. Technology Stack & Performance
+
+### M1. Technology Stack
+- **Python 3.11** (FastAPI/Uvicorn) for api-edge, gateway, memory-api, ingest
+- **Node 20** (Next.js/React) for frontend
+- **ArangoDB Community** (graph+vector store)
+- **Redis 7** for caches
+- **MinIO** for artifact store (optional but makes artifacts real)
+
+### M2. Performance Requirements
+1. `/v2/ask` with intent=why_decision&decision_ref=<slug> returns in ≤3.0s p95 with fallback_used=false
+2. `/v2/query` with natural language returns in ≤4.5s p95
+3. **Model Inference**: ≤5ms (resolver), ≤2ms (selector)
+
+### M3. Reliability Requirements  
+3. If LLM returns invalid JSON or out-of-scope IDs, endpoint still returns valid response with fallback_used=true (no user-visible error)
+3.1 Evidence Truncation: When bundle size exceeds MAX_PROMPT_BYTES, selector logs selector_truncation=true and preserves highest-scoring evidence
+
+### M4. Evidence Size Management
+**Configuration Constants**:
+```python
+# Evidence size management
+MAX_PROMPT_BYTES = 8192  # ~4k tokens with metadata
+SELECTOR_TRUNCATION_THRESHOLD = 6144  # Start truncating before hard limit
+MIN_EVIDENCE_ITEMS = 1  # Always keep at least anchor + 1 supporting item
+```
+
+**Truncation Behavior**:
+- Planner expands k=1 and collects all neighbors
+- If `json.dumps(bundle).length > MAX_PROMPT_BYTES`, selector down-ranks and drops lowest-score items until size fits
+- Log `selector_truncation=true` to track evidence loss
+- `allowed_ids` reflects final post-truncation evidence set
+
+### M5. Audit Requirements
+4. **Every response** includes `{prompt_id, policy_id, prompt_fingerprint, snapshot_etag}` and **artifacts** are persisted (Envelope, rendered prompt, raw LLM JSON, validator report, final response)
+
+### M6. Schema-Agnostic Proof
+5. Adding new JSON field (e.g., `phase_label`) with **zero code changes**; field appears in `/v2/schema/fields`
+
+### M7. Quality Gates
+6. **Golden tests** pass for Why/Who/When with **named fixtures** (e.g., `why_decision_panasonic_plasma.json`, `why_decision_with_based_on.json`, `who_decided_anchor_v1.json`, `when_decided_anchor_v1.json`); **coverage = 1.0** and **completeness_debt = 0** on fixtures
+
+## N. Load-Shedding & Circuit Breakers
+
+**Auto Load-Shedding**:
+- If queues or time budgets breach thresholds → automatically set `llm_mode=off` (templater)
+- Skip search when slug is present
+- Return `meta.load_shed=true`
+
+**Purpose**: Preserves availability and p95 under stress while keeping contract stable
+
+## O. Artifact Retention & Access
+
+**Governance**:
+- **Tenant-level** `retention_days` (default 14)
+- **Artifact visibility**: `private|org|public`
+- **Artifacts**: Envelope, rendered prompt, raw LLM JSON, validator report, final response
+
+**Purpose**: Makes audit trail usable in practice and compliant with different data policies
+
+## P. Additional Acceptance Criteria (Ingest & Memory API)
+
+1) Ingest produces a **publishable snapshot** with `snapshot_etag`; Memory API responses include this ETag in headers and logs
+2) All **timestamps** in enrich responses are ISO‑8601 UTC (`Z`)
+3) **Event summary repair**: any event with `summary` empty or equal to its ID is returned with `summary` derived from `description` (and `snippet` present)
+4) **Cross‑link reciprocity**: `event.led_to` decisions include the event in `supported_by`; transitions appear in both related decisions' `transitions[]`; extend to `decision.based_on ↔ prior_decision.transitions[]`
+5) **Catalog endpoints** (`/api/schema/fields`, `/api/schema/rels`) are live and reflect current JSON; gateway mirrors them under `/v2/schema/*`
+6) **k=1 expansion** collects all neighbors; gateway may truncate if bundle size exceeds MAX_PROMPT_BYTES
+7) All ingest/API stages emit structured logs with `snapshot_etag` so traces are fully auditable end‑to‑end
+8) **Orphan handling**: Events without `led_to`, decisions without `transitions` are valid and handled gracefully
+9) **New field support**: `tags`, `based_on`, `snippet`, `x-extra` fields are processed and validated
+10) Empty link arrays (`[]`) are valid; omitted fields are treated as empty arrays
+
+## Q. Health & Auth
+- **Health/Ready endpoints**: `GET /healthz` (process up) and `GET /readyz` (deps ready including ArangoDB) on every service
+- **Auth & CORS**: Bearer/JWT at API edge, CORS allow-list for FE origin
+
+## R. Summary: Key Implementation Priorities
+
+### R1. Critical Path (Blocking Dependencies)
+1. **ArangoDB setup** with graph collections and vector indexes
+2. **Ingest pipeline** with JSON validation and field catalog generation (including new fields: tags, based_on, snippet, x-extra)
+3. **Memory API** with normalized envelopes and k=1 expansion (AQL)
+4. **Gateway orchestration** with evidence bundling and LLM validation
+5. **Intent router** for natural language queries with function routing
+6. **Frontend SSE streaming** with audit drawer
+
+### R2. Quality Gates (Non-negotiable)
+- All services have health/ready endpoints with ArangoDB readiness checks
+- Golden tests pass with coverage=1.0 and completeness_debt=0 (updated test cases)
+- Every request generates complete audit trail with deterministic fingerprints
+- Schema-agnostic proof: new JSON fields appear without code changes
+- Function routing correctly maps natural language to Memory API calls
+- Orphan data handling works correctly (events without decisions, etc.)
+
+### R3. Success Metrics
+- **Performance**: p95 ≤3.0s for `/v2/ask` with known slugs, ≤4.5s for `/v2/query`
+- **Reliability**: fallback_used rate <5% under normal load
+- **Auditability**: 100% of requests have complete artifact retention
+- **Developer experience**: docker-compose up → working system with ArangoDB in <5 minutes
+
+### R4. Updated Test Cases & Validation
+
+**New Golden Test Cases**:
+- `why_decision_panasonic_plasma.json` (plasma TV exit with automotive pivot context)
+- `why_decision_with_based_on.json` (decision influenced by prior decisions)
+- `why_decision_tags_filtering.json` (evidence filtering by tags)
+- `event_with_snippet_display.json` (snippet field in evidence bundle)
+
+**New Validator Unit Tests**:
+- `decision_no_transitions.json` (empty array validation)
+- `event_orphan.json` (no `led_to` validation)
+- `decision_with_tags.json` (tags array validation)
+- `decision_based_on_validation.json` (based_on link validation)
+- `event_with_snippet.json` (snippet field validation)
+
+**Router Contract Tests**:
+- `test_query_panasonic.py` → text: "Why did Panasonic exit plasma?" → expects Memory API calls + final WhyDecisionResponse@1 body
+- Cross-link validation for `based_on` relationships
+
+**Back-link Derivation Tests**:
+- Bidirectional repair for `based_on ↔ transitions` relationships
+- Tag-based evidence enrichment and filtering
+
+## S. Key Schema Changes Summary
+
+### S1. New Fields Added
+- **Decision**: `tags[]`, `based_on[]`, `x-extra{}`
+- **Event**: `tags[]`, `snippet`, `x-extra{}` 
+- **Transition**: `tags[]`, `x-extra{}`
+
+### S2. Field Purpose Updates
+- **`based_on`**: References to prior decisions that influenced this decision (complements `supported_by` events)
+- **`tags`**: Categorical labels for filtering and grouping
+- **`snippet`**: Brief extract for display in evidence bundles
+- **`x-extra`**: Extension object for custom fields without schema migration
+
+### S3. Validation Updates
+- ID regex allows underscores: `/^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$/`
+- `snippet` added to content field validation
+- Cross-link reciprocity extended to `based_on ↔ transitions` relationships
+- Tags array validation (optional, strings only)
+- x-extra object validation (optional, any structure)
+
+### S4. Orphan Tolerance
+- Events may exist without `led_to` (pending decisions)
+- Decisions may exist without `transitions` (isolated/initial decisions)
+- Empty arrays are valid; missing fields treated as empty arrays
+- Validation only enforces links when arrays are non-empty
+
+## T. Frontend & User Experience Updates
+
+### T1. Evidence Display
+- **Tags**: Display tags as colored badges in evidence cards
+- **Snippets**: Show brief excerpts in event summaries
+- **Based-on links**: Visualize decision dependency chains
+- **Orphan indicators**: Show completeness flags for partial data
+
+### T2. Audit Interface
+- **Prompt viewer**: Expandable sections for envelope, rendered prompt, LLM response
+- **Evidence trace**: Show which items were truncated and why
+- **Model scores**: Display resolver confidence, selector features when available
+- **Fingerprint tracking**: Link requests via prompt_fingerprint chains
+
+### T3. Schema Exploration
+- **Field catalog browser**: Live view of `/v2/schema/fields`
+- **Relation graph**: Interactive view of decision/event/transition relationships
+- **Tag cloud**: Aggregate view of all tags across corpus

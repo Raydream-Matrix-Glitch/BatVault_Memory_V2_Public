@@ -2,7 +2,7 @@ import re, unicodedata
 from datetime import datetime, timezone
 from dateutil import parser as dtp
 
-ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,}[a-z0-9]$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
 
 def slugify_id(s: str) -> str:
     s = unicodedata.normalize("NFKC", s.strip().lower())

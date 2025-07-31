@@ -1,9 +1,25 @@
-import hashlib, orjson
+# packages/core_utils/src/core_utils/fingerprints.py
+
+import hashlib
+import orjson
 from typing import Any
 
-def canonical_json(obj: Any) -> str:
-    return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS).decode()
+# ensure fully stable encoding: sort keys + drop microseconds
+_OPTS = orjson.OPT_SORT_KEYS | orjson.OPT_OMIT_MICROSECONDS
+
+def canonical_json(obj: Any) -> bytes:
+    """
+    Serialize `obj` to canonical JSON bytes:
+    - keys sorted
+    - no microseconds in timestamps
+    - compact representation
+    """
+    return orjson.dumps(obj, option=_OPTS)
 
 def prompt_fingerprint(envelope: Any) -> str:
-    canon = canonical_json(envelope)
-    return hashlib.sha256(canon.encode()).hexdigest()
+    """
+    Compute the SHA-256 fingerprint of the given envelope by
+    hashing its canonical JSON representation.
+    """
+    canon_bytes = canonical_json(envelope)
+    return hashlib.sha256(canon_bytes).hexdigest()
