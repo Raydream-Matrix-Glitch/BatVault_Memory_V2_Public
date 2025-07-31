@@ -17,6 +17,7 @@ def _sample_docs():
 def test_upsert_is_idempotent():
     store = DummyStore()
     for _ in range(2):                 # run twice
-        upsert_all(store, *_sample_docs())
+        # Provide a dummy snapshot_etag for idempotency
+        upsert_all(store, *_sample_docs(), snapshot_etag="test-etag")
     assert len(store.nodes) == 3
     assert len(store.edges) == 2       # LED_TO + CAUSAL_PRECEDES

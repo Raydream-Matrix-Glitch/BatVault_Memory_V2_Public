@@ -12,5 +12,5 @@ def test_backlinks_roundtrip():
     events    = {e["id"]: e}
     derive_backlinks(decisions, events, {})
 
-    assert "E-42" in decisions["adopt-k3s-2025q1"]["supported_by"]
-    assert "adopt-k3s-2025q1" in events["E-42"]["led_to"]
+    assert "e-42" in decisions["adopt-k3s-2025q1"]["supported_by"]
+    assert "adopt-k3s-2025q1" in events["e-42"]["led_to"]

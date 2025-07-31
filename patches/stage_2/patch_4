@@ -1,0 +1,51 @@
+Validation of patch 3 against spec & earlier gaps
+Topic	Patch 3 result	Spec alignment	Notes / required tweak
+Resolver cache TTL	CACHE_TTL_RESOLVE_SEC = 300 s (env-overridable)	Matches spec “Resolver: 5 min TTL”	
+Stage-level budgets	asyncio.wait_for limits: resolve ≤ 800 ms, expand ≤ 250 ms; Gateway now calls Memory-API with timeout=0.8 s	Matches H2 stage budgets	
+Free-text search AQL	PHRASE(d.title OR d.rationale OR d.notes OR d.tags , @q)	Still off-spec – spec lists the content requirement as ≥1 of rationale / description / reason / summary.
+• title isn’t a canonical field (it becomes option after aliasing).
+• notes isn’t normative.
+• description & summary are missing.	
+Resolver vector flag	use_vector=true passthrough; requires caller to supply query_vector. Falls back to BM25/LIKE.	Acceptable for Milestone 2 (vector search is “feature-flagged”) – server-side embedding can wait.	
+OTel spans	Added across resolve / expand / enrich / schema	Meets M2 “structured spans” goal; exporter still optional – that’s okay.	
+Tests	Unit + contract tests for expand_candidates (happy-path + edge) included.	✔ M2 deliverable satisfied.	
+TTL for expand_candidates	Left at 60 s (separate constant).	Spec sets no explicit TTL for expand; 60 s is fine as long as evidence-bundle cache later uses 900 s.	
+
+Answers to your follow-up points
+ArangoSearch view bootstrap
+Yes – add an ops script. Milestone-0/1 already provision collections; extending ops/bootstrap_arangosearch.sh (or a Python admin script) to:
+
+aql
+Copy
+Edit
+CREATE VIEW nodes_search OPTIONS {
+  "links": {
+    "nodes": {
+      "fields": {
+        "rationale": { "analyzers": ["text_en"] },
+        "description": { "analyzers": ["text_en"] },
+        "reason": { "analyzers": ["text_en"] },
+        "summary": { "analyzers": ["text_en"] }
+      },
+      "includeAllFields": false,
+      "storeValues": "none"
+    }
+  }
+}
+Why? It removes the need for field-wise PHRASE() clauses and keeps the spec-mandated field set together. Document it in /ops/arangodb/README.md.
+
+Free-text field list change needed
+Please update the AQL to search rationale, description, reason, summary (and optionally option for decisions) instead of title|notes|tags. That will:
+
+fulfil the validation rule that at least one of those four holds non-whitespace text;
+
+avoid mismatching field names after aliasing (title→option, why→rationale, etc.).
+
+Vector embedding on the service
+Current approach (client supplies query_vector) is compliant for M2. If you’d like the Memory-API to auto-embed later:
+
+create a lightweight cpu_encoder.py in packages/core_embeddings (Sentence-T-Mini or similar, license-compatible);
+
+guard it behind ENABLE_EMBEDDINGS=true; cache sha256(text) → vector for determinism;
+
+no spec change until Milestone 3+, so treat this as an enhancement, not a blocker.

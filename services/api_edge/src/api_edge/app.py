@@ -78,13 +78,17 @@ async def stream_demo():
             await asyncio.sleep(0.5)
     return StreamingResponse(eventgen(), media_type="text/event-stream")
 
-@app.post("/v2/ask")
-async def v2_ask_passthrough(request: Request):
+@app.post("/v2/query")
+async def v2_query_passthrough(request: Request):
     body_bytes = await request.body()
     try:
         payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
     except Exception:
         payload = {}
     async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post("http://gateway:8081/v2/ask", json=payload)
-        return JSONResponse(status_code=r.status_code, content=r.json())
+        r = await client.post("http://gateway:8081/v2/query", json=payload)
+        return JSONResponse(
+            status_code=r.status_code,
+            content=r.json(),
+            headers={"x-snapshot-etag": r.headers.get("x-snapshot-etag", "")},
+        )

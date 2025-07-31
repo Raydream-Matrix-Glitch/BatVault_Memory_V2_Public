@@ -1,0 +1,387 @@
+What I verified (M2‑critical):
+
+/api/graph/expand_candidates is a stub in memory_api and no traversal helper exists in core_storage → gap confirmed.
+
+Text resolver (BM25/vector) is not wired: /api/resolve/text is a stub → gap confirmed.
+
+Redis is only pinged in gateway health; no caching layer for hot paths → gap confirmed.
+
+Schema catalogs are surfaced but not consistently, and responses don’t always carry x-snapshot-etag → gap confirmed.
+
+OpenTelemetry spans are missing; only structured logs exist → gap confirmed.
+
+Contract/golden tests for resolver/expand missing (ingest has good coverage) → gap confirmed.
+
+Below are git‑style diffs for existing files and full new files to close M2 gaps. I’ve followed your constraints (modular service boundaries, JSON‑first validation, structured logging with deterministic IDs, async‑friendly, cache‑optimized, docker/K8s‑ready, and added strategic logging). I call out assumptions where repo details were ambiguous.
+
+Changes in existing files (git‑style diffs)
+1) Export tracing helper
+diff
+Copy
+Edit
+diff --git a/packages/core_logging/src/core_logging/__init__.py b/packages/core_logging/src/core_logging/__init__.py
+--- a/packages/core_logging/src/core_logging/__init__.py
++++ b/packages/core_logging/src/core_logging/__init__.py
+@@ -1 +1,3 @@
+ from .logger import get_logger, log_event, log_stage
++
++from .logger import trace_span
+diff
+Copy
+Edit
+diff --git a/packages/core_logging/src/core_logging/logger.py b/packages/core_logging/src/core_logging/logger.py
+--- a/packages/core_logging/src/core_logging/logger.py
++++ b/packages/core_logging/src/core_logging/logger.py
+@@ -66,3 +66,33 @@
+     safe_extras = {k: v for k, v in extras.items() if k not in _RESERVED}
+     logger.info(event, extra=safe_extras)
++
++from contextlib import contextmanager
++try:
++    from opentelemetry import trace as _otel_trace  # optional
++except Exception:  # pragma: no cover
++    _otel_trace = None
++
++@contextmanager
++def trace_span(name: str, **attrs):
++    """
++    Lightweight span wrapper. Uses OpenTelemetry if present, else no‑op.
++    Avoids hard dependency to keep runtime lean.
++    """
++    if _otel_trace:
++        tracer = _otel_trace.get_tracer("batvault")
++        with tracer.start_as_current_span(name) as span:
++            for k, v in attrs.items():
++                try:
++                    span.set_attribute(k, v)
++                except Exception:
++                    pass
++            yield span
++            return
++    # Fallback no‑op
++    yield None
+2) Settings: cache TTLs for resolver/expand
+diff
+Copy
+Edit
+diff --git a/packages/core_config/src/core_config/settings.py b/packages/core_config/src/core_config/settings.py
+--- a/packages/core_config/src/core_config/settings.py
++++ b/packages/core_config/src/core_config/settings.py
+@@ -49,6 +49,10 @@
+     arango_meta_collection: str = Field(default="meta", alias="ARANGO_META_COLLECTION")
+ 
+     # Redis
++    cache_ttl_expand_sec: int = Field(default=60, alias="CACHE_TTL_EXPAND_SEC")
++    cache_ttl_resolve_sec: int = Field(default=60, alias="CACHE_TTL_RESOLVE_SEC")
++    # existing:
+     redis_url: str = Field(default="redis://redis:6379/0", alias="REDIS_URL")
+3) Arango store: add caching + k=1 traversal + BM25/LIKE resolver
+diff
+Copy
+Edit
+diff --git a/packages/core_storage/src/core_storage/arangodb.py b/packages/core_storage/src/core_storage/arangodb.py
+--- a/packages/core_storage/src/core_storage/arangodb.py
++++ b/packages/core_storage/src/core_storage/arangodb.py
+@@ -1,6 +1,7 @@
+ from typing import Any, Dict, List, Optional, Tuple
+ import os, re, hashlib, logging
+ import httpx
++import json
+ from arango import ArangoClient
+ from pydantic import BaseModel
+ from core_config import get_settings
+ from core_logging import get_logger, log_stage
+@@
+     # ----------------- Enrichment (envelopes) -----------------
+     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
+         ...
+         return {
+             "id": n["_key"],
+             ...
+         }
++
++    # ----------------- Resolver & Graph Expansion -----------------
++    def _redis(self):
++        try:
++            import redis  # type: ignore
++        except Exception:
++            return None
++        try:
++            return redis.Redis.from_url(get_settings().redis_url)  # type: ignore
++        except Exception:
++            return None
++
++    def _cache_get(self, key: str):
++        r = self._redis()
++        if not r:
++            return None
++        try:
++            v = r.get(key)
++            if v:
++                import orjson
++                return orjson.loads(v)
++        except Exception:
++            return None
++        return None
++
++    def _cache_set(self, key: str, value, ttl: int):
++        r = self._redis()
++        if not r:
++            return
++        try:
++            import orjson
++            r.setex(key, ttl, orjson.dumps(value))
++        except Exception:
++            return
++
++    def expand_candidates(self, anchor_id: str, k: int = 1) -> dict:
++        """
++        Return k‑hop neighbors around an anchor node. k is clamped to 1 per M2.
++        """
++        from core_logging import get_logger, log_stage
++        k = 1
++        cache_key = f"expand:{anchor_id}:k{str(k)}"
++        cached = self._cache_get(cache_key)
++        if cached:
++            return cached
++
++        aql = """
++        LET anchor = DOCUMENT('nodes', @anchor)
++        LET outgoing = (FOR v,e IN 1..1 OUTBOUND anchor GRAPH @graph RETURN {node: v, edge: e})
++        LET incoming = (FOR v,e IN 1..1 INBOUND  anchor GRAPH @graph RETURN {node: v, edge: e})
++        RETURN { anchor: anchor, neighbors: APPEND(outgoing, incoming) }
++        """
++        cursor = self.db.aql.execute(aql, bind_vars={"anchor": anchor_id, "graph": self.graph_name})
++        doc = next(cursor, {"anchor": None, "neighbors": []})
++        result = {
++            "anchor": doc.get("anchor"),
++            "neighbors": [
++                {
++                    "id": n["node"].get("_key"),
++                    "type": n["node"].get("type"),
++                    "title": n["node"].get("title"),
++                    "edge": {
++                        "relation": n["edge"].get("relation"),
++                        "timestamp": n["edge"].get("timestamp"),
++                    },
++                }
++                for n in doc.get("neighbors", [])
++                if n.get("node") and n.get("edge")
++            ],
++        }
++        self._cache_set(cache_key, result, get_settings().cache_ttl_expand_sec)
++        return result
++
++    def resolve_text(self, q: str, limit: int = 10) -> dict:
++        """
++        BM25/TFIDF text resolve via ArangoSearch view if available; fallback to LIKE scan.
++        Returns [{id, score, title, type}].
++        """
++        key = f"resolve:{hash(q)}:l{limit}"
++        cached = self._cache_get(key)
++        if cached:
++            return cached
++        results = []
++        try:
++            # Assumption: ArangoSearch view named 'nodes_search'; analyzer 'text_en'
++            aql = (
++                "FOR d IN nodes_search "
++                "SEARCH ANALYZER(PHRASE(d.content, @q), 'text_en') "
++                "SORT BM25(d) DESC LIMIT @limit "
++                "RETURN {id: d._key, score: BM25(d), title: d.title, type: d.type}"
++            )
++            cursor = self.db.aql.execute(aql, bind_vars={"q": q, "limit": limit})
++            results = list(cursor)
++        except Exception:
++            # Fallback LIKE over 'nodes' collection (0 score)
++            aql = (
++                "FOR d IN nodes "
++                "FILTER LIKE(LOWER(d.content), LOWER(CONCAT('%', @q, '%'))) "
++                "LIMIT @limit RETURN {id: d._key, score: 0.0, title: d.title, type: d.type}"
++            )
++            cursor = self.db.aql.execute(aql, bind_vars={"q": q, "limit": limit})
++            results = list(cursor)
++        resp = {"query": q, "matches": results}
++        self._cache_set(key, resp, get_settings().cache_ttl_resolve_sec)
++        return resp
+Assumptions to confirm:
+• Arango collections are named nodes/edges and graph is settings.arango_graph_name (present in code).
+• Free‑text lives in d.content and an ArangoSearch view nodes_search exists; otherwise we fall back to LIKE.
+If names differ, tell me and I’ll align the AQL.
+
+4) Wire Memory‑API endpoints; headers + logs + spans
+diff
+Copy
+Edit
+diff --git a/services/memory_api/src/memory_api/app.py b/services/memory_api/src/memory_api/app.py
+--- a/services/memory_api/src/memory_api/app.py
++++ b/services/memory_api/src/memory_api/app.py
+@@
+-@app.post("/api/resolve/text")
+-def resolve_text(payload: dict):
+-    # M2 will implement BM25/vector resolve; stub for now
+-    return {"matches": [], "query": payload.get("q")}
++@app.post("/api/resolve/text")
++def resolve_text(payload: dict, response: Response):
++    from core_logging import trace_span
++    q = payload.get("q", "")
++    if not q:
++        return {"matches": [], "query": q}
++    st = store()
++    with trace_span("memory.resolve_text", q=q):
++        doc = st.resolve_text(q, limit=int(payload.get("limit", 10)))
++    etag = st.get_snapshot_etag()
++    if etag:
++        response.headers["x-snapshot-etag"] = etag
++    log_stage(logger, "resolver", "text_resolved",
++              request_id=payload.get("request_id"),
++              snapshot_etag=etag,
++              match_count=len(doc.get("matches", [])))
++    return doc
+@@
+-@app.post("/api/graph/expand_candidates")
+-def expand_candidates(payload: dict):
+-    # M2 will implement real AQL traversal (k=1)
+-    return {"anchor": payload.get("anchor"), "k": 1, "neighbors": []}
++@app.post("/api/graph/expand_candidates")
++def expand_candidates(payload: dict, response: Response):
++    from core_logging import trace_span
++    anchor = payload.get("anchor")
++    k = int(payload.get("k", 1))
++    if not anchor:
++        raise HTTPException(status_code=400, detail="anchor is required")
++    st = store()
++    with trace_span("memory.expand_candidates", anchor=anchor, k=k):
++        doc = st.expand_candidates(anchor, k=k)
++    etag = st.get_snapshot_etag()
++    if etag:
++        response.headers["x-snapshot-etag"] = etag
++    log_stage(logger, "expand", "candidates_returned",
++              request_id=payload.get("request_id"),
++              snapshot_etag=etag,
++              neighbor_count=len(doc.get("neighbors", [])))
++    return doc
+Also: the existing /api/schema/* and /api/enrich/* blocks already set x-snapshot-etag in some places; these changes ensure resolver/expand now do as well.
+
+5) Gateway: /v2/query passthrough with strategic logging & ETag
+diff
+Copy
+Edit
+diff --git a/services/gateway/src/gateway/app.py b/services/gateway/src/gateway/app.py
+--- a/services/gateway/src/gateway/app.py
++++ b/services/gateway/src/gateway/app.py
+@@
+ @app.post("/v2/ask")
+ def v2_ask(...):
+     ...
+     return JSONResponse(resp.model_dump())
++
++@app.post("/v2/query")
++def v2_query(payload: dict):
++    """Natural‑language query resolver: BM25/Vector (first pass)."""
++    log_stage(logger, "gateway", "v2_query_in", request_id=payload.get("request_id"))
++    resp = httpx.post(f"{settings.memory_api_url}/api/resolve/text", json=payload, timeout=5.0)
++    data = resp.json()
++    headers = {"x-snapshot-etag": resp.headers.get("x-snapshot-etag", "")}
++    log_stage(logger, "gateway", "v2_query_out",
++              request_id=payload.get("request_id"),
++              match_count=len(data.get("matches", [])),
++              snapshot_etag=headers.get("x-snapshot-etag"))
++    return JSONResponse(content=data, headers=headers, status_code=resp.status_code)
+6) API‑Edge: passthrough /v2/query to Gateway
+diff
+Copy
+Edit
+diff --git a/services/api_edge/src/api_edge/app.py b/services/api_edge/src/api_edge/app.py
+--- a/services/api_edge/src/api_edge/app.py
++++ b/services/api_edge/src/api_edge/app.py
+@@
+ @app.post("/v2/ask")
+ async def v2_ask_passthrough(...):
+     ...
+     return JSONResponse(status_code=r.status_code, content=r.json())
++
++@app.post("/v2/query")
++async def v2_query_passthrough(request: Request):
++    body_bytes = await request.body()
++    try:
++        payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
++    except Exception:
++        payload = {}
++    async with httpx.AsyncClient(timeout=20.0) as client:
++        r = await client.post("http://gateway:8081/v2/query", json=payload)
++        return JSONResponse(
++            status_code=r.status_code,
++            content=r.json(),
++            headers={"x-snapshot-etag": r.headers.get("x-snapshot-etag", "")},
++        )
+7) Requirements: optional OTel and dev redis lib
+diff
+Copy
+Edit
+diff --git a/requirements/runtime.txt b/requirements/runtime.txt
+--- a/requirements/runtime.txt
++++ b/requirements/runtime.txt
+@@
+ # Utilities
+ python-dateutil
++opentelemetry-api>=1.24
+diff
+Copy
+Edit
+diff --git a/requirements/dev.txt b/requirements/dev.txt
+--- a/requirements/dev.txt
++++ b/requirements/dev.txt
+@@
+ ruff>=0.0
++redis>=4.5
++opentelemetry-api>=1.24
+New tests (full files)
+services/memory_api/tests/test_expand_and_resolve_contracts.py
+
+python
+Copy
+Edit
+import httpx
+
+BASE = "http://memory_api:8000"
+
+def test_expand_candidates_contract():
+    # Without data, should still return shape with neighbors list
+    r = httpx.post(f"{BASE}/api/graph/expand_candidates",
+                   json={"anchor": "nonexistent", "k": 1}, timeout=3.0)
+    assert r.status_code == 200
+    body = r.json()
+    assert "anchor" in body and "neighbors" in body
+    assert isinstance(body["neighbors"], list)
+
+def test_resolve_text_contract():
+    r = httpx.post(f"{BASE}/api/resolve/text", json={"q": "test"}, timeout=3.0)
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("query") == "test"
+    assert "matches" in body
+    assert isinstance(body["matches"], list)
+Notes on strategic logging & IDs
+All new endpoints emit log_stage with request_id, snapshot_etag, and counters (match_count, neighbor_count).
+
+x-snapshot-etag is added to resolver/expand responses (it already existed in some schema/enrich handlers).
+
+Introduced trace_span(...); if OpenTelemetry is present, you’ll get spans (memory.resolve_text, memory.expand_candidates). Otherwise it’s a no‑op but safe.
+
+Ambiguities / assumptions I need you to confirm
+ArangoSearch view: I assumed a view named nodes_search with a text_en analyzer and text in the content field.
+→ If your ingest names differ (view/field/analyzer), tell me and I’ll change the AQL.
+
+Collections/graph: I used nodes/edges and settings.arango_graph_name; if collections are aliased, I’ll update the bindings.
+
+Vector search: M2 calls for gating vector search behind a flag. I left the resolver BM25‑first with a fallback LIKE. If you want a vector path now (e.g., ENABLE_EMBEDDINGS=true), provide the embedding field/index naming and I’ll wire a second branch.
+
+Cache policy: I set CACHE_TTL_EXPAND_SEC=60, CACHE_TTL_RESOLVE_SEC=60. Adjust as needed.
+
+What’s still not done (out of M2 scope or needs your input)
+Robust BM25 view provisioning (migration to ensure nodes_search exists and is populated) — I can add ops scripts if you want that in M2.
+
+True OpenTelemetry exporter/resource config (we only add spans if the lib exists).
+
+End‑to‑end golden fixtures for “why” (this belongs to M3 with evidence bundling/templater).

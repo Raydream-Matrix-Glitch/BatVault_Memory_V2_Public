@@ -68,3 +68,27 @@ def log_stage(
     # Strip keys that would collide with LogRecord attributes
     safe_extras = {k: v for k, v in extras.items() if k not in _RESERVED}
     logger.info(event, extra=safe_extras)
+
+from contextlib import contextmanager
+try:
+    from opentelemetry import trace as _otel_trace  # optional
+except Exception:  # pragma: no cover
+    _otel_trace = None
+
+@contextmanager
+def trace_span(name: str, **attrs):
+    """
+    Lightweight span wrapper. Uses OpenTelemetry if present, else no‑op.
+    """
+    if _otel_trace:
+        tracer = _otel_trace.get_tracer("batvault")
+        with tracer.start_as_current_span(name) as span:
+            for k, v in attrs.items():
+                try:
+                    span.set_attribute(k, v)
+                except Exception:
+                    pass
+            yield span
+            return
+    # Fallback no‑op
+    yield None

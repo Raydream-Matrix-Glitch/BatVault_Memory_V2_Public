@@ -1,0 +1,4 @@
+# one shot (venv, deps, editable, run tests)
+RUN_TESTS=1 bash scripts/dev_install.sh
+# or:
+pytest -q

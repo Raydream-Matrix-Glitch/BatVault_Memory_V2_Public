@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     arango_meta_collection: str = Field(default="meta", alias="ARANGO_META_COLLECTION")
 
     # Redis
+    cache_ttl_expand_sec: int = Field(default=60, alias="CACHE_TTL_EXPAND_SEC")
+    cache_ttl_resolve_sec: int = Field(default=60, alias="CACHE_TTL_RESOLVE_SEC")
     redis_url: str = Field(default="redis://redis:6379/0", alias="REDIS_URL")
 
     # MinIO

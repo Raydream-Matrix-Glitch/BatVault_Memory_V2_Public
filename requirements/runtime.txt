@@ -18,3 +18,4 @@ orjson
 
 # Utilities
 python-dateutil
+opentelemetry-api>=1.24

@@ -41,13 +41,13 @@
 - Back-link derivation (`event.led_to` ↔ `decision.supported_by`; transitions appear in both decisions)
 - Arango upsert (graph) and optional vector embeddings pre-wiring (config-toggled for now)
 - Memory API serves normalized envelopes + catalogs; headers include `snapshot_etag`
-- Contract tests for orphan handling & empty arrays
+- Contract tests for orphan & empty‑array cases must run in CI (coverage ≥1, completeness_debt = 0).
 
 ---
 
 ## Milestone 2 — Memory API k=1 & Resolver
 
-**Goal:** Real AQL for `/api/graph/expand_candidates` (k=1), BM25 text resolve, optional vector resolve (flag), Redis caching.
+**Goal:** Real AQL for /api/graph/expand_candidates (k = 1); BM25 resolver with optional vector flag; Redis caching; stage‑level performance budgets.
 
 ### Key Deliverables
 
@@ -57,6 +57,20 @@
   - Expand: 250ms
   - Enrich: 600ms
 - Unit + contract tests for evidence collection k=1
+- Resolver
+  slug short‑circuit → else BM25 → optional vector (ENABLE_EMBEDDINGS=true).
+- Expand
+  AQL k = 1 traversal, caches results (CACHE_TTL_EXPAND_SEC, default 60 s).
+- Performance Budgets
+  Search ≤ 800 ms, Expand ≤ 250 ms, Enrich ≤ 600 ms, enforced via asyncio.wait_for.
+- Cache Policy
+  TTLs now enumerated here (spec §9.3): Resolver 5 min, Evidence 15 min, LLM JSON 2 min.
+- TTFB Gates
+  CI asserts ≤ 600 ms (known slug) / ≤ 2.5 s (search) p95.
+- Tests
+  Unit + contract tests for resolver & k = 1 expand; smoke covers ETag propagation.
+- Observability
+  OTEL spans on all M2 stages.
 
 ---
 
@@ -78,6 +92,20 @@
 - Golden tests for templater answers
 - Strict validation rules (`supporting_ids ⊆ allowed_ids`, anchor cited, transitions cited)
 
+**Additions**
+- Evidence Builder
+  Caches bundles 15 min (invalidated on snapshot_etag change).
+- Selector
+  Deterministic baseline (recency + similarity) with selector_truncation logs.
+- Prompt Management
+  Canonical Envelope, prompt_fingerprint, artifact retention (Envelope → Prompt → Raw LLM → Validator → Final).
+- Validation
+  Rules in Core‑Spec §11 enforced; completeness_flags included in every response.
+- Golden Tests
+  Templates + validator golden tests run in CI; coverage ≥1, completeness_debt = 0.
+- TTFB Impact
+  p95 total ≤ 3 s (/v2/ask slug) / ≤ 4.5 s (/v2/query).
+
 ---
 
 ## Milestone 4 — /v2/ask & /v2/query + Routing
@@ -89,14 +117,21 @@
 **Intent Routing:**
 - Function-routing calling `search_similar` + `get_graph_neighbors`
 - Merge results, include `routing_confidence`
+- Intent Router with function‑routing.
 
 **Policy Management:**
 - `policy_id` / `prompt_id` registry.json
 - Retries with jitter
 - `fallback_used` semantics
+- Policy Registry with retries & fallback_used.
 
 **Performance:**
-- p95 targets and cache TTLs as specified
+- Performance: p95 & cache TTLs re‑asserted.
+
+**Additions**
+- Load-shedding mechanisms
+- Auto Load‑Shedding & Circuit Breakers (Tech‑Spec § N) — llm_mode=off when budgets breach.
+
 
 ---
 
@@ -121,6 +156,8 @@
 
 - Comprehensive test suites covering core question types
 - End-to-end Docker Compose testing
-- Load-shedding mechanisms
 - Cache performance metrics
 - Error budget monitoring and alerting
+- Golden suites for Why/Who/When + e2e compose tests.
+- Cache‑hit & latency dashboards.
+- Error budget SLOs.

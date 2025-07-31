@@ -1,0 +1,39 @@
+1 · Vector-search function to use
+ArangoDB version (what we run in CI / Compose)	Correct AQL helper	When it’s valid	Index required
+≥ 3.12.4 (current default)	APPROX_NEAR_COSINE()	Works only if a vector index (type hnsw, metric cosine) exists over nodes.embedding	CREATE VECTOR INDEX … METRIC cosine
+3.11 or 3.12 without --experimental-vector-index	COSINE_SIMILARITY() or L2_DISTANCE()	Brute-force; no ANN; slow but correct	none (collection scan)
+
+COSINE_DISTANCE is not an ArangoDB AQL helper – that name comes from other engines such as Google Spanner or Apache Doris. For our target stack we should therefore sort by
+
+
+3 · Ops wrapper / compose job — my recommendation
+Add a tiny shell (or Python) script under ops/bootstrap_arango.sh that waits for TCP 8529, then issues the following (idempotent) HTTP calls or arangosh commands:
+
+
+# 1. create analyzer if absent
+POST /_api/analyzer/text_en …
+
+# 2. create / update arangosearch view
+POST /_api/view/nodes_search         # PUT if exists
+  { "type":"arangosearch", "links":{ … } }
+
+# 3. create vector index
+POST /_api/index?collection=nodes
+  { "type":"vector", "name":"embedding_hnsw",
+    "fields":["embedding"], "dimension":768, "metric":"cosine" }
+Tie it into docker-compose as a one-shot service that depends_on arangodb and exits 0 when finished:
+
+bootstrap:
+  image: arangodb/arangodb:3.12
+  entrypoint: ["/app/ops/bootstrap_arango.sh"]
+  depends_on:
+    arangodb:
+      condition: service_healthy
+Compose will run it exactly once on each up; Kubernetes users can mirror this with a Job/Init-container.
+
+This guarantees every environment – CI, local dev, prod-like – has the same search & vector capabilities without manual clicks.
+
+4 · Next tiny tweak
+Swap any remaining COSINE_DISTANCE mention in README or code to APPROX_NEAR_COSINE (or COSINE_SIMILARITY for the brute-force fallback).
+
+Document the new bootstrap service and the env-var ENABLE_EMBEDDINGS=true in docs/db_bootstrap.md & README.md.

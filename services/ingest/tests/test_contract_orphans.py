@@ -2,7 +2,7 @@ import json, pathlib
 from jsonschema import Draft202012Validator as V
 from ingest.cli import load_schema
 
-ROOT = pathlib.Path(__file__).parents[3] / "memory" / "events"
+ROOT = pathlib.Path(__file__).parents[3] / "memory" / "fixtures" / "events"
 
 
 def _load(path: pathlib.Path) -> dict:

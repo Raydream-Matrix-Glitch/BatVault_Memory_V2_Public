@@ -1,0 +1,8 @@
+{
+  "why_v1": {
+    "policy_id": "why_v1",
+    "prompt_id": "why_v1.0",
+    "policy_block": "Answer strictly in JSON matching WhyDecisionAnswer@1.",
+    "explanations": []
+  }
+}

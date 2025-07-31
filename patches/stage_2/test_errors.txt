@@ -1,0 +1,228 @@
+============================================================================================================================== FAILURES ==============================================================================================================================
+__________________________________________________________________________________________________________________ test_expand_candidates_contract ___________________________________________________________________________________________________________________
+
+    @contextlib.contextmanager
+    def map_httpcore_exceptions() -> typing.Iterator[None]:
+        global HTTPCORE_EXC_MAP
+        if len(HTTPCORE_EXC_MAP) == 0:
+            HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+        try:
+>           yield
+
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:101:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:250: in handle_request
+    resp = self._pool.handle_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection_pool.py:256: in handle_request
+    raise exc from None
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection_pool.py:236: in handle_request
+    response = connection.handle_request(
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection.py:101: in handle_request
+    raise exc
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection.py:78: in handle_request
+    stream = self._connect(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection.py:124: in _connect
+    stream = self._network_backend.connect_tcp(**kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpcore/_backends/sync.py:207: in connect_tcp
+    with map_exceptions(exc_map):
+/usr/lib/python3.12/contextlib.py:158: in __exit__
+    self.gen.throw(value)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+map = {<class 'TimeoutError'>: <class 'httpcore.ConnectTimeout'>, <class 'OSError'>: <class 'httpcore.ConnectError'>}
+
+    @contextlib.contextmanager
+    def map_exceptions(map: ExceptionMapping) -> typing.Iterator[None]:
+        try:
+            yield
+        except Exception as exc:  # noqa: PIE786
+            for from_exc, to_exc in map.items():
+                if isinstance(exc, from_exc):
+>                   raise to_exc(exc) from exc
+E                   httpcore.ConnectError: [Errno -3] Temporary failure in name resolution
+
+.venv/lib/python3.12/site-packages/httpcore/_exceptions.py:14: ConnectError
+
+The above exception was the direct cause of the following exception:
+
+    def test_expand_candidates_contract():
+        # Without data, should still return shape with neighbors list
+>       r = httpx.post(f"{BASE}/api/graph/expand_candidates",
+                       json={"anchor": "nonexistent", "k": 1}, timeout=3.0)
+
+services/memory_api/tests/test_expand_and_resolve_contracts.py:7:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.12/site-packages/httpx/_api.py:304: in post
+    return request(
+.venv/lib/python3.12/site-packages/httpx/_api.py:109: in request
+    return client.request(
+.venv/lib/python3.12/site-packages/httpx/_client.py:825: in request
+    return self.send(request, auth=auth, follow_redirects=follow_redirects)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpx/_client.py:914: in send
+    response = self._send_handling_auth(
+.venv/lib/python3.12/site-packages/httpx/_client.py:942: in _send_handling_auth
+    response = self._send_handling_redirects(
+.venv/lib/python3.12/site-packages/httpx/_client.py:979: in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpx/_client.py:1014: in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:249: in handle_request
+    with map_httpcore_exceptions():
+/usr/lib/python3.12/contextlib.py:158: in __exit__
+    self.gen.throw(value)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    @contextlib.contextmanager
+    def map_httpcore_exceptions() -> typing.Iterator[None]:
+        global HTTPCORE_EXC_MAP
+        if len(HTTPCORE_EXC_MAP) == 0:
+            HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+        try:
+            yield
+        except Exception as exc:
+            mapped_exc = None
+
+            for from_exc, to_exc in HTTPCORE_EXC_MAP.items():
+                if not isinstance(exc, from_exc):
+                    continue
+                # We want to map to the most specific exception we can find.
+                # Eg if `exc` is an `httpcore.ReadTimeout`, we want to map to
+                # `httpx.ReadTimeout`, not just `httpx.TimeoutException`.
+                if mapped_exc is None or issubclass(to_exc, mapped_exc):
+                    mapped_exc = to_exc
+
+            if mapped_exc is None:  # pragma: no cover
+                raise
+
+            message = str(exc)
+>           raise mapped_exc(message) from exc
+E           httpx.ConnectError: [Errno -3] Temporary failure in name resolution
+
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:118: ConnectError
+------------------------------------------------------------------------------------------------------------------------ Captured stderr call ------------------------------------------------------------------------------------------------------------------------
+DEBUG:httpcore.connection:connect_tcp.started host='memory_api' port=8000 local_address=None timeout=3.0 socket_options=None
+DEBUG:httpcore.connection:connect_tcp.failed exception=ConnectError(gaierror(-3, 'Temporary failure in name resolution'))
+------------------------------------------------------------------------------------------------------------------------- Captured log call --------------------------------------------------------------------------------------------------------------------------
+DEBUG    httpcore.connection:_trace.py:47 connect_tcp.started host='memory_api' port=8000 local_address=None timeout=3.0 socket_options=None
+DEBUG    httpcore.connection:_trace.py:47 connect_tcp.failed exception=ConnectError(gaierror(-3, 'Temporary failure in name resolution'))
+_____________________________________________________________________________________________________________________ test_resolve_text_contract _____________________________________________________________________________________________________________________
+
+    @contextlib.contextmanager
+    def map_httpcore_exceptions() -> typing.Iterator[None]:
+        global HTTPCORE_EXC_MAP
+        if len(HTTPCORE_EXC_MAP) == 0:
+            HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+        try:
+>           yield
+
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:101:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:250: in handle_request
+    resp = self._pool.handle_request(req)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection_pool.py:256: in handle_request
+    raise exc from None
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection_pool.py:236: in handle_request
+    response = connection.handle_request(
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection.py:101: in handle_request
+    raise exc
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection.py:78: in handle_request
+    stream = self._connect(request)
+             ^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpcore/_sync/connection.py:124: in _connect
+    stream = self._network_backend.connect_tcp(**kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpcore/_backends/sync.py:207: in connect_tcp
+    with map_exceptions(exc_map):
+/usr/lib/python3.12/contextlib.py:158: in __exit__
+    self.gen.throw(value)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+map = {<class 'TimeoutError'>: <class 'httpcore.ConnectTimeout'>, <class 'OSError'>: <class 'httpcore.ConnectError'>}
+
+    @contextlib.contextmanager
+    def map_exceptions(map: ExceptionMapping) -> typing.Iterator[None]:
+        try:
+            yield
+        except Exception as exc:  # noqa: PIE786
+            for from_exc, to_exc in map.items():
+                if isinstance(exc, from_exc):
+>                   raise to_exc(exc) from exc
+E                   httpcore.ConnectError: [Errno -3] Temporary failure in name resolution
+
+.venv/lib/python3.12/site-packages/httpcore/_exceptions.py:14: ConnectError
+
+The above exception was the direct cause of the following exception:
+
+    def test_resolve_text_contract():
+>       r = httpx.post(f"{BASE}/api/resolve/text", json={"q": "test"}, timeout=3.0)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+services/memory_api/tests/test_expand_and_resolve_contracts.py:15:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.12/site-packages/httpx/_api.py:304: in post
+    return request(
+.venv/lib/python3.12/site-packages/httpx/_api.py:109: in request
+    return client.request(
+.venv/lib/python3.12/site-packages/httpx/_client.py:825: in request
+    return self.send(request, auth=auth, follow_redirects=follow_redirects)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpx/_client.py:914: in send
+    response = self._send_handling_auth(
+.venv/lib/python3.12/site-packages/httpx/_client.py:942: in _send_handling_auth
+    response = self._send_handling_redirects(
+.venv/lib/python3.12/site-packages/httpx/_client.py:979: in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpx/_client.py:1014: in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:249: in handle_request
+    with map_httpcore_exceptions():
+/usr/lib/python3.12/contextlib.py:158: in __exit__
+    self.gen.throw(value)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    @contextlib.contextmanager
+    def map_httpcore_exceptions() -> typing.Iterator[None]:
+        global HTTPCORE_EXC_MAP
+        if len(HTTPCORE_EXC_MAP) == 0:
+            HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+        try:
+            yield
+        except Exception as exc:
+            mapped_exc = None
+
+            for from_exc, to_exc in HTTPCORE_EXC_MAP.items():
+                if not isinstance(exc, from_exc):
+                    continue
+                # We want to map to the most specific exception we can find.
+                # Eg if `exc` is an `httpcore.ReadTimeout`, we want to map to
+                # `httpx.ReadTimeout`, not just `httpx.TimeoutException`.
+                if mapped_exc is None or issubclass(to_exc, mapped_exc):
+                    mapped_exc = to_exc
+
+            if mapped_exc is None:  # pragma: no cover
+                raise
+
+            message = str(exc)
+>           raise mapped_exc(message) from exc
+E           httpx.ConnectError: [Errno -3] Temporary failure in name resolution
+
+.venv/lib/python3.12/site-packages/httpx/_transports/default.py:118: ConnectError
+------------------------------------------------------------------------------------------------------------------------ Captured stderr call ------------------------------------------------------------------------------------------------------------------------
+DEBUG:httpcore.connection:connect_tcp.started host='memory_api' port=8000 local_address=None timeout=3.0 socket_options=None
+DEBUG:httpcore.connection:connect_tcp.failed exception=ConnectError(gaierror(-3, 'Temporary failure in name resolution'))
+------------------------------------------------------------------------------------------------------------------------- Captured log call --------------------------------------------------------------------------------------------------------------------------
+DEBUG    httpcore.connection:_trace.py:47 connect_tcp.started host='memory_api' port=8000 local_address=None timeout=3.0 socket_options=None
+DEBUG    httpcore.connection:_trace.py:47 connect_tcp.failed exception=ConnectError(gaierror(-3, 'Temporary failure in name resolution'))
+====================================================================================================================== short test summary info =======================================================================================================================
+FAILED services/memory_api/tests/test_expand_and_resolve_contracts.py::test_expand_candidates_contract - httpx.ConnectError: [Errno -3] Temporary failure in name resolution
+FAILED services/memory_api/tests/test_expand_and_resolve_contracts.py::test_resolve_text_contract - httpx.ConnectError: [Errno -3] Temporary failure in name resolution
+============================================================================================================== 2 failed, 11 passed in 63.09s (0:01:03) ===============================================================================================================

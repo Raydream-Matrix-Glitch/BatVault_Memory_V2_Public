@@ -1,11 +1,16 @@
-from types import SimpleNamespace
-
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-
+import gateway.app as gw_app
 from gateway.app import app
+from types import SimpleNamespace
 
+# ── isolate unit test from Redis ──
+# ensure we stub get *and* setex (the code uses setex, not set)
+app._schema_cache   = SimpleNamespace(get=lambda *_: None,
+                                     setex=lambda *_: None)
+gw_app._schema_cache = SimpleNamespace(get=lambda *_: None,
+                                      setex=lambda *_: None)
 
 # ---------------------------------------------------------------------------
 # Stub out httpx.AsyncClient used inside gateway.app.schema_mirror
