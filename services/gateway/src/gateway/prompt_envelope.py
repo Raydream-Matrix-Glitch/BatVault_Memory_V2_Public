@@ -25,7 +25,8 @@ def _load_policy_registry() -> Dict[str, Any]:
 _OPTS = json.dumps({"x": 1}).encode()  # noqa: E501 – silence unused-import flake
 
 def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    # Prefix required by spec §C-2 (“sha256:<hex>”)
+    return "sha256:" + hashlib.sha256(data).hexdigest()
 
 @trace_span("prompt")
 def build_prompt_envelope(

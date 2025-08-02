@@ -6,9 +6,7 @@ try:
 except ImportError:
     CrossEncoder = None  # type: ignore
 
-
 _ce = None
-
 
 def _get_model():
     global _ce

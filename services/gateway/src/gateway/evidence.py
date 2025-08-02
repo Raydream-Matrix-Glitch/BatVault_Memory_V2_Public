@@ -7,9 +7,7 @@ import orjson
 import redis
 import hashlib
 import random
-import time
-from typing import List, Dict, Any, Optional, Tuple
-from pydantic import ValidationError
+from typing import Optional
 from fastapi import HTTPException                       # A-2
 from core_logging import get_logger
 from core_config import get_settings
@@ -39,9 +37,20 @@ def _make_cache_key(
     parts = (decision_id, intent, graph_scope, snapshot_etag, str(truncation_applied))
     return "evidence:" + hashlib.sha256("|".join(parts).encode()).hexdigest()
 
+def _collect_allowed_ids(                     # spec §B2 exact-union rule :contentReference[oaicite:2]{index=2}
+    anchor: WhyDecisionAnchor,
+    events: list[dict],
+    trans_pre: list[dict],
+    trans_suc: list[dict],
+) -> list[str]:
+    ids: set[str] = {anchor.id}
+    ids.update(e.get("id") for e in events if isinstance(e, dict))
+    ids.update(t.get("id") for t in trans_pre + trans_suc if isinstance(t, dict))
+    return sorted(i for i in ids if i)
+
+
 logger = get_logger("evidence_builder")
 settings = get_settings()
-
 
 class EvidenceBuilder:
     """Collect & return a **validated** evidence bundle for *anchor_id*."""
@@ -117,7 +126,10 @@ class EvidenceBuilder:
             ev = WhyDecisionEvidence(
                 anchor=anchor,
                 events=events,
-                transitions=WhyDecisionTransitions(preceding=trans_pre, succeeding=trans_suc),
+                transitions=WhyDecisionTransitions(
+                    preceding=trans_pre, succeeding=trans_suc
+                ),
+                allowed_ids=_collect_allowed_ids(anchor, events, trans_pre, trans_suc),
             )
             ev.snapshot_etag            = snapshot_etag
             ev.__dict__["_retry_count"] = retry_count
@@ -125,6 +137,8 @@ class EvidenceBuilder:
             # selector truncation (may mutate *ev*)
             ev, selector_meta = truncate_evidence(ev)
             ev.__dict__["_selector_meta"] = selector_meta
+            for k, v in selector_meta.items():
+                span.set_attribute(k, v)
 
             span.set_attribute("total_neighbors_found", len(events) + len(trans_pre) + len(trans_suc))
             span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
@@ -214,7 +228,10 @@ class EvidenceBuilder:
         ev = WhyDecisionEvidence(
             anchor=anchor,
             events=events,
-            transitions=WhyDecisionTransitions(preceding=trans_pre, succeeding=trans_suc),
+            transitions=WhyDecisionTransitions(
+                preceding=trans_pre, succeeding=trans_suc
+            ),
+            allowed_ids=_collect_allowed_ids(anchor, events, trans_pre, trans_suc),
         )
         ev.snapshot_etag            = snapshot_etag
         ev.__dict__["_retry_count"] = retry_count
@@ -222,7 +239,12 @@ class EvidenceBuilder:
         # ---------------- selector truncation ------------------- #
         ev, selector_meta = truncate_evidence(ev)  # only if > MAX_PROMPT_BYTES (§M4)
         ev.__dict__["_selector_meta"] = selector_meta
-        span.set_attribute("selector.truncated", selector_meta.get("selector_truncation", False))
+        span.set_attribute(
+            "selector.truncated", selector_meta.get("selector_truncation", False)
+        )
+        for k, v in selector_meta.items():
+            span.set_attribute(k, v)
+
 
         # ---------- cache write (composite + alias) --------------------
         if self._redis is not None:

@@ -9,6 +9,12 @@ def validate_response(resp: WhyDecisionResponse) -> Tuple[bool, List[str]]:
     """Validate full WhyDecisionResponse and return (is_valid, errors)."""
     errs: List[str] = []
 
+    # --- WhyDecisionAnswer@1 length limits (spec §F1) -------------------- #
+    if len(resp.answer.short_answer or "") > 320:
+        errs.append("short_answer exceeds 320 characters")
+    if resp.answer.rationale_note and len(resp.answer.rationale_note) > 280:
+        errs.append("rationale_note exceeds 280 characters")
+
     # -------- schema validation ---------------------------------- #
     try:
         WhyDecisionResponse.model_validate(resp.model_dump(mode="python"))
@@ -39,6 +45,16 @@ def validate_response(resp: WhyDecisionResponse) -> Tuple[bool, List[str]]:
     ]
     if trans_ids and not set(trans_ids).issubset(support):
         errs.append("transition ids must be cited in supporting_ids")
+
+    # --- allowed_ids exact union (spec §B2) ------------------------------ #
+    expected = {resp.evidence.anchor.id}
+    expected |= {e.get("id") for e in resp.evidence.events
+                 if isinstance(e, dict) and e.get("id")}
+    expected |= {t.get("id") for t in (resp.evidence.transitions.preceding +
+                                       resp.evidence.transitions.succeeding)
+                 if isinstance(t, dict) and t.get("id")}
+    if set(resp.evidence.allowed_ids) != expected:
+        errs.append("allowed_ids mismatch union of anchor, events and transitions")
 
     # completeness flags
     cf = resp.completeness_flags
