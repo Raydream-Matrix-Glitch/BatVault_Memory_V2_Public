@@ -54,6 +54,9 @@ def log_stage(
     *,
     request_id: str | None = None,
     prompt_fingerprint: str | None = None,
+    plan_fingerprint: str | None = None,
+    bundle_fingerprint: str | None = None,
+    selector_model_id: str | None = None,
     snapshot_etag: str | None = None,
     **kwargs: Any,
 ) -> None:
@@ -62,6 +65,12 @@ def log_stage(
         extras["request_id"] = request_id
     if prompt_fingerprint:
         extras["prompt_fingerprint"] = prompt_fingerprint
+    if plan_fingerprint:
+        extras["plan_fingerprint"] = plan_fingerprint
+    if bundle_fingerprint:
+        extras["bundle_fingerprint"] = bundle_fingerprint
+    if selector_model_id:
+        extras["selector_model_id"] = selector_model_id
     if snapshot_etag:
         extras["snapshot_etag"] = snapshot_etag
     extras.update(kwargs)

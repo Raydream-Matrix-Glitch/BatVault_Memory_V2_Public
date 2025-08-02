@@ -1,13 +1,11 @@
-import re, unicodedata
+import re
 from datetime import datetime, timezone
 from dateutil import parser as dtp
+from core_utils import slugify_id
+from link_utils import derive_links
+import unicodedata
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
-
-def slugify_id(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s.strip().lower())
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
-    return s
 
 def norm_timestamp(ts: str) -> str:
     dt = dtp.parse(ts)
@@ -69,29 +67,11 @@ def normalize_transition(t: dict) -> dict:
     out["tags"] = sorted(set(x.lower() for x in t.get("tags", [])))
     return out
 
-def derive_backlinks(decisions: dict, events: dict, transitions: dict) -> None:
-    """
-    Ensure:
-      - event.led_to ↔ decision.supported_by
-      - transitions appear in both decisions' transitions[] (by id)
-    Only enforce referential integrity when arrays are non-empty (or field present & non-empty).
-    """
-    # Events -> Decisions
-    for eid, e in events.items():
-        for did in e.get("led_to", []):
-            if did in decisions:
-                dec = decisions[did]
-                sb = set(dec.get("supported_by", []))
-                if eid not in sb:
-                    sb.add(eid)
-                    dec["supported_by"] = sorted(sb)
+def normalize_tags(tags: list[str]) -> list[str]:
+    """Canonical tag normalization – spec §L2: slug-lower, dedupe, sort."""
+    normalized = [slugify_id(t) for t in tags]
+    return sorted(set(normalized))
 
-    # Transitions in both decisions
-    for tid, tr in transitions.items():
-        fr, to = tr["from"], tr["to"]
-        if fr in decisions:
-            lst = set(decisions[fr].get("transitions", []))
-            lst.add(tid); decisions[fr]["transitions"] = sorted(lst)
-        if to in decisions:
-            lst = set(decisions[to].get("transitions", []))
-            lst.add(tid); decisions[to]["transitions"] = sorted(lst)
+def derive_backlinks(decisions: dict, events: dict, transitions: dict) -> None:
+    """Shim: delegates to link_utils.derive_links for reciprocity."""
+    return derive_links(decisions, events, transitions)

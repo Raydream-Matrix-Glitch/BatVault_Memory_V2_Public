@@ -22,4 +22,15 @@ def prompt_fingerprint(envelope: Any) -> str:
     hashing its canonical JSON representation.
     """
     canon_bytes = canonical_json(envelope)
-    return hashlib.sha256(canon_bytes).hexdigest()
+    h = hashlib.sha256(canon_bytes).hexdigest()
+    return f"sha256:{h}"
+
+
+def parse_fingerprint(value: str) -> tuple[str, str]:
+    """Parse a fingerprint string, returning (algorithm, hexval).
+    Accepts both "sha256:<hex>" and bare hex for backward compatibility.
+    Always returns ("sha256", <hex>).
+    """
+    if isinstance(value, str) and value.startswith("sha256:"):
+        return ("sha256", value.split(":", 1)[1])
+    return ("sha256", value)

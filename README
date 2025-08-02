@@ -2,3 +2,42 @@
 RUN_TESTS=1 bash scripts/dev_install.sh
 # or:
 pytest -q
+
+
+# create / activate the virtual-env
+python3 -m venv .venv
+source .venv/bin/activate          # or .\.venv\Scripts\activate on Windows
+
+# tooling & requirements
+python -m pip install -U pip wheel
+pip install -r requirements/runtime.txt -r requirements/dev.txt
+
+# editable installs for the core packages only
+for pkg in core_config core_logging core_models core_storage core_utils core_validator link_utils
+do
+  pip install -e packages/$pkg
+done
+
+# run the tests
+pytest -q tests/unit/packages
+
+
+# Delete all __pycache__ directories
+find . -type d -name "__pycache__" -exec rm -rf {} +
+
+# (Optional) Also delete any leftover .pyc files
+find . -type f -name "*.pyc" -delete
+
+API Edge: http://localhost:8080/healthz
+
+Gateway: http://localhost:8081/healthz
+
+MemoryAPI: http://localhost:8082/healthz
+
+Ingest: http://localhost:8083/healthz
+
+ArangoDB: http://localhost:8529 (user: root / pass from .env)
+
+MinIO: http://localhost:9001 (console) (user/pass from .env)
+
+Redis: http://localhost:6379

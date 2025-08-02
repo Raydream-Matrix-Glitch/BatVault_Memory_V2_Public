@@ -7,25 +7,25 @@
 ### Key Deliverables
 
 **Repository Structure:**
-- Repo scaffold matching `/services`, `/packages`, `/ops`, `/scripts`, `/memory` as per spec
+- Repo scaffold matching services, packages, operations, scripts, and memory data directories as per spec
 - Configuration constants file with unified values across all services
 
 **Services:**
-- **/services/api-edge**: Basic routes `/healthz`, `/readyz`, request idempotency keys (hash of body), SSE stub, CORS setup
-- **/services/gateway**: Route shells, trace envelope, artifact sink to MinIO, **templater fallback implementation** (no LLM yet)
-- **/services/memory-api**: Stubs for `/api/enrich/*`, `/api/schema/*`, `/api/graph/expand_candidates`, `/api/resolve/text` returning fixture data
-- **/services/ingest**: JSON loader + schema validation (ID regex, timestamps, content fields) and field/relation catalog from `/memory/*`
+- **API Edge Service**: Basic routes `/healthz`, `/readyz`, request idempotency keys (hash of body), SSE stub, CORS setup
+- **Gateway Service**: Route shells, trace envelope, artifact sink to MinIO, **templater fallback implementation** (no LLM yet)
+- **Memory API Service**: Stubs for `/api/enrich/*`, `/api/schema/*`, `/api/graph/expand_candidates`, `/api/resolve/text` returning fixture data
+- **Ingest Service**: JSON loader + schema validation (ID regex, timestamps, content fields) and field/relation catalog from memory data
 
 **Core Packages:**
-- **/packages/core-***: Logging (JSON with OTEL), IDs (deterministic fingerprinting), config, errors, models (Pydantic v2) with response contracts
-- **/packages/core-storage**: ArangoDB adapter stubs
+- **Core Libraries**: Logging (JSON with OTEL), IDs (deterministic fingerprinting), config, errors, models (Pydantic v2) with response contracts
+- **Storage Adapter**: ArangoDB adapter stubs
 
 **Operations:**
-- **/ops**: Dockerfiles per service, docker-compose (includes ArangoDB/Redis/MinIO), OTEL collector configuration
+- **Container Configuration**: Dockerfiles per service, docker-compose (includes ArangoDB/Redis/MinIO), OTEL collector configuration
 - **Environment variables**: Feature flags, cache TTLs, performance budgets
 
 **Scripts:**
-- **/scripts**: `seed_memory.sh` (loads sample memory/ fixtures), `smoke.sh` (pings health endpoints + basic flow)
+- **Utility Scripts**: Memory data seeding script (loads sample memory fixtures), smoke test script (pings health endpoints + basic flow)
 
 **CI/CD:**
 - GitHub Actions (lint, unit, docker build), pinned Python 3.11 / Node 20
@@ -175,7 +175,7 @@
 - **Fallback handling**: Auto-switch to templater on LLM failures
 
 **Policy Management:**
-- **Intent registry**: `registry.json` with policy-as-data configuration
+- **Intent registry**: Policy configuration file with policy-as-data configuration
 - **Policy versioning**: `policy_id` + `prompt_id` tracking
 - **Rollout control**: Feature flags for policy A/B testing
 - **Fallback semantics**: `fallback_used` flag in all responses
@@ -249,9 +249,9 @@
 ### Key Deliverables
 
 **Golden Test Suites (Complete):**
-- **Why decision tests**: `why_decision_panasonic_plasma.json`, `why_decision_with_based_on.json`, `why_decision_tags_filtering.json`
-- **Who decided tests**: `who_decided_anchor_v1.json`, decision maker identification
-- **When decided tests**: `when_decided_anchor_v1.json`, timeline reconstruction
+- **Why decision tests**: Test cases for decision reasoning, based_on relationships, tag filtering
+- **Who decided tests**: Decision maker identification test cases
+- **When decided tests**: Timeline reconstruction test cases
 - **Cross-link tests**: `based_on` relationship validation, bidirectional repair
 - **Orphan handling tests**: Isolated events, decisions without predecessors
 - **New field tests**: Tags, snippets, x-extra field handling

@@ -6,6 +6,8 @@ from core_utils import compute_snapshot_etag_for_files, slugify_id
 from core_storage import ArangoStore
 from core_config import get_settings
 from .pipeline.normalize import normalize_decision, normalize_event, normalize_transition, derive_backlinks
+from .pipeline.snippet_enricher import enrich_all as enrich_snippets
+from link_utils import derive_links
 from .pipeline.graph_upsert import upsert_all
 from .catalog.field_catalog import build_field_catalog, build_relation_catalog
 
@@ -17,7 +19,7 @@ settings = get_settings()
 #  Public regex constants needed by the contract-tests
 # ------------------------------------------------------------------
 
-ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,}[a-z0-9]$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$")
 
 # ---------- Alias map (extend as needed) ----------
@@ -136,7 +138,10 @@ def seed(path: str) -> int:
     transitions = {k: normalize_transition(v) for k, v in raw_transitions.items()}
 
     # Derivations (backlinks & transition listing)
-    derive_backlinks(decisions, events, transitions)
+    derive_links(decisions, events, transitions)
+
+    # Enrich (deterministic) — precompute node-level `snippet`
+    enrich_snippets(decisions, events, transitions)
 
     # Referential integrity checks (fail fast with clear messages)
     ri_errors = []

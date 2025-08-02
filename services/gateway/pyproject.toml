@@ -9,6 +9,9 @@ description = "Gateway and prompt/evidence coordinator"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.112.0",
+  "numpy>=1.26.4",
+  "sentence-transformers>=2.7.0",
+  "core_storage",
   "uvicorn[standard]>=0.29.0",
   "httpx>=0.27.0",
   "redis>=5.0.3",
@@ -18,6 +21,7 @@ dependencies = [
   "core_config",
   "core_logging",
   "core_utils",
+  "core_validator",
 ]
 
 [tool.setuptools.packages.find]

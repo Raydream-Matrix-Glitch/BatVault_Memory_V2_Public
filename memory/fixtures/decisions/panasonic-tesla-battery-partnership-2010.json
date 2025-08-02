@@ -9,8 +9,7 @@
     "ev_batteries"
   ],
   "supported_by": [
-    "pan-e1",
-    "pan-e2"
+    "pan-e1"
   ],
   "based_on": [],
   "transitions": [

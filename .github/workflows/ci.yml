@@ -21,15 +21,29 @@ jobs:
 
       - name: Lint (ruff)
         run: |
-          ruff check packages services
+          ruff check packages services tests
 
       - name: Run unit tests with coverage
         env:
           PYTHONPATH: .
         run: |
-          pytest -q --cov=packages --cov=services --cov-report=term-missing --cov-fail-under=80
+          # run the whole suite (pytest.ini now includes “tests/”)
+          pytest -q --cov=packages --cov=services \
+                    --cov-report=term-missing --cov-fail-under=80
 
-      - name: Smoke (docker-compose)
+      - name: Integration / Smoke
         run: |
+          # start services
           docker compose up -d --build api_edge gateway memory_api ingest
+
+          # ---- idempotent graph load ----
+          # runs python -m ingest.cli seed → graph_upsert.py
+          ./scripts/seed_memory.sh
+
+          # ---- baseline health & contract checks ----
           ./scripts/smoke.sh
+
+      - name: Golden tests  ✅ schema-level coverage
+        run: |
+          # Make sure Milestone-3 golden fixtures continue to round-trip
+          pytest -q tests/golden

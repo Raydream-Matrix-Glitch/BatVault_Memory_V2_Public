@@ -1,9 +1,9 @@
 {
   "id": "trans-phil-2011-2013",
   "from": "philips-exit-tv-2011",
-  "to": "philips-spin-off-lighting-2016",
+  "to": "philips-led-lighting-focus-2013",
   "relation": "causal",
-  "reason": "TV divestiture freed capital for Lighting/HealthTech split",
-  "timestamp": "2014-09-23T06:31:00Z",
+  "reason": "Exiting TVs redirected R&D toward LED technologies, directly enabling the 2013 LED-lighting focus decision.",
+  "timestamp": "2013-01-15T00:00:00Z",
   "x-extra": {}
 }

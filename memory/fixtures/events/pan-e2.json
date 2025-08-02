@@ -1,15 +1,18 @@
 {
   "id": "pan-e2",
-  "summary": "Panasonic unveils next-gen 18650 cell",
-  "description": "Panasonic demonstrated a new 18650 lithium\u2011ion cell with 15\u202f% higher energy density at CES\u202f2010.",
-  "timestamp": "2010-01-05T11:00:00Z",
+  "summary": "¥913 m operating loss in plasma division",
+  "description": "On October 9, 2011, Panasonic reported a ¥913 million operating loss in its plasma TV unit, as LCD rivals gained share.",
+  "timestamp": "2011-10-09T05:30:00Z",
   "tags": [
-    "technology_demo",
-    "battery_rd"
+    "financial_loss",
+    "competitive_pressure"
   ],
   "led_to": [
-    "panasonic-tesla-battery-partnership-2010"
+    "panasonic-exit-plasma-2012"
   ],
-  "snippet": "15\u202f% boost in cell capacity.",
-  "x-extra": {}
+  "snippet": "Plasma unit swung to a ¥913 m loss amid rising LCD competition.",
+  "x-extra": {
+    "quarter": "Q3 2011",
+    "report_type": "earnings_release"
+  }
 }

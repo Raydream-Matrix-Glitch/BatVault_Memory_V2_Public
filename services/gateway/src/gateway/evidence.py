@@ -10,17 +10,23 @@ import random
 import time
 from typing import List, Dict, Any, Optional, Tuple
 from pydantic import ValidationError
-
+from fastapi import HTTPException                       # A-2
 from core_logging import get_logger
 from core_config import get_settings
-from .models import WhyDecisionEvidence, WhyDecisionAnchor, WhyDecisionTransitions
+from core_models.models import WhyDecisionEvidence, WhyDecisionAnchor, WhyDecisionTransitions
 from .selector import truncate_evidence, bundle_size_bytes
+from opentelemetry import trace
+
+# instantiate tracer for OTEL spans (§B5)
+tracer = trace.get_tracer(__name__)
 
 # ------------------------------------------------------------------#
 #  Constants & helpers                                              #
 # ------------------------------------------------------------------#
 CACHE_TTL_SEC = 900                           # 15 min (§H3)
-ALIAS_TPL = "evidence:{anchor_id}:latest"     # alias → composite key
+# Both alias *and* composite keys must share the same TTL (§11.3).
+# We do an ETag freshness check to guard against race conditions.
+ALIAS_TPL = "evidence:{anchor_id}:latest"
 
 # ------------------------------------------------------------------ #
 #  helpers                                                          #
@@ -34,6 +40,7 @@ def _make_cache_key(
 ) -> str:
     parts = (decision_id, intent, graph_scope, snapshot_etag, str(truncation_applied))
     return "evidence:" + hashlib.sha256("|".join(parts).encode()).hexdigest()
+
 logger = get_logger("evidence_builder")
 settings = get_settings()
 
@@ -49,7 +56,7 @@ class EvidenceBuilder:
             self._redis = None
 
     # ------------------------------------------------------------------ #
-    #  Public API                                                        #
+    #  Public API                                                      #
     # ------------------------------------------------------------------ #
     async def build(self, anchor_id: str) -> WhyDecisionEvidence:
         """
@@ -58,8 +65,10 @@ class EvidenceBuilder:
            ② composite_key –› evidence JSON
         Both keys share the same TTL (15 min).
         """
-        alias_key = ALIAS_TPL.format(anchor_id=anchor_id)
+        alias_key   = ALIAS_TPL.format(anchor_id=anchor_id)
         retry_count = 0
+        span        = tracer.start_as_current_span("evidence.bundle")   # OTEL (§B5)
+        span.set_attribute("anchor_id", anchor_id)
 
         # ---------- cache read (alias ➜ composite ➜ evidence) ----------
         if self._redis is not None:
@@ -69,17 +78,45 @@ class EvidenceBuilder:
                     cached = self._redis.get(composite_key)
                     if cached:
                         ev = WhyDecisionEvidence.model_validate_json(cached)
-                        ev.__dict__["_retry_count"] = retry_count
-                        logger.debug("evidence cache hit", extra={"anchor_id": anchor_id})
-                        return ev
+                        # ---------- ETag freshness check (§11.3) -------------
+                        if await self._is_fresh(anchor_id, ev.snapshot_etag):
+                            ev.__dict__["_retry_count"] = retry_count
+                            logger.debug(
+                                "evidence cache hit",
+                                extra={
+                                    "anchor_id": anchor_id,
+                                    "snapshot_etag": ev.snapshot_etag,
+                                },
+                            )
+                            span.set_attribute("cache.hit", True)
+                            return ev
+                        else:
+                            # Stale bundle – fall through and rebuild
+                            logger.debug(
+                                "evidence cache stale – snapshot_etag changed",
+                                extra={
+                                    "anchor_id": anchor_id,
+                                    "stale_etag": ev.snapshot_etag,
+                                },
+                            )
             except Exception:
+                span.set_attribute("cache.error", True)
                 logger.warning("redis read error – bypassing cache", exc_info=True)
 
         # ---------- cache-miss ➜ async upstream fetch (+1 retry) -------------
-        client = httpx.AsyncClient(timeout=httpx.Timeout(0.25), base_url=settings.memory_api_url)
-        # fetch anchor with one retry
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.timeout_expand_ms / 1000.0),
+            base_url=settings.memory_api_url
+        )
+        # ── SEARCH stage with timeout (A-2) ───────────────────────────
         for attempt in range(2):
-            resp_anchor = await client.get(f"/api/enrich/decision/{anchor_id}")
+            try:
+                resp_anchor = await asyncio.wait_for(
+                    client.get(f"/api/enrich/decision/{anchor_id}"),
+                    timeout=settings.timeout_search_ms / 1000.0,
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=504, detail="search stage timeout")
             if resp_anchor.status_code == 200:
                 retry_count = attempt
                 break
@@ -92,11 +129,18 @@ class EvidenceBuilder:
 
         # parse anchor
         anchor = WhyDecisionAnchor(**resp_anchor.json())
-        # fetch neighbors
-        resp_neigh = await client.post(
-            "/api/graph/expand_candidates",
-            json={"id": anchor_id, "k": 1},
-        )
+
+        # ── EXPAND stage with timeout (A-2) ───────────────────────────
+        try:
+            resp_neigh = await asyncio.wait_for(
+                client.post(
+                    "/api/graph/expand_candidates",
+                    json={"id": anchor_id, "k": 1},
+                ),
+                timeout=settings.timeout_expand_ms / 1000.0,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="expand stage timeout")
         resp_neigh.raise_for_status()
         neigh = resp_neigh.json()
         events    = neigh.get("events", [])
@@ -111,14 +155,13 @@ class EvidenceBuilder:
             events=events,
             transitions=WhyDecisionTransitions(preceding=trans_pre, succeeding=trans_suc),
         )
-        ev.snapshot_etag = snapshot_etag
+        ev.snapshot_etag            = snapshot_etag
         ev.__dict__["_retry_count"] = retry_count
-        ev.snapshot_etag = snapshot_etag           # B-6
-        ev.__dict__["_retry_count"] = retry_count  # B-8
 
         # ---------------- selector truncation ------------------- #
-        ev, selector_meta = truncate_evidence(ev)
-        ev.__dict__["_selector_meta"] = selector_meta   # allow app.py to surface meta
+        ev, selector_meta = truncate_evidence(ev)  # only if > MAX_PROMPT_BYTES (§M4)
+        ev.__dict__["_selector_meta"] = selector_meta
+        span.set_attribute("selector.truncated", selector_meta.get("selector_truncation", False))
 
         # ---------- cache write (composite + alias) --------------------
         if self._redis is not None:
@@ -132,73 +175,47 @@ class EvidenceBuilder:
                 )
                 ev_json = ev.model_dump_json()
                 pipe = self._redis.pipeline()
-                # Alias first → avoids race; alias has **no TTL** (§Cache policy)
-                pipe.set(alias_key, composite_key)
-                pipe.setex(composite_key, CACHE_TTL_SEC, ev_json)
-                pipe.execute()                                # B-1 & B-7
+                ttl = settings.cache_ttl_evidence_sec or CACHE_TTL_SEC
+                pipe.setex(alias_key,     ttl, composite_key)
+                pipe.setex(composite_key, ttl, ev_json)
+                pipe.execute()
             except Exception:
                 logger.warning("redis write error", exc_info=True)
 
-        logger.info(                                             # observability
+        logger.info(
             "evidence_built",
             extra={
-                "anchor_id": anchor_id,
-                "bundle_size_bytes": bundle_size_bytes(ev),
+                "anchor_id":           anchor_id,
+                "total_neighbors":     len(events) + len(trans_pre) + len(trans_suc),
+                "bundle_size_bytes":   bundle_size_bytes(ev),
                 **selector_meta,
             },
         )
+        span.end()
         return ev
 
     # ------------------------------------------------------------------ #
-    #  Helpers                                                           #
+    #  Snapshot freshness helper                                       #
     # ------------------------------------------------------------------ #
-    def _collect_from_upstream(self, anchor_id: str) -> Tuple[WhyDecisionEvidence, str, int]:
-        """Return (evidence, snapshot_etag, retry_count) with ≤ 1 retry + jitter ≤ 300 ms."""
-        retry_count = 0
-        for attempt in range(2):
-            try:
-                resp_anchor = self._client.get(f"/api/enrich/decision/{anchor_id}")
-                resp_anchor.raise_for_status()
-                break
-            except Exception:
-                retry_count = attempt + 1
-                if attempt == 1:
-                    raise
-                time.sleep(random.uniform(0.05, 0.30))  # capped jitter
-
-
-        snapshot_etag = resp_anchor.headers.get("snapshot_etag", "unknown")
+    async def _is_fresh(self, anchor_id: str, cached_etag: str) -> bool:
+        """
+        True  → cached_etag equals current Memory-API snapshot_etag  
+        False → mismatch (or cached_etag=='unknown'); forces rebuild.
+        The GET has a hard 50 ms timeout so we stay well under stage SLOs.
+        """
+        if cached_etag == "unknown":
+            return False
         try:
-            anchor = WhyDecisionAnchor(**resp_anchor.json())
-
-            resp_neigh = self._client.post(
-                "/api/graph/expand_candidates", json={"id": anchor_id, "k": 1}
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(0.05), base_url=settings.memory_api_url
             )
-            resp_neigh.raise_for_status()
-            neigh = resp_neigh.json()
-
-            events      = neigh.get("events", [])
-            trans_pre   = neigh.get("preceding", [])
-            trans_suc   = neigh.get("succeeding", [])
-        except Exception:  # pragma: no cover
-            logger.error("memory_api_error", exc_info=True, extra={"anchor_id": anchor_id})
-            anchor = WhyDecisionAnchor(id=anchor_id)
-            events, trans_pre, trans_suc = [], [], []
-
-        evidence = WhyDecisionEvidence(
-            anchor=anchor,
-            events=events,
-            transitions=WhyDecisionTransitions(preceding=trans_pre, succeeding=trans_suc),
-        )
-
-        ids = {anchor.id}
-        ids.update([e.get("id") for e in events])
-        ids.update([t.get("id") for t in trans_pre])
-        ids.update([t.get("id") for t in trans_suc])
-        evidence.allowed_ids = sorted(i for i in ids if i)
-        # ─── spec sanity: allowed_ids must cover all ids present ─── #
-        missing = {anchor.id, *ids} - set(evidence.allowed_ids)
-        if missing:   # log instead of assert to avoid prod-blowups
-            logger.warning("allowed_ids missing objects", extra={"ids": list(missing)})
-
-        return evidence, snapshot_etag, retry_count
+            resp = await client.get(
+                f"/api/enrich/decision/{anchor_id}",
+                headers={"x-cache-etag-check": "1"},
+            )
+            await client.aclose()
+            current = resp.headers.get("snapshot_etag", "unknown")
+            return current == cached_etag
+        except Exception:
+            # Fail-open: if the check can’t be completed, treat as fresh.
+            return True

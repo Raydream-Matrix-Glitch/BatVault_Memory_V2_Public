@@ -4,13 +4,14 @@
   "type": "object",
   "required": ["id", "from", "to", "relation", "timestamp"],
   "properties": {
-    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{2,}[a-z0-9]$" },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$" },
     "from": { "type": "string" },
     "to": { "type": "string" },
     "relation": { "type": "string", "enum": ["causal", "alternative", "chain_next"] },
     "reason": { "type": "string" },
     "timestamp": { "type": "string", "format": "date-time" },
     "tags": { "type": "array", "items": {"type":"string"} },
+    "snippet": { "type": "string" },
     "x-extra": { "type": "object", "additionalProperties": true }
   },
   "additionalProperties": true

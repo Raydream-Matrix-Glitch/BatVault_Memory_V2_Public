@@ -3,7 +3,12 @@ name = "core_storage"
 version = "0.1.0"
 description = "ArangoDB adapters for BatVault"
 requires-python = ">=3.11"
-dependencies = ["python-arango>=7.9.1", "pydantic>=2.7.0"]
+dependencies = [
+  "python-arango>=7.9.1",
+  "pydantic>=2.7.0",
+  "redis>=5.0.3",
+  "httpx>=0.27.0",              # used for write-through cache in arangodb.py
+]
 
 [build-system]
 requires = ["setuptools", "wheel"]

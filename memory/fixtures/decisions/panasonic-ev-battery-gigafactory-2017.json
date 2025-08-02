@@ -9,8 +9,8 @@
     "ev_batteries"
   ],
   "supported_by": [
-    "pan-e7",
-    "pan-e8"
+    "pan-e6",
+    "pan-e7"
   ],
   "based_on": [
     "panasonic-automotive-infotainment-acquisition-2014"

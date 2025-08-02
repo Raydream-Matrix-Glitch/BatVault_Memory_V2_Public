@@ -476,29 +476,6 @@ ENABLE_CACHING = True             # Redis caching layer
 - `snippet` added to content field validation
 - Cross-link reciprocity extended to `based_on ↔ transitions` relationships
 
-## 16. Service Structure
-
-```
-/services
-  /api-edge          # HTTP gateway, auth, rate limiting
-  /gateway           # Core orchestration, evidence bundling
-    /intent_router/  # Natural language → function routing
-    /resolver/       # Weak AI anchor resolution
-    /evidence/       # Bundle building with ML selection
-    /validator/      # Response validation
-  /memory-api        # Graph ops, enrichment, schema catalog
-  /ingest           # JSON validation, normalization, ArangoDB
-/packages
-  /core-storage     # ArangoDB graph + vector adapters
-  /core-models      # Pydantic schemas
-  /core-logging     # Structured logging with OTEL
-  /core-config      # Configuration management
-  /core-errors      # Error handling
-  /core-ids         # Deterministic ID generation
-/memory
-  /{decisions,events,transitions}/*.json
-```
-
 ## 17. Development Setup
 
 **Prerequisites**: Docker Compose with ArangoDB, Redis, MinIO

@@ -7,17 +7,18 @@
     "earnings_alert",
     "loss_mitigation"
   ],
-  "kpis": [
+  "led_to": [
+    "panasonic-exit-plasma-2012"
+  ],
+  "snippet": "Plasma unit \u2212$913\u202fm op.loss.",
+  "x-extra": {
+      "kpis": [
     {
       "name": "Operating Loss (TV)",
       "value": 913,
       "unit": "million USD",
       "timestamp": "2013-10-09T00:00:00Z"
     }
-  ],
-  "led_to": [
-    "panasonic-exit-plasma-2012"
-  ],
-  "snippet": "Plasma unit \u2212$913\u202fm op.loss.",
-  "x-extra": {}
+  ]
+  }
 }

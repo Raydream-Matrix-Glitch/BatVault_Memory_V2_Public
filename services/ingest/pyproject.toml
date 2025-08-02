@@ -17,6 +17,8 @@ dependencies = [
   "core_logging",
   "core_utils",
   "core_storage",
+  "link_utils",
+  "core_validator",
 ]
 
 [tool.setuptools.packages.find]

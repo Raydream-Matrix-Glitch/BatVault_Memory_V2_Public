@@ -7,7 +7,12 @@
     "market_analysis",
     "margin_warning"
   ],
-  "kpis": [
+  "led_to": [
+    "philips-exit-tv-2011"
+  ],
+  "snippet": "TV unit margin \u22122\u202f% to \u22123\u202f%; \u20ac60\u201390\u202fm loss.",
+  "x-extra": {
+      "kpis": [
     {
       "name": "Adjusted EBITA Margin (TV)",
       "value": -2.5,
@@ -20,10 +25,6 @@
       "unit": "million EUR",
       "timestamp": "2010-12-01T14:03:00Z"
     }
-  ],
-  "led_to": [
-    "philips-exit-tv-2011"
-  ],
-  "snippet": "TV unit margin \u22122\u202f% to \u22123\u202f%; \u20ac60\u201390\u202fm loss.",
-  "x-extra": {}
+  ]
+  }
 }

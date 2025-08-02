@@ -13,10 +13,10 @@
     "phil-e6"
   ],
   "based_on": [
-    "philips-led-lighting-focus-2013"
+    "philips-lighting-split-2014"
   ],
   "transitions": [
-    "trans-phil-2013-2016",
+    "trans-phil-2014-2016",
     "trans-phil-2016-2018"
   ],
   "x-extra": {}

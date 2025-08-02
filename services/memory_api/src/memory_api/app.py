@@ -1,19 +1,47 @@
 from fastapi import FastAPI, Response, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core_config import get_settings
-from core_logging import get_logger, log_stage
+from core_logging import get_logger, log_stage, trace_span
 from core_storage import ArangoStore
-from typing import Dict, List, Tuple, Optional, Callable
+from core_utils.health import attach_health_routes
+from core_utils.ids import generate_request_id
+from typing import Dict, List, Tuple, Optional
 from functools import lru_cache
 import httpx
 import asyncio
 import re
 import time
 
-
 settings = get_settings()
 logger = get_logger("memory_api")
-app = FastAPI(title="BatVault Memory API", version="0.1.0")
+app = FastAPI(title="BatVault Memory_API", version="0.1.0")
+
+# ── Prometheus scrape endpoint (CI + Prometheus) ───────────────────────────
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:                         # pragma: no cover
+    return Response(generate_latest(),
+                    media_type=CONTENT_TYPE_LATEST)
+
+async def _ping_gateway_ready():
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.get("http://gateway:8081/readyz")
+        return r.status_code == 200 and r.json().get("ready", False)
+
+async def _readiness() -> dict:
+    ok = await _ping_gateway_ready()
+    return {
+        "status": "ready" if ok else "degraded",
+        "request_id": generate_request_id(),
+    }
+
+attach_health_routes(
+    app,
+    checks={
+        "liveness": lambda: True,          # always healthy if the process is up
+        "readiness": _readiness,           # still verifies Gateway once it exists
+    },
+)
 
 @lru_cache()
 def store() -> ArangoStore:
@@ -31,21 +59,6 @@ def store() -> ArangoStore:
 async def bootstrap_arango():
     # Ensure DB/collections via ArangoStore init (it handles vector index creation)
     _ = store()
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "service": "memory-api"}
-
-@app.get("/readyz")
-async def readyz():
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{settings.arango_url}/_api/version")
-            if r.status_code == 200:
-                return {"ready": True}
-    except Exception:
-        pass
-    return {"ready": False}
 
 # ------------------ Catalog helpers (shared) ------------------
 def _compute_field_catalog() -> Tuple[Dict[str, List[str]], Optional[str]]:
@@ -67,7 +80,6 @@ def _compute_relation_catalog() -> Tuple[List[str], Optional[str]]:
 # ------------------ Catalogs (HTTP) ------------------
 @app.get("/api/schema/fields")
 def get_field_catalog(response: Response):
-    from core_logging import trace_span
     with trace_span("memory.schema_fields"):
         fields, etag = _compute_field_catalog()
         if etag:
@@ -77,7 +89,6 @@ def get_field_catalog(response: Response):
 @app.get("/api/schema/rels")
 @app.get("/api/schema/relations")
 def get_relation_catalog(response: Response):
-    from core_logging import trace_span
     with trace_span("memory.schema_relations"):
         relations, etag = _compute_relation_catalog()
         if etag:
@@ -87,7 +98,6 @@ def get_relation_catalog(response: Response):
 # --------------- Enrichment -------------
 @app.get("/api/enrich/decision/{node_id}")
 def enrich_decision(node_id: str, response: Response):
-    from core_logging import trace_span
     with trace_span("memory.enrich_decision", node_id=node_id):
         st = store()
         doc = st.get_enriched_decision(node_id)
@@ -100,7 +110,6 @@ def enrich_decision(node_id: str, response: Response):
 
 @app.get("/api/enrich/event/{node_id}")
 def enrich_event(node_id: str, response: Response):
-    from core_logging import trace_span
     with trace_span("memory.enrich_event", node_id=node_id):
         st = store()
         doc = st.get_enriched_event(node_id)
@@ -146,7 +155,6 @@ def relation_catalog(request):
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
 @app.post("/api/resolve/text")
 async def resolve_text(payload: dict, response: Response):
-    from core_logging import trace_span
     q = payload.get("q", "")
     use_vector = bool(payload.get("use_vector", False))
     query_vector = payload.get("query_vector")
@@ -216,10 +224,6 @@ async def resolve_text(payload: dict, response: Response):
     doc.setdefault("vector_used", bool(use_vector))
     doc.setdefault("meta", {})
 
-    # ---- Milestone-2 contract guarantees -------------------------------- #
-    doc.setdefault("matches", [])
-    doc.setdefault("vector_used", bool(use_vector))
-    doc.setdefault("meta", {})
     # ---------- ensure non-null resolved_id ------------------------------ #
     if doc.get("matches"):
         doc["resolved_id"] = doc["matches"][0].get("id")
@@ -234,7 +238,6 @@ async def resolve_text(payload: dict, response: Response):
 
 @app.post("/api/graph/expand_candidates")
 async def expand_candidates(payload: dict, response: Response):
-    from core_logging import trace_span
     anchor = payload.get("anchor")
     k = int(payload.get("k", 1))
     if not anchor:

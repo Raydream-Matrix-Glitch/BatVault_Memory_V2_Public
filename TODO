@@ -38,3 +38,17 @@ Add explicit timeout handling for each service boundary
 Define data consistency guarantees (eventual vs strong consistency for cross-links)
 
 The pipeline is ambitious and well-structured, but these issues could cause problems in production. The core concept is sound - the devil is in the execution details around edge cases and error conditions.
+
+
+
+
+
+
+
+
+
+Important: 
+
+- validate whether no code duplication exist or logic duplication
+- verify whether all milestones up until 3 have been reached fully
+- check valitity of all test

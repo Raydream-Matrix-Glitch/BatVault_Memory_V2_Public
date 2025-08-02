@@ -20,8 +20,6 @@ class WhyDecisionEvidence(BaseModel):
     events: List[Dict[str, Any]]
     transitions: WhyDecisionTransitions
     allowed_ids: List[str]
-    supporting_ids: List[str]
-    rationale_note: Optional[str] = None
 
 
 class WhyDecisionAnswer(BaseModel):

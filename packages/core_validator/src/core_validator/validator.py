@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import List, Tuple
-from gateway.models import WhyDecisionResponse
+from core_models.models import WhyDecisionResponse
 
 __all__ = ["validate_response"]
 

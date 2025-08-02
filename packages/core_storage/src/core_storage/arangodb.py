@@ -6,6 +6,8 @@ from functools import cached_property
 from pydantic import BaseModel
 from core_config import get_settings
 from core_logging import get_logger, log_stage
+import core_metrics
+
 
 logger = get_logger("core_storage")
 
@@ -86,7 +88,68 @@ class ArangoStore:
         #  (guarded by env ARANGO_VECTOR_INDEX_ENABLED=true)
         # ------------------------------------------------------------------
         if os.getenv("ARANGO_VECTOR_INDEX_ENABLED", "false").lower() == "true":
+            # Validate & audit embedding configuration once at startup
+            self._audit_embedding_config()
             self._maybe_create_vector_index()
+
+        # --------------------------------------------------------------
+        #  Ensure BM25 search components (analyzer + ArangoSearch view)
+        # --------------------------------------------------------------
+        self._ensure_search_components()
+
+    # ------------------------------------------------------------------
+    #  Analyzer + ArangoSearch view
+    # ------------------------------------------------------------------
+    def _ensure_search_components(self) -> None:
+        """
+        Idempotently create
+          • analyzer  `text_en`
+          • view      `nodes_search` that links `nodes`
+        """
+        cfg  = get_settings()
+        auth = httpx.BasicAuth(cfg.arango_root_user, cfg.arango_root_password)
+        base = f"{cfg.arango_url}/_db/{self.db.name}"
+
+        # 1. analyzer ---------------------------------------------------
+        ana_payload = {
+            "name": "text_en",
+            "type": "text",
+            "properties": {
+                "locale": "en_US.utf-8",
+                "case": "lower",
+                "accent": False,
+                "stemming": True,
+            },
+        }
+        try:
+            httpx.post(f"{base}/_api/analyzer", json=ana_payload, auth=auth, timeout=10.0)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (400, 409):
+                raise
+
+        # 2. view -------------------------------------------------------
+        view_name = "nodes_search"
+        try:
+            httpx.post(f"{base}/_api/view", json={"name": view_name, "type": "arangosearch"},
+                       auth=auth, timeout=10.0)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (400, 409):
+                raise
+
+        props = {
+            "links": {
+                "nodes": {
+                    "includeAllFields": False,
+                    "fields": {
+                        "rationale": {"analyzers": ["text_en"]},
+                        "summary":   {"analyzers": ["text_en"]},
+                    },
+                    "storeValues": "id",
+                }
+            }
+        }
+        httpx.patch(f"{base}/_api/view/{view_name}/properties", json=props,
+                    auth=auth, timeout=10.0)
 
     def _count_vectors(self) -> int:
         """Count docs that actually have an embedding field."""
@@ -123,7 +186,7 @@ class ArangoStore:
             "fields": ["embedding"],
             "inBackground": True,
             "params": {
-                "dimension": int(os.getenv("EMBEDDING_DIM", 384)),
+                "dimension": int(os.getenv("EMBEDDING_DIM", 768)),
                 "metric": os.getenv("VECTOR_METRIC", "cosine"),   # cosine | l2
                 "nLists": effective_nlists,                       # IVF cluster count
             },
@@ -155,6 +218,26 @@ class ArangoStore:
                           body=resp.text[:500], **common, payload_schema="vector+params/faiss")
         except Exception as exc:
             log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_error", error=str(exc))
+
+    # ----------------- Config audit -----------------
+    def _audit_embedding_config(self) -> None:
+        """
+        Fail fast on invalid embedding configuration and emit a structured audit log
+        with a deterministic fingerprint for the (dim, metric) tuple.
+        """
+        cfg = get_settings()
+        dim = int(getattr(cfg, "embedding_dim", 0))
+        metric = str(getattr(cfg, "vector_metric", "cosine")).lower()
+        ok_dim = dim > 0
+        ok_metric = metric in {"cosine", "l2"}
+        fp = hashlib.sha1(f"{dim}|{metric}".encode("utf-8")).hexdigest()[:12]
+        log_stage(
+            get_logger("memory_api"), "bootstrap", "embedding_config",
+            embedding_dim=dim, embedding_metric=metric,
+            config_fingerprint=fp, valid_dim=ok_dim, valid_metric=ok_metric,
+        )
+        if not ok_dim or not ok_metric:
+            raise ValueError(f"Invalid embedding configuration: dim={dim}, metric='{metric}'")
 
     # ----------------- Upserts -----------------
     def upsert_node(self, node_id: str, node_type: str, payload: Dict[str, Any]) -> None:
@@ -367,7 +450,9 @@ class ArangoStore:
             v = r.get(key)
             if v:
                 import orjson
+                core_metrics.counter("cache_hit_total", 1, service="memory_api")
                 return orjson.loads(v)
+            core_metrics.counter("cache_miss_total", 1, service="memory_api")
         except Exception:
             return None
         return None

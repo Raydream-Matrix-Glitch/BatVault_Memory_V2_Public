@@ -9,8 +9,8 @@
     "automotive_electronics"
   ],
   "supported_by": [
-    "pan-e5",
-    "pan-e6"
+    "pan-e4",
+    "pan-e5"
   ],
   "based_on": [
     "panasonic-exit-plasma-2012"

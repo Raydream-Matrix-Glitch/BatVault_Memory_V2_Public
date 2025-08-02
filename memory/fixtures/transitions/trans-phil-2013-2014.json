@@ -1,0 +1,10 @@
+{
+  "id": "trans-phil-2013-2014",
+  "from": "philips-led-lighting-focus-2013",
+  "to":   "philips-lighting-split-2014",
+  "relation": "causal",
+  "reason":   "Prolonged LED focus strategy highlighted the need to unlock value by creating a standalone lighting entity.",
+  "timestamp":"2014-09-23T00:00:00Z",
+  "tags": ["strategic_pivot"],
+  "x-extra": {}
+}

@@ -1,13 +1,61 @@
+import os
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import (
+    JSONResponse,
+    StreamingResponse,
+    PlainTextResponse,
+    JSONResponse,
+    Response
+)
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from core_logging import get_logger, log_stage
+import core_metrics
 from core_config import get_settings, Settings
 from core_utils import idempotency_key
+from core_utils.ids import generate_request_id
+from core_utils.health import attach_health_routes
+
 import time, json, httpx, asyncio
 
 settings: Settings = get_settings()
 logger = get_logger("api_edge")
 app = FastAPI(title="BatVault API Edge", version="0.1.0")
+
+# ── Prometheus scrape endpoint (CI + Prometheus) ───────────────────────────
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:                         # pragma: no cover
+    return Response(generate_latest(),
+                    media_type=CONTENT_TYPE_LATEST)
+
+# ───────────────────── CORS allow-list (Q-2) ──────────────────────
+_origins: list[str] = [
+    o.strip()
+    for o in os.getenv("CORS_ALLOW_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+    # ─────────────────── Rate-limiting middleware (A-1) ───────────────────
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=[settings.api_rate_limit_default],
+)
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return PlainTextResponse("Too Many Requests", status_code=429)
 
 # ---- Middleware: auth stub ----
 @app.middleware("http")
@@ -38,29 +86,52 @@ async def req_logger(request: Request, call_next):
                   request_id=idem, path=request.url.path, method=request.method)
         response = await call_next(request)
         dt = int((time.perf_counter() - t0) * 1000)
+        core_metrics.histogram("ttfb_ms", float(dt))
         response.headers["x-request-id"] = idem
         log_stage(logger, "request", "request_end",
-                  request_id=idem, status_code=response.status_code, latency_ms=dt)
+                  request_id=idem, status_code=response.status_code,
+                  latency_ms=dt)
+        # ── Fallback counter -------------------------------------------- #
+        try:
+            from fastapi.responses import JSONResponse as _JSONResponse
+            if isinstance(response, _JSONResponse):
+                import orjson
+                data = orjson.loads(response.body)
+                if isinstance(data, dict) and data.get("meta", {}).get("fallback_used"):
+                    core_metrics.counter("fallback_total", 1)
+        except Exception:
+            pass
         return response
     except Exception as e:
         log_stage(logger, "request", "request_error", error=str(e))
         return JSONResponse(status_code=500, content={"error": "internal_error"})
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "service": "api_edge"}
-
-@app.get("/readyz")
-async def readyz():
-    # Probe Gateway readiness as dependency (single probe is sufficient)
+async def check_gateway_ready() -> bool:
+    """
+    Returns True iff Gateway /readyz returns status: ready.
+    """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             r = await client.get("http://gateway:8081/readyz")
-            if r.status_code == 200 and r.json().get("ready"):
-                return {"ready": True}
+        return r.status_code == 200 and r.json().get("status") == "ready"
     except Exception:
-        return {"ready": False}
-    return {"ready": False}
+        return False
+
+async def _readiness() -> dict:
+    ready = await check_gateway_ready()
+    return {
+        "status": "ready" if ready else "degraded",
+        "request_id": generate_request_id(),
+    }
+
+# — single, canonical wiring of /healthz + /readyz —
+attach_health_routes(
+    app,
+    checks={
+        "liveness": lambda: {"status": "ok"},
+        "readiness": _readiness,
+    },
+)
 
 # ---- Ops: ensure MinIO bucket via Gateway ----
 @app.get("/ops/minio/bucket")

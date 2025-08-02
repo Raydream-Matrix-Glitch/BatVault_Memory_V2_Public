@@ -15,6 +15,13 @@ dependencies = [
   "core_config",
   "core_logging",
   "core_utils",
+  "slowapi>=0.1.7",
+  "redis>=5.0.3",
+  "opentelemetry-api>=1.24",
+  "opentelemetry-sdk>=1.24",
+  "opentelemetry-exporter-otlp-proto-http>=1.24",
+  "opentelemetry-instrumentation-fastapi>=0.46b0",
+  "opentelemetry-instrumentation-redis>=0.46b0",
 ]
 
 [tool.setuptools.packages.find]

@@ -1,21 +1,29 @@
 # Web framework & ASGI server
-fastapi
-uvicorn
+fastapi>=0.112.0
+uvicorn[standard]>=0.29.0
 
 # HTTP client
-httpx
+httpx>=0.27.0
 
 # Database / storage drivers
-python-arango
-redis
-minio
+python-arango>=7.9.1
+redis>=5.0.3
+minio>=7.2.7
 
 # Data validation & serialization
-pydantic
-pydantic-settings
-jsonschema
-orjson
+pydantic>=2.7
+pydantic-settings>=2.3
+jsonschema>=4.22
+orjson>=3.9
 
 # Utilities
-python-dateutil
+python-dateutil>=2.9
+numpy>=1.26
 opentelemetry-api>=1.24
+sentence-transformers>=2.7
+opentelemetry-sdk>=1.24
+opentelemetry-exporter-otlp>=1.24
+
+# Observability
+opentelemetry-exporter-prometheus>=1.24
+prometheus-client>=0.19

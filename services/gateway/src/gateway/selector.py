@@ -3,12 +3,17 @@ import datetime as dt
 import hashlib
 import math
 from typing import Any, Dict, List, Set, Tuple, Sequence
+import core_metrics
 
 import orjson
 
-from .models import WhyDecisionEvidence, WhyDecisionAnchor
+from core_models.models import (
+     WhyDecisionResponse,
+     WhyDecisionAnswer,
+     WhyDecisionAnchor,
+)
 import time
-from core_logging import log_stage
+from core_logging import log_stage, get_logger
 import core_metrics
 from core_config.constants import (
     MAX_PROMPT_BYTES,
@@ -16,6 +21,8 @@ from core_config.constants import (
     MIN_EVIDENCE_ITEMS,
     SELECTOR_MODEL_ID,
 )
+
+logger = get_logger("selector")
 
 
 def bundle_size_bytes(ev: WhyDecisionEvidence) -> int:
@@ -71,7 +78,18 @@ def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dic
             "max_prompt_bytes": MAX_PROMPT_BYTES,
             "selector_model_id": SELECTOR_MODEL_ID,
         }
-        log_stage("selector", meta)
+        log_stage(logger, "selector", "selector_complete", **meta)
+        # ── Metrics ----------------------------------------------------- #
+        try:
+            core_metrics.histogram("total_neighbors_found", float(meta["total_neighbors_found"]))
+            core_metrics.histogram("final_evidence_count", float(meta["final_evidence_count"]))
+            core_metrics.histogram("bundle_size_bytes", float(meta["bundle_size_bytes"]))
+            if meta["selector_truncation"]:
+                core_metrics.counter("selector_truncation", 1)
+            for _id in meta["dropped_evidence_ids"]:
+                core_metrics.counter("dropped_evidence_id_total", 1, id=_id)
+        except Exception:
+            pass
         return ev, meta
 
     # 2) Full sort and prune loop: keep dropping worst items until under hard limit
@@ -99,30 +117,18 @@ def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dic
         "max_prompt_bytes": MAX_PROMPT_BYTES,
         "selector_model_id": SELECTOR_MODEL_ID,
     }
-    log_stage("selector", meta)
-    return ev, meta
+    log_stage(logger, "selector", "selector_complete", **meta)
+    
+    # ── Metrics --------------------------------------------------------- #
+    try:
+        core_metrics.histogram("total_neighbors_found", float(meta["total_neighbors_found"]))
+        core_metrics.histogram("final_evidence_count", float(meta["final_evidence_count"]))
+        core_metrics.histogram("bundle_size_bytes", float(meta["bundle_size_bytes"]))
+        if meta["selector_truncation"]:
+            core_metrics.counter("selector_truncation", 1)
+        for _id in meta["dropped_evidence_ids"]:
+            core_metrics.counter("dropped_evidence_id_total", 1, id=_id)
+    except Exception:
+        pass
 
-# -- MIN_EVIDENCE_ITEMS safety net (rare edge: every neighbour too big) --
-    if not kept and events_sorted:
-        kept.append(events_sorted[0])
-        ev.events = kept
-
-    ids = {ev.anchor.id}
-    ids.update([e.get("id") for e in kept if isinstance(e, dict)])
-    ids.update([t.get("id") for t in ev.transitions.preceding if t.get("id")])
-    ids.update([t.get("id") for t in ev.transitions.succeeding if t.get("id")])
-    ev.allowed_ids = sorted(i for i in ids if i)
-
-    meta = {
-        "selector_truncation": True,
-        "total_neighbors_found": len(events_sorted),
-        "final_evidence_count": len(kept)
-        + len(ev.transitions.preceding)
-        + len(ev.transitions.succeeding),
-        "dropped_evidence_ids": [x.get("id") for x in events_sorted[len(kept) :] if x.get("id")],
-        "bundle_size_bytes": bundle_size_bytes(ev),
-        "max_prompt_bytes": MAX_PROMPT_BYTES,
-        "selector_model_id": SELECTOR_MODEL_ID,
-    }
-    log_stage("selector", meta)
     return ev, meta

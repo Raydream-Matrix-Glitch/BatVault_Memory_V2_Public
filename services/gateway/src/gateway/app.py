@@ -1,21 +1,29 @@
 import io
 import time
 import uuid
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import asyncio
 import httpx
 import orjson
 import redis
 from fastapi import FastAPI, HTTPException, APIRouter
-from fastapi.responses import JSONResponse
+from core_utils.health import attach_health_routes
+from core_utils.ids import generate_request_id
+from core_storage.minio_utils import ensure_bucket as ensure_minio_bucket
+from gateway.resolver import resolve_decision_text
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from minio import Minio
-from minio.error import S3Error
 from pydantic import BaseModel, Field, model_validator
 
 import importlib.metadata as _md
 from core_config import get_settings
-from core_config.constants import SELECTOR_MODEL_ID
+from core_config.constants import (
+    SELECTOR_MODEL_ID,
+    RESOLVER_MODEL_ID,
+    MAX_PROMPT_BYTES,        # needed for fallback metrics synthesis
+)
 from core_logging import get_logger, log_stage, trace_span
 from core_utils.fingerprints import canonical_json
 from core_validator import validate_response
@@ -24,6 +32,7 @@ from .load_shed import should_load_shed
 from .prompt_envelope import build_prompt_envelope
 from .selector import bundle_size_bytes, truncate_evidence
 from .templater import deterministic_short_answer, validate_and_fix
+from .match_snippet import build_match_snippet
 from core_models.models import (
     WhyDecisionAnchor,
     WhyDecisionEvidence,
@@ -32,9 +41,16 @@ from core_models.models import (
     WhyDecisionResponse,
 )
 
-
 settings = get_settings()
 logger = get_logger("gateway")
+
+app = FastAPI(title="BatVault Gateway", version="0.1.0")
+
+# ── Prometheus scrape endpoint (CI + Prometheus) ───────────────────────────
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:                         # pragma: no cover
+    return Response(generate_latest(),
+                    media_type=CONTENT_TYPE_LATEST)
 
 # ——— helper to write audit-trail artefacts to MinIO ———
 def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]):
@@ -61,7 +77,26 @@ try:
 except Exception:
     _schema_cache = None
 
-app = FastAPI(title="BatVault Gateway", version="0.1.0")
+async def _ping_memory_api():
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.get("http://memory_api:8082/readyz")
+        return r.status_code == 200 and r.json().get("ready", False)
+
+async def _readiness() -> dict:
+    ok = await _ping_memory_api()
+    return {
+        "status": "ready" if ok else "degraded",
+        "request_id": generate_request_id(),
+    }
+
+# — single, canonical wiring of /healthz + /readyz —
+attach_health_routes(
+    app,
+    checks={
+        "liveness": lambda: {"status": "ok"},
+        "readiness": _readiness,
+    },
+)
 
 router = APIRouter(prefix="/v2")
 ### NOTE: /v2 routes should be added to `router` rather than `app` so tests hit /v2/* uniformly. ###
@@ -268,26 +303,17 @@ async def ask(req: AskIn):
         retries=getattr(ev, "_retry_count", 0),
     )
  
-    # ——— render prompt stub & raw LLM JSON placeholder for M3 ——— #
     prompt = canonical_json(envelope).encode()
-    raw_json: Dict[str, Any] = {}
-
-    # ---------- persist envelope to MinIO (audit-trail §8.3) --- #
-    try:
-        _minio_put_batch(request_id, {
-            "envelope.json":  orjson.dumps(envelope),
-            "response.json":  resp.model_dump_json().encode(),
-            **({"validator_report.json": orjson.dumps({"errors": meta["validator_errors"]})}
-               if meta.get("validator_errors") else {}),
-        })
-    except Exception as exc:
-        logger.warning("minio_put_envelope_failed", extra={"error": str(exc)})
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
     try:
         sdk_version = _md.version("batvault_sdk")            # P-2
     except _md.PackageNotFoundError:
         sdk_version = "unknown"
+    model_metrics = {
+        "selector_model_id": SELECTOR_MODEL_ID,
+        "resolver_model_id": RESOLVER_MODEL_ID,  # populated when resolver metrics land
+    }
     meta = {
         "policy_id": envelope["policy_id"],
         "prompt_id": envelope["prompt_id"],
@@ -301,8 +327,24 @@ async def ask(req: AskIn):
         "sdk_version":     sdk_version,
         "selector_model_id": SELECTOR_MODEL_ID,
         "latency_ms":      latency_ms,
-        "selector_meta":      selector_meta,
+        "model_metrics":     model_metrics,
     }
+    # ------------------------------------------------------------------ #
+    #  Evidence-bundle metrics (Milestone 3)                              #
+    # ------------------------------------------------------------------ #
+    if hasattr(ev, "_selector_meta") and ev._selector_meta:
+        meta["evidence_metrics"] = ev._selector_meta
+    else:
+        # Hard fallback: should never hit, but keeps contract intact
+        meta["evidence_metrics"] = {
+            "total_neighbors_found": len(ev.events),
+            "selector_truncation": False,
+            "final_evidence_count": len(ev.events),
+            "dropped_evidence_ids": [],
+            "bundle_size_bytes": bundle_size_bytes(ev),
+            "max_prompt_bytes": MAX_PROMPT_BYTES,
+        }
+
     meta["load_shed"] = should_load_shed()
 
     resp = WhyDecisionResponse(
@@ -369,91 +411,62 @@ def minio_client() -> Minio:
         region=settings.minio_region,
     )
 
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "service": "gateway"}
-
-@app.get("/readyz")
-def readyz():
-    # Probe MinIO + Redis to ensure we can reach dependencies
-    try:
-        mc = minio_client()
-        _ = mc.list_buckets()  # simple reachability
-        r = redis.Redis.from_url(settings.redis_url)
-        r.ping()
-        # Upstream Memory-API health probe
-        resp = httpx.get(f"{settings.memory_api_url}/healthz", timeout=2.0)
-        if resp.status_code != 200:
-            raise Exception("memory_api unhealthy")
-        return {"ready": True}
-    except Exception:
-        return {"ready": False}
-
 @app.post("/ops/minio/ensure-bucket")
 @log_stage(logger, "gateway", "ensure_bucket")
 def ensure_bucket():
-    """Create (if needed) and tag the artefact bucket; idempotent."""
     client = minio_client()
-    bucket = settings.minio_bucket
-
-    try:
-        newly_created = False
-        if not client.bucket_exists(bucket):
-            client.make_bucket(bucket)
-            newly_created = True
-    except S3Error as exc:
-        log_stage(logger, "artifacts", "minio_bucket_error",
-                  bucket=bucket, error=str(exc))
-        raise HTTPException(status_code=500,
-                            detail="minio bucket check failed") from exc
-    days = settings.minio_retention_days
-    lifecycle = f"""
-    <LifecycleConfiguration>
-      <Rule>
-        <ID>batvault-artifacts-retention</ID>
-        <Status>Enabled</Status>
-        <Expiration><Days>{days}</Days></Expiration>
-      </Rule>
-    </LifecycleConfiguration>
-    """
-    try:
-        client.set_bucket_lifecycle(bucket, lifecycle)
-    except Exception as e:
-        log_stage(logger, "artifacts", "minio_lifecycle_warning",
-                  bucket=bucket, error=str(e))
-
-    log_stage(
-        logger,
-        "artifacts",
-        "minio_bucket_ensured",
-        bucket=bucket,
-        newly_created=newly_created,
-        retention_days=days,
-        created_ts=datetime.utcnow().isoformat() if newly_created else None,
+    return ensure_minio_bucket(
+        client,
+        bucket=settings.minio_bucket,
+        retention_days=settings.minio_retention_days,
     )
 
-    return JSONResponse(
-      status_code=200,
-      content={
-          "bucket": bucket,
-          "newly_created": newly_created,
-          "retention_days": days,
-      },
-  )
-
-# ---------- /v2/query (resolver-first NL path) ----------
 @app.post("/v2/query")
 @log_stage(logger, "gateway", "v2_query")
-def v2_query(payload: dict):
-    """Natural‑language query resolver: BM25/Vector (first pass)."""
-    log_stage(logger, "gateway", "v2_query_in", request_id=payload.get("request_id"))
-    resp = httpx.post(f"{settings.memory_api_url}/api/resolve/text", json=payload, timeout=0.8)
-    data = resp.json()
-    headers = {"x-snapshot-etag": resp.headers.get("x-snapshot-etag", "")}
-    log_stage(logger, "gateway", "v2_query_out",
-              request_id=payload.get("request_id"),
-              match_count=len(data.get("matches", [])),
-              snapshot_etag=headers.get("x-snapshot-etag"))
-    return JSONResponse(content=data, headers=headers, status_code=resp.status_code)
+async def v2_query(payload: dict):
+    """
+    Natural‑language query resolver (Milestone‑3):
+      1. Local bi‑/cross‑encoder resolver (≤5 ms) → anchor
+      2. Async Memory‑API k=1 expansion (≤800 ms)
+      3. Attach match snippets
+    """
+    if should_load_shed():
+        retry_after = getattr(settings, "load_shed_retry_after_seconds", 1)
+        return JSONResponse(status_code=429, headers={"Retry-After": str(retry_after)},
+                            content={"detail": "Service overloaded", "meta": {"load_shed": True}})
+
+    query_text = (payload.get("text") or payload.get("query") or payload.get("q") or "").strip()
+    if not query_text:
+        raise HTTPException(status_code=400, detail="missing query text")
+
+    anchor = await resolve_decision_text(query_text)
+    if anchor is None:
+        raise HTTPException(status_code=404, detail="No matching decision found")
+
+    try:
+        async with httpx.AsyncClient(timeout=0.8) as client:
+            upstream = await client.post(
+                f"{settings.memory_api_url}/api/graph/expand_candidates",
+                json={"decision_ref": anchor["id"], "request_id": payload.get("request_id")},
+            )
+    except (httpx.RequestError, asyncio.TimeoutError):
+        raise HTTPException(status_code=502, detail="Memory‑API unavailable")
+
+    data = upstream.json()
+    try:
+        matches = data.get("matches") if isinstance(data, dict) else None
+        if isinstance(matches, list):
+            for m in matches:
+                if isinstance(m, dict) and "match_snippet" not in m:
+                    ms = build_match_snippet(m, query_text)
+                    if ms:
+                        m["match_snippet"] = ms
+    except Exception as exc:
+        log_stage(logger, "gateway", "match_snippet_pipeline_error", error=str(exc))
+
+    headers = {"x-snapshot-etag": upstream.headers.get("x-snapshot-etag", "")}
+    log_stage(logger, "gateway", "v2_query_out", request_id=payload.get("request_id"),
+              match_count=len(data.get("matches", [])), snapshot_etag=headers.get("x-snapshot-etag"))
+    return JSONResponse(content=data, headers=headers, status_code=upstream.status_code)
 
 
