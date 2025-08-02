@@ -1,4 +1,31 @@
 services:
+
+  # ---- Monitoring Stack ---------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle"]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+    networks: [batnet]
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_INSTALL_PLUGINS=grafana-polystat-panel
+    volumes:
+      - ./ops/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./ops/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    networks: [batnet]
+  
   arangodb:
     image: arangodb:3.12.4
     restart: always

@@ -17,6 +17,7 @@ _REQUIRED = [
     "cache_miss_total",
     "fallback_total",
     "selector_truncation",
+    "artifact_bytes_total",
 ]
 
 # pre-register metrics so they appear even before the first request
@@ -34,8 +35,19 @@ _APPS = [
 def test_metrics_exposed_and_contains_required_names():
     for name, application in _APPS:
         client = TestClient(application)
+        # Trigger one real request so latency histogram is recorded
+        # (esp. for api_edge which records per-request TTFB).
+        try:
+            client.get("/readyz", headers={"authorization": "Bearer test"})
+        except Exception:
+            # If service lacks /readyz or auth, ignore; /metrics will still be checked
+            pass
         res = client.get("/metrics")
         assert res.status_code == 200, f"{name} missing /metrics"
         body = res.text
         for metric in _REQUIRED:
             assert metric in body, f"{name} missing {metric}"
+        if name == "api_edge":
+            # Histogram presence (any of the standard histogram series will do)
+            assert "ttfb_seconds_bucket" in body or "ttfb_seconds_count" in body, \
+                "api_edge missing ttfb_seconds histogram series"

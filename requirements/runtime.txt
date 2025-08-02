@@ -25,5 +25,5 @@ opentelemetry-sdk>=1.24
 opentelemetry-exporter-otlp>=1.24
 
 # Observability
-opentelemetry-exporter-prometheus>=1.24
+opentelemetry-exporter-prometheus>=0.57b0
 prometheus-client>=0.19

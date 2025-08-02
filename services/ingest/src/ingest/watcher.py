@@ -6,10 +6,40 @@ from types import SimpleNamespace
 
 from core_utils.snapshot import compute_snapshot_etag_for_files
 from core_logging import get_logger, log_stage
+from core_metrics import counter as _metric_counter
+from core_config import get_settings
+
+# ── optional Redis cache for snapshot_etag, field-catalog, etc. ─────────────
+import redis, orjson, time
+
+_CACHE_TTL = 60  # seconds
+
+def _redis():
+    try:
+        return redis.Redis.from_url(get_settings().redis_url)
+    except Exception:
+        return None
+
+def _cache_get(key: str):
+    r = _redis()
+    if not r:
+        return None
+    val = r.get(key)
+    if val is not None:
+        _metric_counter("cache_hit_total", 1, service="ingest")
+        return orjson.loads(val)
+    _metric_counter("cache_miss_total", 1, service="ingest")
+    return None
+
+def _cache_set(key: str, value, ttl: int = _CACHE_TTL):
+    r = _redis()
+    if not r:
+        return
+    _metric_counter("cache_write_total", 1, service="ingest")
+    r.setex(key, ttl, orjson.dumps(value))
 
 # Initialize structured logger with ingest service context
 logger = get_logger("ingest.watcher")
-
 
 class SnapshotWatcher:
     def __init__(

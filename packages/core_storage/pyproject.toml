@@ -7,7 +7,8 @@ dependencies = [
   "python-arango>=7.9.1",
   "pydantic>=2.7.0",
   "redis>=5.0.3",
-  "httpx>=0.27.0",              # used for write-through cache in arangodb.py
+  "httpx>=0.27.0",
+  "core_metrics",
 ]
 
 [build-system]

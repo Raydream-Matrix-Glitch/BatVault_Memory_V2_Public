@@ -87,7 +87,7 @@ def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dic
             if meta["selector_truncation"]:
                 core_metrics.counter("selector_truncation", 1)
             for _id in meta["dropped_evidence_ids"]:
-                core_metrics.counter("dropped_evidence_id_total", 1, id=_id)
+                core_metrics.counter("dropped_evidence_ids", 1, id=_id)
         except Exception:
             pass
         return ev, meta
@@ -127,7 +127,7 @@ def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dic
         if meta["selector_truncation"]:
             core_metrics.counter("selector_truncation", 1)
         for _id in meta["dropped_evidence_ids"]:
-            core_metrics.counter("dropped_evidence_id_total", 1, id=_id)
+            core_metrics.counter("dropped_evidence_ids", 1, id=_id)
     except Exception:
         pass
 

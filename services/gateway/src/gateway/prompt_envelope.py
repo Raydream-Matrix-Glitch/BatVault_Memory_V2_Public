@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from core_utils.fingerprints import canonical_json
+from core_logging import trace_span
 
 # --------------------------------------------------------------#
 #  Lazy-loaded policy registry to avoid FS dependency at import #
@@ -26,7 +27,7 @@ _OPTS = json.dumps({"x": 1}).encode()  # noqa: E501 – silence unused-import fl
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-
+@trace_span("prompt")
 def build_prompt_envelope(
     question: str,
     evidence: Dict[str, Any],
@@ -63,4 +64,11 @@ def build_prompt_envelope(
         "prompt_fingerprint": prompt_fp,
         "snapshot_etag": snapshot_etag,
     }
+    # --- expose fingerprints on the current OTEL span ----------------
+    from opentelemetry import trace as _t
+    span = _t.get_current_span()
+    if span and span.is_recording():            # no-op if OTEL disabled
+        span.set_attribute("bundle_fingerprint",  bundle_fp)
+        span.set_attribute("prompt_fingerprint",  prompt_fp)
+        span.set_attribute("snapshot_etag",       snapshot_etag)
     return env

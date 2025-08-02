@@ -84,13 +84,30 @@ async def req_logger(request: Request, call_next):
         t0 = time.perf_counter()
         log_stage(logger, "request", "request_start",
                   request_id=idem, path=request.url.path, method=request.method)
-        response = await call_next(request)
-        dt = int((time.perf_counter() - t0) * 1000)
-        core_metrics.histogram("ttfb_ms", float(dt))
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        # Record TTFB in seconds to align with Prometheus histogram buckets
+        core_metrics.histogram("ttfb_seconds", float(dt_ms) / 1000.0)
+        # ── Record TTFB in seconds for correct Prometheus histogram buckets
+        core_metrics.histogram("ttfb_seconds", float(dt_ms) / 1000.0)
+        # TEMP: keep legacy ms metric for a short deprecation window (to be removed)
+        core_metrics.histogram("ttfb_ms", float(dt_ms))
+
+        # ── HTTP request counter for error-rate alerting (low-cardinality)
+        # Labels: service (constant), method, code
+        try:
+            core_metrics.counter(
+                "http_requests_total", 1,
+                service="api_edge",
+                method=request.method,
+                code=str(response.status_code),
+            )
+        except Exception:
+            # metrics must never break the request path
+            pass
         response.headers["x-request-id"] = idem
         log_stage(logger, "request", "request_end",
                   request_id=idem, status_code=response.status_code,
-                  latency_ms=dt)
+                  latency_ms=dt_ms)
         # ── Fallback counter -------------------------------------------- #
         try:
             from fastapi.responses import JSONResponse as _JSONResponse

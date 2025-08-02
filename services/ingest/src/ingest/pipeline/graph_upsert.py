@@ -1,5 +1,7 @@
 from typing import Dict
 from core_storage import ArangoStore
+from link_utils.derive_links import derive_links               # spec §J1.5 canonical location
+from core_logging import log_stage, trace_span
 
 
 def upsert_all(
@@ -31,9 +33,13 @@ def upsert_all(
         doc["snapshot_etag"] = snapshot_etag
         store.upsert_node(tid, "transition", doc)
 
-    # Derive reciprocal links before persisting
-    from ingest.pipeline.derive_links import derive_links
+    # ---------------- back-link derivation (LED_TO / SUPPORTED_BY etc.) ----------------
+    log_stage("ingest", "derive_links_begin", snapshot_etag=snapshot_etag)
     derive_links(decisions, events, transitions)
+    log_stage("ingest", "derive_links_completed",
+              decision_count=len(decisions),
+              event_count=len(events),
+              transition_count=len(transitions))
 
     # ---------------------------  Edges  ---------------------------
     # LED_TO  (event → decision)
@@ -46,6 +52,10 @@ def upsert_all(
     # CAUSAL_PRECEDES  (transition)
     for tid, t in transitions.items():
         fr, to = t["from"], t["to"]
+        if fr not in decisions or to not in decisions:          # spec §P orphan tolerance
+            log_stage("ingest", "orphan_transition_skipped",
+                      transition_id=tid, from_id=fr, to_id=to)
+            continue
         edge_id = f"transition:{tid}"
         payload = {"relation": t.get("relation"), "snapshot_etag": snapshot_etag}
         store.upsert_edge(edge_id, fr, to, "CAUSAL_PRECEDES", payload)

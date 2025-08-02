@@ -10,6 +10,7 @@ import core_metrics
 from .embedding_model import encode
 from .reranker import rerank
 from .fallback_search import search_bm25
+from core_logging import trace_span
 from core_config import get_settings
 
 settings = get_settings()
@@ -18,6 +19,7 @@ _redis = redis.from_url(settings.redis_url, decode_responses=False)
 CACHE_TTL = 300  # seconds
 
 
+@trace_span("resolve")
 async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
     key = "resolver:" + hashlib.sha256(text.encode()).hexdigest()
     if _redis:

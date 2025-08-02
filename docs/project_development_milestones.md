@@ -1,4 +1,4 @@
-# Project Development Milestones (Updated)
+# Project Development Milestones (Updated & Aligned)
 
 ## Milestone 0 — Bootstrapping & Health (Day 1-2)
 
@@ -14,7 +14,7 @@
 - **API Edge Service**: Basic routes `/healthz`, `/readyz`, request idempotency keys (hash of body), SSE stub, CORS setup
 - **Gateway Service**: Route shells, trace envelope, artifact sink to MinIO, **templater fallback implementation** (no LLM yet)
 - **Memory API Service**: Stubs for `/api/enrich/*`, `/api/schema/*`, `/api/graph/expand_candidates`, `/api/resolve/text` returning fixture data
-- **Ingest Service**: JSON loader + schema validation (ID regex, timestamps, content fields) and field/relation catalog from memory data
+- **Ingest Service**: JSON loader + schema validation (ID regex: `^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$`, timestamps, content fields) and field/relation catalog from memory data
 
 **Core Packages:**
 - **Core Libraries**: Logging (JSON with OTEL), IDs (deterministic fingerprinting), config, errors, models (Pydantic v2) with response contracts
@@ -43,8 +43,12 @@
 
 **Ingest Pipeline:**
 - **Strict validation** + normalization per K-schemas (aliases, text normalization, UTC timestamps)
-- **New field support**: `tags`, `based_on`, `snippet`, `x-extra` processing
-- **Back-link derivation**: `event.led_to` ↔ `decision.supported_by`; `decision.based_on` ↔ `prior_decision.transitions`; transitions appear in both decisions
+- **ID validation**: Enforce regex pattern `^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$` (allows underscores)
+- **New field support**: `tags`, `based_on`, `snippet`, `x-extra` processing with validation
+- **Back-link derivation**: 
+  - `event.led_to` ↔ `decision.supported_by`
+  - `decision.based_on` ↔ `prior_decision.transitions`
+  - Transitions appear in both decisions
 - **Orphan handling**: Events without decisions, decisions without predecessors are valid
 
 **ArangoDB Integration:**
@@ -60,7 +64,7 @@
 
 **Testing:**
 - **Contract tests** for orphan & empty-array cases in CI (coverage ≥1, completeness_debt = 0)
-- **Cross-link validation** tests for bidirectional relationships
+- **Cross-link validation** tests for bidirectional relationships including `based_on` links
 - **New field validation** tests for tags, based_on, snippet, x-extra
 
 **Outcome:** Real ArangoDB graph with proper schema, catalog endpoints working, cross-links enforced, orphan data handled gracefully.
@@ -111,8 +115,14 @@
 ### Key Deliverables
 
 **Evidence Builder:**
+- **Evidence size constants**:
+  ```python
+  MAX_PROMPT_BYTES = 8192  # Hard limit for bundle size
+  SELECTOR_TRUNCATION_THRESHOLD = 6144  # Start truncating before hard limit
+  MIN_EVIDENCE_ITEMS = 1  # Always keep at least anchor + 1 supporting item
+  ```
 - **Unbounded collection**: Gather all k=1 neighbors first
-- **Size-based truncation**: Only truncate if bundle > 8192 bytes
+- **Size-based truncation**: Only truncate if bundle > MAX_PROMPT_BYTES
 - **Selector model**: Deterministic baseline (recency + similarity scoring)
 - **Evidence caching**: 15min TTL, invalidated on snapshot_etag change
 
@@ -162,7 +172,9 @@
 - **Shared response schema**: WhyDecisionResponse@1 format for both endpoints
 
 **Intent Router (New Component):**
-- **Function routing**: LLM converts text → `search_similar()` + `get_graph_neighbors()` calls
+- **Function routing**: LLM converts text → function calls:
+  - `search_similar(query_text: string, k: int=3)` → Memory API `/api/resolve/text`
+  - `get_graph_neighbors(node_id: string, k: int=3)` → Memory API `/api/graph/expand_candidates`
 - **Memory API integration**: Route function calls to appropriate endpoints
 - **Result merging**: Combine search + graph results into evidence bundle
 - **Routing confidence**: Track and log how well NL → functions mapping worked
@@ -196,6 +208,7 @@
 - **Policy tests**: Intent routing accuracy, fallback behavior
 - **Load tests**: Circuit breaker triggering, performance under stress
 - **Integration tests**: LLM + validation + streaming pipeline
+- **Function routing tests**: Natural language → Memory API call mapping
 
 **Outcome:** Complete question-answering pipeline with natural language support, intelligent load shedding, and streaming responses. Performance target: p95 ≤4.5s (/v2/query).
 
@@ -220,12 +233,14 @@
 - **Evidence inspector**: Show truncation decisions, dropped items, selector scores
 - **Fingerprint tracking**: Link related requests via prompt_fingerprint chains
 - **Performance breakdown**: Stage timings, cache hits, model confidence scores
+- **Function routing trace**: Show NL → function call mapping for /v2/query
 
 **Advanced Features:**
 - **Schema explorer**: Live browser for `/v2/schema/fields` and `/v2/schema/rels`
 - **Decision graph**: Interactive visualization of decision/event/transition relationships
 - **Tag cloud**: Aggregate view of all tags across the corpus
 - **Completeness indicators**: Visual flags for partial/missing data
+- **Based-on visualization**: Show decision dependency chains
 
 **API Integration:**
 - **CORS configuration**: Proper setup for frontend-backend communication
@@ -249,12 +264,27 @@
 ### Key Deliverables
 
 **Golden Test Suites (Complete):**
-- **Why decision tests**: Test cases for decision reasoning, based_on relationships, tag filtering
-- **Who decided tests**: Decision maker identification test cases
-- **When decided tests**: Timeline reconstruction test cases
+- **Named golden test cases**:
+  - `why_decision_panasonic_plasma.json` - Plasma TV exit with automotive pivot context
+  - `why_decision_with_based_on.json` - Decision influenced by prior decisions  
+  - `why_decision_tags_filtering.json` - Evidence filtering by tags
+  - `event_with_snippet_display.json` - Snippet field in evidence bundle
+  - `who_decided_anchor_v1.json` - Decision maker identification
+  - `when_decided_anchor_v1.json` - Timeline reconstruction
+  - `decision_no_transitions.json` - Empty array validation
+  - `event_orphan.json` - No `led_to` validation
+  - `decision_with_tags.json` - Tags array validation
+  - `decision_based_on_validation.json` - Based_on link validation
 - **Cross-link tests**: `based_on` relationship validation, bidirectional repair
 - **Orphan handling tests**: Isolated events, decisions without predecessors
 - **New field tests**: Tags, snippets, x-extra field handling
+
+**Function Routing Test Suites:**
+- **Router Contract Tests**:
+  - `test_query_panasonic.py` - "Why did Panasonic exit plasma?" → Memory API calls + WhyDecisionResponse@1
+  - `test_search_similar_routing.py` - Natural language → `search_similar()` calls
+  - `test_graph_neighbors_routing.py` - Node queries → `get_graph_neighbors()` calls
+  - `test_routing_confidence.py` - LLM function routing accuracy
 
 **End-to-End Testing:**
 - **Docker Compose e2e**: Full system testing in containerized environment  
@@ -298,15 +328,22 @@
 - **Total latency**: p95 ≤3.0s (/v2/ask), p95 ≤4.5s (/v2/query)
 - **Model inference**: ≤5ms (resolver), ≤2ms (selector)
 - **Cache hit rates**: >80% (resolver), >60% (evidence), >40% (LLM)
+- **Stage timeouts**: Search 800ms, Graph 250ms, Enrich 600ms, LLM 1500ms, Validator 300ms
 
 ### Quality Requirements  
 - **Fallback rate**: <5% under normal load
 - **Test coverage**: Golden tests 100%, unit >90%, integration >80%
 - **Schema agnostic**: New JSON fields appear without code changes
 - **Audit completeness**: 100% request traceability with artifacts
+- **Function routing accuracy**: >90% correct NL → Memory API mapping
 
 ### Operational Requirements
 - **Availability**: 99.9% uptime target
 - **Error budget**: <0.1% 5xx errors
 - **Recovery time**: <2min from service restart
 - **Monitoring**: Complete observability with alerts on SLO breaches
+
+### Evidence Management Requirements
+- **Size constants**: MAX_PROMPT_BYTES=8192, SELECTOR_TRUNCATION_THRESHOLD=6144, MIN_EVIDENCE_ITEMS=1
+- **Truncation logging**: 100% of truncation events logged with `selector_truncation=true`
+- **ID validation**: 100% compliance with regex `^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$`

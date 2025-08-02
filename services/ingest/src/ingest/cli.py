@@ -7,7 +7,6 @@ from core_storage import ArangoStore
 from core_config import get_settings
 from .pipeline.normalize import normalize_decision, normalize_event, normalize_transition, derive_backlinks
 from .pipeline.snippet_enricher import enrich_all as enrich_snippets
-from link_utils import derive_links
 from .pipeline.graph_upsert import upsert_all
 from .catalog.field_catalog import build_field_catalog, build_relation_catalog
 
@@ -103,7 +102,10 @@ def seed(path: str) -> int:
             with open(p, "r", encoding="utf-8") as fh:
                 doc = json.load(fh)
         except Exception as e:
-            errors.append(f"{p}: json error {e}")
+            if getattr(e, "lineno", None):                       # surface file/line diagnostics
+                errors.append(f"{p}:{e.lineno}:{e.colno}: json error {e.msg}")
+            else:
+                errors.append(f"{p}: json error {e}")
             continue
         # Canonicalize aliases BEFORE kind inference and schema validation
         doc, hits = canonicalize(doc)
@@ -137,9 +139,6 @@ def seed(path: str) -> int:
     events = {k: normalize_event(v) for k, v in raw_events.items()}
     transitions = {k: normalize_transition(v) for k, v in raw_transitions.items()}
 
-    # Derivations (backlinks & transition listing)
-    derive_links(decisions, events, transitions)
-
     # Enrich (deterministic) — precompute node-level `snippet`
     enrich_snippets(decisions, events, transitions)
 
@@ -171,6 +170,24 @@ def seed(path: str) -> int:
                         settings.arango_catalog_collection, settings.arango_meta_collection)
     upsert_all(store, decisions, events, transitions, snapshot_etag)
     store.set_snapshot_etag(snapshot_etag)
+
+    # ---------- 🎯  content-addressable batch snapshot (spec §D) ----------
+    from core_storage.minio_utils import ensure_bucket
+    import minio, io, gzip, orjson, datetime as _dt
+    minio_client = minio.Minio(settings.minio_endpoint,
+                               access_key=settings.minio_access_key,
+                               secret_key=settings.minio_secret_key,
+                               secure=False)
+    ensure_bucket(minio_client, "batvault-snapshots", 30)
+    blob = gzip.compress(orjson.dumps({"decisions": decisions,
+                                       "events": events,
+                                       "transitions": transitions}))
+    obj_name = f"{snapshot_etag}.json.gz"
+    minio_client.put_object("batvault-snapshots", obj_name,
+                            io.BytesIO(blob), length=len(blob),
+                            content_type="application/gzip")
+    log_stage(logger, "artifacts", "snapshot_uploaded",
+              bucket="batvault-snapshots", object=obj_name, size=len(blob))
 
     # --------------------  sweep out stale docs  -------------------
     removed_nodes, removed_edges = store.prune_stale(snapshot_etag)

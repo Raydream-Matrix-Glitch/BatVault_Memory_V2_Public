@@ -97,16 +97,20 @@ def get_relation_catalog(response: Response):
 
 # --------------- Enrichment -------------
 @app.get("/api/enrich/decision/{node_id}")
-def enrich_decision(node_id: str, response: Response):
-    with trace_span("memory.enrich_decision", node_id=node_id):
-        st = store()
-        doc = st.get_enriched_decision(node_id)
-        if doc is None:
-            raise HTTPException(status_code=404, detail="decision_not_found")
-        etag = st.get_snapshot_etag()
-        if etag:
-            response.headers["x-snapshot-etag"] = etag
-        return doc
+async def enrich_decision(node_id: str, response: Response):
+    async def _work():
+        return store().get_enriched_decision(node_id)
+    try:
+        with trace_span("memory.enrich_decision", node_id=node_id):
+            doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=0.6)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="timeout")
+    if doc is None:
+        raise HTTPException(status_code=404, detail="decision_not_found")
+    etag = store().get_snapshot_etag()
+    if etag:
+        response.headers["x-snapshot-etag"] = etag
+    return doc
 
 @app.get("/api/enrich/event/{node_id}")
 def enrich_event(node_id: str, response: Response):

@@ -1,8 +1,8 @@
 # Milestone Requirements to Test Coverage Mapping
 
 ## Coverage Summary
-- **Total test files discovered:** 70
-- **✔️ Tests mapped to ≥ 1 Milestone 1-3 requirement:** 59
+- **Total test files discovered:** 73
+- **✔️ Tests mapped to ≥ 1 Milestone 1-3 requirement:** 62
 - **⚠️ Tests that do not map to any requirement:** 11 (usually __init__.py, fixtures, or generic health checks)
 - **🎯 Coverage status:** **No Milestone 1–3 requirement is left without at least one covering test**
 
@@ -40,7 +40,7 @@
 | **Confidence scoring on resolution** | `tests/unit/services/gateway/test_resolver.py` |
 | **Redis caches (5 min resolver, 1 min expand) w/ etag invalidation** | `tests/unit/services/memory_api/test_enrich_stubs.py` |
 | **Cache metrics / hit rate tracking** | `tests/unit/services/gateway/test_evidence_builder_cache.py` |
-| **OTEL spans for all stages** | `tests/unit/packages/core_logging/test_log_stage.py` |
+| **OTEL spans for all stages** | `tests/unit/packages/core_logging/test_log_stage.py` | | `tests/unit/observability/test_stage_span_coverage.py` |
 | **TTFB assertions ≤ 600 ms (slug) / ≤ 2.5 s (search)** | `tests/performance/test_ask_latency.py`<br>`tests/performance/test_query_latency.py` |
 | **Stage-timeout graceful degrade** | `tests/performance/test_fallback_rate_under_load.py`<br>`tests/unit/services/api_edge/test_timeouts.py`<br>`tests/unit/services/memory_api/test_timeouts.py` |
 
@@ -61,7 +61,7 @@
 | **Schema validation against WhyDecisionAnswer@1** | `tests/unit/packages/core_validator/test_validator_golden_matrix.py`<br>`tests/unit/services/gateway/test_validator.py`<br>`tests/unit/services/gateway/test_validator_edgecases.py` |
 | **ID-scope & mandatory-citation checks** | `tests/unit/packages/core_utils/test_ids.py`<br>`tests/unit/packages/core_validator/test_validator_negative.py`<br>`tests/unit/services/gateway/test_validator.py`<br>`tests/unit/services/gateway/test_validator_edgecases.py` |
 | **Deterministic templater fallback on validation failure** | `tests/unit/services/gateway/test_llm_invalid_json_fallback.py`<br>`tests/unit/services/gateway/test_llm_retry_twice_fallback.py`<br>`tests/unit/services/gateway/test_templater_ask.py`<br>`tests/unit/services/gateway/test_templater_golden.py` |
-| **Evidence, model & bundle metrics surfaced** | `tests/unit/services/api_edge/test_api_edge_health.py`<br>`tests/unit/services/gateway/test_gateway_health.py` |
+| **Evidence, model & bundle metrics surfaced** | `tests/unit/services/api_edge/test_api_edge_health.py`<br>`tests/unit/services/gateway/test_gateway_health.py`<br>`tests/ops/test_metrics_smoke.py`<br>`tests/unit/services/gateway/test_artifact_metric_names.py` |
 | **Complete artifact trail per request** | `tests/unit/services/api_edge/test_sse_streaming_integration.py`<br>`tests/unit/services/gateway/test_gateway_audit_metadata.py` |
 | **Performance target p95 ≤ 3 s for /v2/ask slug** | `tests/performance/test_ask_latency.py` |
 

@@ -1,0 +1,30 @@
+groups:
+  - name: batvault.slo
+    rules:
+      # p95 latency > 3s for 5m
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(ttfb_seconds_bucket[5m])) by (le)
+          ) > 3
+        for: 5m
+        labels:
+          severity: page
+          service: api_edge
+        annotations:
+          summary: "P95 latency SLO breach (>3s for 5m)"
+          description: "TTFB p95 above 3 seconds."
+
+      # Error rate > 0.1% over 5m (5xx only)
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{service="api_edge", code=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{service="api_edge"}[5m])) > 0.001
+        for: 5m
+        labels:
+          severity: alert
+          service: api_edge
+        annotations:
+          summary: "Error-rate SLO breach (>0.1% for 5m)"

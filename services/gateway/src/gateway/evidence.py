@@ -15,10 +15,8 @@ from core_logging import get_logger
 from core_config import get_settings
 from core_models.models import WhyDecisionEvidence, WhyDecisionAnchor, WhyDecisionTransitions
 from .selector import truncate_evidence, bundle_size_bytes
-from opentelemetry import trace
+from core_logging import trace_span
 
-# instantiate tracer for OTEL spans (§B5)
-tracer = trace.get_tracer(__name__)
 
 # ------------------------------------------------------------------#
 #  Constants & helpers                                              #
@@ -67,8 +65,71 @@ class EvidenceBuilder:
         """
         alias_key   = ALIAS_TPL.format(anchor_id=anchor_id)
         retry_count = 0
-        span        = tracer.start_as_current_span("evidence.bundle")   # OTEL (§B5)
-        span.set_attribute("anchor_id", anchor_id)
+
+        # ---------- fast-path: cache probe BEFORE any network I/O ----------
+        if self._redis is not None:
+            try:
+                composite_key = self._redis.get(alias_key)
+                if composite_key:
+                    cached = self._redis.get(composite_key)
+                    if cached:
+                        ev = WhyDecisionEvidence.model_validate_json(cached)
+                        if await self._is_fresh(anchor_id, ev.snapshot_etag):
+                            ev.__dict__["_retry_count"] = retry_count
+                            with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+                                span.set_attribute("cache.hit", True)
+                                span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
+                            return ev
+            except Exception:  # pragma: no cover
+                logger.warning("redis read error – bypassing cache", exc_info=True)
+
+        # ---------- cache-miss ➜ full fetch & span chain --------------------
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.timeout_expand_ms / 1000.0),
+            base_url=settings.memory_api_url,
+        )
+
+        with trace_span.ctx("plan", anchor_id=anchor_id):
+            plan = {"id": anchor_id, "k": 1}
+
+        with trace_span.ctx("exec", anchor_id=anchor_id) as span_exec:
+            resp_neigh = await asyncio.wait_for(
+                client.post("/api/graph/expand_candidates", json=plan),
+                timeout=settings.timeout_expand_ms / 1000.0,
+            )
+            span_exec.set_attribute("exec.status_code", resp_neigh.status_code)
+
+        with trace_span.ctx("enrich", anchor_id=anchor_id):
+            resp_anchor = await asyncio.wait_for(
+                client.get(f"/api/enrich/decision/{anchor_id}"),
+                timeout=settings.timeout_search_ms / 1000.0,
+            )
+            resp_anchor.raise_for_status()
+            snapshot_etag = resp_anchor.headers.get("snapshot_etag", "unknown")
+
+            neigh       = resp_neigh.json()
+            events      = neigh.get("events", [])
+            trans_pre   = neigh.get("preceding", [])
+            trans_suc   = neigh.get("succeeding", [])
+            anchor      = WhyDecisionAnchor(**resp_anchor.json())
+
+        with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+            ev = WhyDecisionEvidence(
+                anchor=anchor,
+                events=events,
+                transitions=WhyDecisionTransitions(preceding=trans_pre, succeeding=trans_suc),
+            )
+            ev.snapshot_etag            = snapshot_etag
+            ev.__dict__["_retry_count"] = retry_count
+
+            # selector truncation (may mutate *ev*)
+            ev, selector_meta = truncate_evidence(ev)
+            ev.__dict__["_selector_meta"] = selector_meta
+
+            span.set_attribute("total_neighbors_found", len(events) + len(trans_pre) + len(trans_suc))
+            span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
+
+        await client.aclose()
 
         # ---------- cache read (alias ➜ composite ➜ evidence) ----------
         if self._redis is not None:

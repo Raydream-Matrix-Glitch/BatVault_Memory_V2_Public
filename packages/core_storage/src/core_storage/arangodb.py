@@ -295,6 +295,12 @@ class ArangoStore:
         digest = hashlib.sha1(cleaned.encode()).hexdigest()[:8]
         return f"{cleaned[:245]}_{digest}"
 
+    # ---------------- Redis key helper (namespaced by snapshot_etag) ----------------
+    def _cache_key(self, *parts: str) -> str:
+        """Return a Redis-safe cache key prefixed with the active snapshot_etag."""
+        etag = self.get_snapshot_etag() or "noetag"
+        return ":".join((etag, *parts))
+
     # ----------------- Catalogs -----------------
     def set_field_catalog(self, catalog: Dict[str, List[str]]) -> None:
         self.db.collection(self.catalog_col).insert(
@@ -482,7 +488,7 @@ class ArangoStore:
             }
 
         k = 1
-        cache_key = f"expand:{anchor_id}:k{str(k)}"
+        cache_key = self._cache_key("expand", anchor_id, f"k{k}")
         cached = self._cache_get(cache_key)
         # ------------------------------------------------------------------ #
         # Contract: every resolver response **must** echo the original query
@@ -536,7 +542,9 @@ class ArangoStore:
         BM25/TFIDF text resolve via ArangoSearch view if available; fallback to LIKE scan.
         Returns [{id, score, title, type}].
         """
-        key = f"resolve:{hash((q, bool(use_vector)))}:l{limit}"
+        key = self._cache_key("resolve",
+                              str(hash((q, bool(use_vector)))),
+                              f"l{limit}")
         cached = self._cache_get(key)
         if cached:
             # ── Milestone-2: ensure every cached hit meets the resolver contract ──

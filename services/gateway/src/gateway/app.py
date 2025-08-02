@@ -1,4 +1,5 @@
 import io
+import core_metrics
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -63,6 +64,10 @@ def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]):
             length=len(blob),
             content_type="application/json",
         )
+        # B5-metrics §4.2 — running total of persisted bytes
+        core_metrics.counter("artifact_bytes_total",
+                             inc=len(blob),
+                             artefact=name)
 
 _evidence_builder = EvidenceBuilder()
 
@@ -225,6 +230,11 @@ def _compute_allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
 async def ask(req: AskIn):
     t0 = time.perf_counter()
     request_id = req.request_id or uuid.uuid4().hex
+    common = {"request_id": request_id}
+
+    # ── gather artefacts per request; flush once at the end ──────────
+    artefacts: dict[str, bytes] = {}
+
     # ——— initial gateway entry log ———
     log_stage(
         logger,
@@ -247,14 +257,21 @@ async def ask(req: AskIn):
         )
 
     # ------------------------------------------------ evidence ----------- #
-    if req.evidence is None and req.anchor_id:
-        ev = await _evidence_builder.build(req.anchor_id)
-    else:
-        ev = req.evidence or WhyDecisionEvidence(anchor=WhyDecisionAnchor(id=req.anchor_id))
+    with trace_span.ctx("resolve", **common):
+        if req.evidence is None and req.anchor_id:
+            ev = await _evidence_builder.build(req.anchor_id)
+        else:
+            ev = req.evidence or WhyDecisionEvidence(
+                anchor=WhyDecisionAnchor(id=req.anchor_id)
+            )
+
+    # snapshot **pre-selector** evidence (unbounded collect)
+    artefacts["evidence_pre.json"] = orjson.dumps(ev.model_dump(mode="python"))
 
     # ------------ selector (truncate & score) ----------------------------- #
     ev, selector_meta = truncate_evidence(ev)
-
+    # snapshot **post-selector** evidence (may be identical if no truncation)
+    artefacts["evidence_post.json"] = orjson.dumps(ev.model_dump(mode="python"))
 
     # Ensure allowed_ids is the exact union required by the spec
     allowed = _compute_allowed_ids(ev)
@@ -302,8 +319,15 @@ async def ask(req: AskIn):
         allowed_ids=allowed,
         retries=getattr(ev, "_retry_count", 0),
     )
+
+    artefacts["envelope.json"] = orjson.dumps(envelope)
  
-    prompt = canonical_json(envelope).encode()
+    with trace_span.ctx("llm", **common):
+        prompt = canonical_json(envelope).encode()
+
+    # even if the templater path is taken we still persist the “rendered prompt”
+    artefacts["rendered_prompt.txt"] = prompt
+    artefacts.setdefault("llm_raw.json", b"{}")  # placeholder when LLM disabled
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
     try:
@@ -356,7 +380,9 @@ async def ask(req: AskIn):
     )
 
     # ---------------- validation & deterministic fallback ------- #
-    valid, errors = validate_response(resp)
+    with trace_span.ctx("validate", **common) as span_val:
+        valid, errors = validate_response(resp)
+        span_val.set_attribute("validator_passed", valid)
     if not valid:
         logger.warning("validator_errors", extra={"errors": errors, "request_id": request_id})
         try:
@@ -391,14 +417,22 @@ async def ask(req: AskIn):
                 content_type="application/json",
             )
 
-        _put("envelope.json", orjson.dumps(envelope))
-        _put("response.json", resp.model_dump_json().encode())
+        artefacts["response.json"] = resp.model_dump_json().encode()
         if meta.get("validator_errors"):
-            _put("validator_report.json", orjson.dumps({"errors": meta["validator_errors"]}))
-    except Exception as exc:  # non-blocking
-        logger.warning("minio_put_envelope_failed", extra={"error": str(exc)})
+            artefacts["validator_report.json"] = orjson.dumps(
+                {"errors": meta["validator_errors"]}
+            )
 
-    return resp
+        # ── finally persist the full artefact batch ───────────────────
+        _minio_put_batch(request_id, artefacts)
+    except Exception as exc:  # non-blocking
+        logger.warning("minio_put_batch_failed", extra={"error": str(exc)})
+
+    with trace_span.ctx("render", **common):
+        rendered = resp.model_dump()
+
+    with trace_span.ctx("stream", **common):
+        return JSONResponse(content=rendered)
 
 app.include_router(router)
 
