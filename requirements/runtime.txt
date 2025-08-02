@@ -24,6 +24,11 @@ sentence-transformers>=2.7
 opentelemetry-sdk>=1.24
 opentelemetry-exporter-otlp>=1.24
 
+# ─── API-Edge runtime deps ─────────────────────────────────────────────
+slowapi>=0.1.7               # rate-limiting middleware
+prometheus_client>=0.19      # /metrics endpoint
+
 # Observability
+# Prometheus metric exporter – still in beta, use the 0.* line.
+# 0.57b0 (2025-07-29) is the latest build compatible with Python ≥ 3.9.
 opentelemetry-exporter-prometheus>=0.57b0
-prometheus-client>=0.19

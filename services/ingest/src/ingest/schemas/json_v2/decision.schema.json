@@ -10,7 +10,6 @@
     "timestamp": { "type": "string", "format": "date-time" },
     "decision_maker": { "type": "string" },
     "tags": { "type": "array", "items": {"type":"string"} },
-    "snippet": { "type": "string" },
     "supported_by": { "type": "array", "items": { "type":"string" } },
     "based_on": { "type": "array", "items": { "type":"string" } },
     "transitions": { "type": "array", "items": { "type":"string" } },

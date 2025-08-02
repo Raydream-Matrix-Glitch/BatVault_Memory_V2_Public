@@ -2,167 +2,151 @@
 
 You’re an expert in our Python/FastAPI + ArangoDB memory system. You have:
 
-1. The requirements-to-test mapping: `milestone_reqs_to_test_map.md`
-2. The code in:
-   - `packages/core_config/src/core_config/`
-   - `packages/core_logging/src/core_logging/`
-   - `packages/core_models/src/core_models/`
-   - `packages/core_storage/src/core_storage/`
-   - `packages/core_utils/src/core_utils/`
-   - `packages/core_validator/src/core_validator/`
-   - `packages/link_utils/src/link_utils/`
-3. The relevant test suites under `tests/unit/packages/...`
+1. All mapping & milestone docs:
+   - `requirements_to_milestone_mapping.md`
+   - `project_development_milestones.md`
+2. The existing unit tests under:
+   - `tests/unit/packages/*
+3. **Attached tarball** `batvault_live_snapshot.tar` at project root—this contains the **entire source code** and all test fixtures. **You must unpack and treat its contents as the authoritative codebase.**
 
-**Task for “Core Packages”**
-1. Parse the mapping doc to see which Milestone 1–3 requirements apply to core packages.
-2. For each requirement:
-   - Confirm the code implements it (✅/⚠️/❌).
-   - Confirm the listed tests actually exercise it.
-3. Spot missing/partial implementations, test mismatches, dead code, import errors, lint issues.
-4. Verify that public APIs and signatures are consistent across packages and match client imports.
-5. Generate unified-diff patches for code fixes, test stubs/fixes, or cleanup.
-6. Summarize with:
-   - A checklist table (Requirement → Status → File paths).
-   - “Issues & Gaps” bullets.
+**Task for “Core Packages” (Milestones 1–3)**  
+1. **Unpack** `batvault_live_snapshot.tar` and use it as the code reference.  
+2. Parse the mapping docs to identify which Milestone 1–3 requirements apply.  
+3. For each requirement:
+   - Confirm code implements it (✅/⚠️/❌).
+   - Confirm listed tests cover it (loading fixtures from the unpacked tar).  
+4. Spot missing/partial implementations, dead code, import or lint errors.  
+5. Verify public APIs, Pydantic models and signatures match across packages and client imports.  
+6. Propose additional unit‐test stubs (with paths into the unpacked snapshot) for uncovered or edge cases.  
+7. Generate unified‐diff patches for code fixes, new test stubs/fixes (including fixture imports), or cleanup—**all against the unpacked code**.  
+8. Summarize with:
+   - A checklist table (Requirement → Status → Files).
+   - “Issues & Gaps” bullets, including missing tests.
    - Patches in `diff --git a/... b/...` format.
 
-Own this entire folder audit and patch work. Next up: Ingest.
-```
 
----
 
 #### 2. Ingest Service
 
 You’re an expert in our Python/FastAPI + ArangoDB memory system. You have:
 
-1. The requirements-to-test mapping: `milestone_reqs_to_test_map.md`
-2. The code in `services/ingest/src/ingest/` (all .py files in that folder)
-3. The full test suite under `tests/unit/services/ingest/`
+1. All mapping & milestone docs:
+   - `requirements_to_milestone_mapping.md`
+   - `project_development_milestones.md`
+2. The existing unit tests under:
+   - `tests/unit/services/ingest/`
+3. **Attached tarball** `batvault_live_snapshot.tar`—unpack and use as your codebase and fixtures.
 
-**Task for “Ingest”**
-1. Parse the mapping doc to see which Milestone 1–3 requirements apply to Ingest.
-2. For each requirement:
-   - Confirm the code implements it (✅/⚠️/❌).
-   - Confirm the listed tests actually exercise it.
-3. Look for any:
-   - Missing or partial implementations.
-   - Test-to-code mismatches (tests that don’t hit their claimed code).
-   - Dead code, import errors, lint issues, or logical inconsistencies.
-4. Verify imports and API usage from Core Packages (signatures, return types, side-effects).
-5. Generate unified-diff patches for:
-   - Any missing implementation.
-   - Test stubs or fixes for incomplete tests.
-   - Cleanup of dead or broken code.
-6. Summarize with:
-   - A checklist table (Requirement → Status → File paths).
-   - “Issues & Gaps” bullets.
-   - Patches in `diff --git a/... b/...` format.
+**Task for “Ingest” (Milestones 1–3)**  
+1. **Unpack** `batvault_live_snapshot.tar`.  
+2. Parse the mapping docs for Milestone 1–3 requirements.  
+3. For each requirement:
+   - Confirm code implements it (✅/⚠️/❌).
+   - Confirm tests cover it (loading fixtures from the unpacked snapshot).  
+4. Spot missing or partial implementations, test-to-code mismatches, dead code, import or lint issues.  
+5. Verify imports & API usage from Core Packages (signatures, return types, side effects).  
+6. Propose any additional unit‐test stubs (with snapshot paths) to cover gaps.  
+7. Generate unified‐diff patches for missing implementations, test stubs/fixes, or cleanup—**against unpacked code**.  
+8. Summarize with checklist table, “Issues & Gaps,” and `diff --git` patches.
 
-Own this entire folder audit and patch work. Next up: Memory API.
-```
 
----
 
 #### 3. Memory API Service
 
 You’re an expert in our Python/FastAPI + ArangoDB memory system. You have:
 
-1. The requirements-to-test mapping: `milestone_reqs_to_test_map.md`
-2. The code in `services/memory_api/src/memory_api/` (all .py files in that folder)
-3. The full test suite under `tests/unit/services/memory_api/`
+1. All mapping & milestone docs:
+   - `requirements_to_milestone_mapping.md`
+   - `project_development_milestones.md`
+2. The existing unit tests under:
+   - `tests/unit/services/memory_api/`
+3. **Attached tarball** `batvault_live_snapshot.tar`—unpack and use as the single source of truth for code & fixtures.
 
-**Task for “Memory API”**
-1. Parse the mapping doc to see which Milestone 1–3 requirements apply to Memory API.
-2. For each requirement:
-   - Confirm the code implements it (✅/⚠️/❌).
-   - Confirm the listed tests actually exercise it.
-3. Look for any:
-   - Missing or partial implementations.
-   - Test-to-code mismatches.
-   - Dead code, import errors, lint issues, or logical inconsistencies.
-4. Verify imports and API usage from Ingest and Core Packages.
-5. Generate unified-diff patches for missing code, test stubs/fixes, or cleanup.
-6. Summarize with:
-   - A checklist table (Requirement → Status → File paths).
-   - “Issues & Gaps” bullets.
-   - Patches in `diff --git a/... b/...` format.
+**Task for “Memory API” (Milestones 1–3)**  
+1. **Unpack** `batvault_live_snapshot.tar`.  
+2. Parse mapping docs for applicable Milestone 1–3 requirements.  
+3. For each requirement:
+   - Confirm code implements it (✅/⚠️/❌).
+   - Confirm tests exercise it (using unpacked fixtures).  
+4. Spot missing/partial implementations, dead or import-error code, lint issues.  
+5. Verify imports & API usage from Ingest and Core Packages.  
+6. Propose missing or edge-case tests (with snapshot references).  
+7. Generate unified-diff patches for code fixes, test stubs/fixes, or cleanup—**against unpacked code**.  
+8. Summarize with checklist, “Issues & Gaps,” and `diff --git` patches.
 
-Own the audit and patch generation—no follow-up questions needed. Next up: API Edge.
-```
 
----
 
 #### 4. API Edge Service
 
 You’re an expert in our Python/FastAPI + ArangoDB memory system. You have:
 
-1. The requirements-to-test mapping: `milestone_reqs_to_test_map.md`
-2. The code in `services/api_edge/src/api_edge/` (all .py files)
-3. The full test suite under `tests/unit/services/api_edge/`
+1. All mapping & milestone docs:
+   - `requirements_to_milestone_mapping.md`
+   - `project_development_milestones.md`
+2. The existing unit tests under:
+   - `tests/unit/services/api_edge/`
+3. **Attached tarball** `batvault_live_snapshot.tar`—unpack and use as your authoritative code & fixtures.
 
-**Task for “API Edge”**
-1. Parse the mapping doc to see which Milestone 1–3 requirements apply to API Edge.
-2. For each requirement:
-   - Confirm the code implements it (✅/⚠️/❌).
-   - Confirm the listed tests actually exercise it.
-3. Spot missing or partial features, test mismatches, dead/import-error code, lint issues.
-4. Verify imports and API usage from Memory API and Core Packages.
-5. Generate unified-diff patches for fixes (code, tests, cleanup).
-6. Summarize with:
-   - A checklist table (Requirement → Status → File paths).
-   - “Issues & Gaps” bullets.
-   - Patches in `diff --git a/... b/...` format.
+**Task for “API Edge” (Milestones 1–3)**  
+1. **Unpack** `batvault_live_snapshot.tar`.  
+2. Parse mapping docs for Milestone 1–3 requirements.  
+3. For each requirement:
+   - Confirm implementation in code (✅/⚠️/❌).
+   - Confirm tests cover it (with unpacked fixtures).  
+4. Spot missing features, test mismatches, dead/import-error code, lint issues.  
+5. Verify imports & API usage from Memory API and Core Packages.  
+6. Propose any needed unit tests (with snapshot paths).  
+7. Generate unified-diff patches for fixes or cleanup—**against the unpacked code**.  
+8. Summarize with checklist, “Issues & Gaps,” and `diff --git` patches.
 
-Own this entire folder audit and patch work. Next up: Gateway.
-```
-
----
 
 #### 5. Gateway Service
 
 You’re an expert in our Python/FastAPI + ArangoDB memory system. You have:
 
-1. The requirements-to-test mapping: `milestone_reqs_to_test_map.md`
-2. The code in `services/gateway/src/gateway/` (all .py files, including subfolders)
-3. The full test suite under `tests/unit/services/gateway/`
+1. All mapping & milestone docs:
+   - `requirements_to_milestone_mapping.md`
+   - `project_development_milestones.md`
+2. The existing unit tests under:
+   - `tests/unit/services/gateway/`
+3. **Attached tarball** `batvault_live_snapshot.tar`—this is **your** source code + fixtures. **Unpack and use exclusively.**
 
-**Task for “Gateway”**
-1. Parse the mapping doc to see which Milestone 1–3 requirements apply to Gateway.
-2. For each requirement:
-   - Confirm the code implements it (✅/⚠️/❌).
-   - Confirm the listed tests actually exercise it.
-3. Spot missing/partial features, test mismatches, dead code, import errors, lint issues.
-4. Verify imports and API usage from API Edge, Memory API, and Core Packages.
-5. Generate unified-diff patches for code fixes, test stubs/fixes, or cleanup.
-6. Summarize with:
-   - A checklist table (Requirement → Status → File paths).
-   - “Issues & Gaps” bullets.
-   - Patches in `diff --git a/... b/...` format.
+**Task for “Gateway” (Milestones 1–3)**  
+1. **Unpack** `batvault_live_snapshot.tar`.  
+2. Identify applicable Milestone 1–3 requirements from mapping docs.  
+3. For each requirement:
+   - Confirm code implements it (✅/⚠️/❌).
+   - Confirm tests cover it (using unpacked fixtures).  
+4. Spot missing/partial features, test mismatches, dead or import-error code, lint issues.  
+5. Verify imports & API usage from API Edge, Memory API, and Core Packages.  
+6. Propose any additional unit tests (with snapshot references).  
+7. Generate unified-diff patches for code fixes, test stubs/fixes, or cleanup—**against unpacked code**.  
+8. Summarize with checklist table, “Issues & Gaps,” and `diff --git` patches.
 
-Own this entire folder audit and patch work. Next up: Performance & Integration.
-```
 
----
 
 #### 6. Performance & Integration
 
 You’re an expert in our Python/FastAPI + ArangoDB memory system. You have:
 
-1. The requirements-to-test mapping: `milestone_reqs_to_test_map.md`
-2. The performance tests under `tests/performance/`
-3. The integration/ops tests under `tests/integration/` and `tests/ops/`
+1. All mapping & milestone docs:
+   - `requirements_to_milestone_mapping.md`
+   - `project_development_milestones.md`
+2. The performance tests under:
+   - `tests/performance/`
+3. The integration & ops tests under:
+   - `tests/integration/`
+   - `tests/ops/`
+4. **Attached tarball** `batvault_live_snapshot.tar`—unpack and use as the sole source of code & fixtures.
 
-**Task for “Performance & Integration”**
-1. Parse the mapping doc for any NFR/performance/integration requirements.
-2. For each:
-   - Confirm tests exist and align with budgets/targets (✅/⚠️/❌).
-   - Spot gaps (missing performance checks, integration flows, vector-index bootstrap).
-3. Spot dead tests, import errors, lint issues, or misconfigured test harnesses.
-4. Generate unified-diff patches to add missing tests or fix broken ones.
-5. Summarize with:
-   - A checklist table (Requirement → Status → File paths).
-   - “Issues & Gaps” bullets.
-   - Patches in `diff --git a/... b/...` format.
+**Task for “Performance & Integration” (Milestones 1–3)**  
+1. **Unpack** `batvault_live_snapshot.tar`.  
+2. Parse mapping docs for non-functional, performance, and integration requirements.  
+3. For each requirement:
+   - Confirm tests exist and cover targets (✅/⚠️/❌) with unpacked fixtures.
+   - Spot missing performance checks or integration flows.  
+4. Spot dead tests, import or lint issues, misconfigured harnesses.  
+5. Propose missing integration or performance tests (with snapshot paths).  
+6. Generate unified-diff patches to add missing tests or fix broken ones—**against unpacked code**.  
+7. Summarize with checklist table, “Issues & Gaps,” and `diff --git` patches.
 
-Own this final audit pass. Once complete, we’ll have full Milestone 3 readiness.
-```

@@ -11,7 +11,6 @@
     "reason": { "type": "string" },
     "timestamp": { "type": "string", "format": "date-time" },
     "tags": { "type": "array", "items": {"type":"string"} },
-    "snippet": { "type": "string" },
     "x-extra": { "type": "object", "additionalProperties": true }
   },
   "additionalProperties": true

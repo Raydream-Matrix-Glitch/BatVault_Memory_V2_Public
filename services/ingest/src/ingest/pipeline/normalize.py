@@ -29,7 +29,7 @@ def normalize_decision(d: dict) -> dict:
     out["rationale"] = norm_text(d.get("rationale"), 600)
     out["timestamp"] = norm_timestamp(d["timestamp"])
     out["decision_maker"] = norm_text(d.get("decision_maker"), 120)
-    out["tags"] = sorted(set(t.lower() for t in d.get("tags", [])))
+    out["tags"] = normalize_tags(d.get("tags", []))
     for k in ("supported_by","based_on","transitions"):
         arr = d.get(k) or []
         if not isinstance(arr, list): arr = []
@@ -51,7 +51,7 @@ def normalize_event(e: dict) -> dict:
         desc = out.get("description") or ""
         first = desc.split(".")[0][:160]
         out["snippet"] = norm_text(first, 160)
-    out["tags"] = sorted(set(t.lower() for t in e.get("tags", [])))
+    out["tags"] = normalize_tags(e.get("tags", []))
     arr = e.get("led_to") or []
     out["led_to"] = [str(x) for x in arr] if isinstance(arr, list) else []
     return out
@@ -64,7 +64,7 @@ def normalize_transition(t: dict) -> dict:
     out["relation"] = t.get("relation") or "causal"
     out["reason"] = norm_text(t.get("reason"), 280)
     out["timestamp"] = norm_timestamp(t["timestamp"])
-    out["tags"] = sorted(set(x.lower() for x in t.get("tags", [])))
+    out["tags"] = normalize_tags(t.get("tags", []))
     return out
 
 def normalize_tags(tags: list[str]) -> list[str]:

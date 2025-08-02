@@ -74,36 +74,74 @@ def get_logger(name: str="app", level: str|None=None) -> logging.Logger:
 def log_event(logger: logging.Logger, event: str, **kwargs: Any) -> None:
     logger.info(event, extra=kwargs)
 
-def log_stage(
-    logger: logging.Logger,
-    stage: str,
-    event: str,
-    *,
-    request_id: str | None = None,
-    prompt_fingerprint: str | None = None,
-    plan_fingerprint: str | None = None,
-    bundle_fingerprint: str | None = None,
-    selector_model_id: str | None = None,
-    snapshot_etag: str | None = None,
-    **kwargs: Any,
-) -> None:
-    extras = {"stage": stage}
-    if request_id:
-        extras["request_id"] = request_id
-    if prompt_fingerprint:
-        extras["prompt_fingerprint"] = prompt_fingerprint
-    if plan_fingerprint:
-        extras["plan_fingerprint"] = plan_fingerprint
-    if bundle_fingerprint:
-        extras["bundle_fingerprint"] = bundle_fingerprint
-    if selector_model_id:
-        extras["selector_model_id"] = selector_model_id
-    if snapshot_etag:
-        extras["snapshot_etag"] = snapshot_etag
-    extras.update(kwargs)
-    # Strip keys that would collide with LogRecord attributes
-    safe_extras = {k: v for k, v in extras.items() if k not in _RESERVED}
-    logger.info(event, extra=safe_extras)
+# ---------------------------------------------------------------------------#
+# Internal helper – emit exactly one structured log line                      #
+# ---------------------------------------------------------------------------#
+def _emit_stage_log(logger: logging.Logger, stage: str, event: str, **extras: Any):
+    payload = {"stage": stage, **extras}
+    logger.info(event, extra={k: v for k, v in payload.items() if k not in _RESERVED})
+
+# ---------------------------------------------------------------------------#
+# log_stage – imperative **and** decorator utility (§B5 tech-spec)           #
+# ---------------------------------------------------------------------------#
+def log_stage(logger: logging.Logger, stage: str, event: str, **fixed: Any):
+    """
+    *Imperative*  →  log_stage(logger, "gateway", "v2_query_end", request_id=req.id)
+    *Decorator*   →  @log_stage(logger, "gateway", "v2_query")
+                     async def v2_query(...):
+                         ...
+    Also exposes ``.ctx`` so it can be used as a context-manager just like
+    ``trace_span``.
+    """
+    # fire-and-forget so existing call-sites stay untouched
+    _emit_stage_log(logger, stage, event, **fixed)
+
+    import asyncio, time
+    from contextlib import contextmanager
+
+    # ---------------- decorator ------------------------------------------ #
+    def _decorator(fn):
+        if asyncio.iscoroutinefunction(fn):
+            async def _aw(*a, **kw):
+                t0 = time.perf_counter()
+                try:
+                    return await fn(*a, **kw)
+                finally:
+                    _emit_stage_log(
+                        logger, stage, f"{event}.done",
+                        latency_ms=(time.perf_counter() - t0) * 1000,
+                        **fixed,
+                    )
+            return _aw
+
+        def _w(*a, **kw):
+            t0 = time.perf_counter()
+            try:
+                return fn(*a, **kw)
+            finally:
+                _emit_stage_log(
+                    logger, stage, f"{event}.done",
+                    latency_ms=(time.perf_counter() - t0) * 1000,
+                    **fixed,
+                )
+        return _w
+
+    # ---------------- ctx-manager ---------------------------------------- #
+    @contextmanager
+    def _ctx(**dynamic):
+        _emit_stage_log(logger, stage, f"{event}.start", **(fixed | dynamic))
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            _emit_stage_log(
+                logger, stage, f"{event}.done",
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                **(fixed | dynamic),
+            )
+
+    _decorator.ctx = _ctx
+    return _decorator
 
 # -- upgraded helper: decorator OR ctx-manager, sync OR async --------------
 import asyncio, types

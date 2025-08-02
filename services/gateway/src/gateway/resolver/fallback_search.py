@@ -7,7 +7,7 @@ settings = get_settings()
 
 
         
-async def fallback_search(text: str, k: int) -> List[Dict[str, Any]]:
+async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
     """Fallback BM25 search against Memory-API (non-vector)."""
     payload = {"q": text, "limit": k, "use_vector": False}
     async with httpx.AsyncClient(timeout=0.8) as client:
@@ -24,3 +24,8 @@ async def fallback_search(text: str, k: int) -> List[Dict[str, Any]]:
         vector_used=doc.get("vector_used")
     )
     return doc.get("matches", [])
+
+# ---------------------------------------------------------------------------
+# Back-compat: anything that still imports `fallback_search` will continue to
+# work after this rename. Remove the alias once all usages are updated.
+fallback_search = search_bm25

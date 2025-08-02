@@ -5,8 +5,7 @@ from fastapi.responses import (
     JSONResponse,
     StreamingResponse,
     PlainTextResponse,
-    JSONResponse,
-    Response
+    Response,
 )
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from slowapi import Limiter
@@ -82,22 +81,23 @@ async def req_logger(request: Request, call_next):
                                request.url.path, dict(request.query_params), parsed)
         request.state.request_id = idem
         t0 = time.perf_counter()
-        log_stage(logger, "request", "request_start",
-                  request_id=idem, path=request.url.path, method=request.method)
+        log_stage(
+            logger, "request", "request_start",
+            request_id=idem, path=request.url.path, method=request.method,
+        )
+
+        # --- hand request to downstream route ---
+        response = await call_next(request)
+
         dt_ms = int((time.perf_counter() - t0) * 1000)
-        # Record TTFB in seconds to align with Prometheus histogram buckets
-        core_metrics.histogram("ttfb_seconds", float(dt_ms) / 1000.0)
-        # ── Record TTFB in seconds for correct Prometheus histogram buckets
-        core_metrics.histogram("ttfb_seconds", float(dt_ms) / 1000.0)
-        # TEMP: keep legacy ms metric for a short deprecation window (to be removed)
-        core_metrics.histogram("ttfb_ms", float(dt_ms))
+        core_metrics.histogram("api_edge_ttfb_seconds", dt_ms / 1000.0)
+        core_metrics.histogram("api_edge_ttfb_ms", float(dt_ms))  # legacy window
 
         # ── HTTP request counter for error-rate alerting (low-cardinality)
         # Labels: service (constant), method, code
         try:
             core_metrics.counter(
-                "http_requests_total", 1,
-                service="api_edge",
+                "api_edge_http_requests_total", 1,
                 method=request.method,
                 code=str(response.status_code),
             )
@@ -115,7 +115,7 @@ async def req_logger(request: Request, call_next):
                 import orjson
                 data = orjson.loads(response.body)
                 if isinstance(data, dict) and data.get("meta", {}).get("fallback_used"):
-                    core_metrics.counter("fallback_total", 1)
+                    core_metrics.counter("api_edge_fallback_total", 1)
         except Exception:
             pass
         return response

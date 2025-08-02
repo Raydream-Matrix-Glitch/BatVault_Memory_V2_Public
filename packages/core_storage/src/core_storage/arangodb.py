@@ -163,16 +163,14 @@ class ArangoStore:
             return 0
 
     def _maybe_create_vector_index(self) -> None:
-        """Create FAISS IVF index once there are enough training vectors."""
+        """Create **HNSW** vector index (spec §M1) once there are enough training vectors."""
         cfg = get_settings()
         url = f"{cfg.arango_url}/_db/{self.db.name}/_api/index"
         params = {"collection": "nodes"}
 
         vector_count = self._count_vectors()
-        desired_nlists = int(os.getenv("FAISS_NLISTS", 100))
-        # heuristic: sqrt(N), bounded to desired_nlists and >=1
-        from math import sqrt, floor
-        effective_nlists = max(1, min(desired_nlists, floor(sqrt(vector_count)) if vector_count else 0))
+        hnsw_m  = int(os.getenv("HNSW_M", 16))
+        hnsw_ef = int(os.getenv("HNSW_EF", 200))
 
         if vector_count == 0:
             log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_deferred",
@@ -182,13 +180,15 @@ class ArangoStore:
 
         payload = {
             "type": "vector",
-            "name": "idx_nodes_embedding",
+            "name": "nodes_embedding_hnsw",
             "fields": ["embedding"],
             "inBackground": True,
             "params": {
                 "dimension": int(os.getenv("EMBEDDING_DIM", 768)),
                 "metric": os.getenv("VECTOR_METRIC", "cosine"),   # cosine | l2
-                "nLists": effective_nlists,                       # IVF cluster count
+                "indexType": "hnsw",
+                "M": hnsw_m,
+                "efConstruction": hnsw_ef,
             },
         }
 
@@ -203,19 +203,19 @@ class ArangoStore:
                 "collection": "nodes",
                 "dimension": payload["params"]["dimension"],
                 "metric": payload["params"]["metric"],
-                "nLists": payload["params"]["nLists"],
+                "M": payload["params"]["M"],
+                "efConstruction": payload["params"]["efConstruction"],
                 "vector_count": vector_count,
-                "desired_nlists": desired_nlists,
-                "effective_nlists": effective_nlists,
             }
             log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_params", **common)
             if resp.status_code in (200, 201):
                 log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created", **common)
             elif resp.status_code == 409 or (resp.headers.get("content-type","").startswith("application/json") and resp.json().get("errorNum") == 1210):
-                log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_exists", **common)
+                log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_exists",
+                          indexType="hnsw", **common)   
             else:
                 log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_warn",
-                          body=resp.text[:500], **common, payload_schema="vector+params/faiss")
+                          body=resp.text[:500], **common, payload_schema="vector+params/hnsw")
         except Exception as exc:
             log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_error", error=str(exc))
 

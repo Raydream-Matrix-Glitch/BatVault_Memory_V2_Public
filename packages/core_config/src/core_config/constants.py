@@ -6,16 +6,17 @@ MIN_EVIDENCE_ITEMS = int(os.getenv("MIN_EVIDENCE_ITEMS", "1"))
 SELECTOR_MODEL_ID = "selector_v1"
 SIM_DIM = int(os.getenv("EMBEDDING_DIM", "768"))  # vector index dimension                         # vector index dimension
 
+# Redis TTL constants (Milestone 2 – caching strategy §H)
+TTL_RESOLVER_CACHE_SEC = int(os.getenv("TTL_RESOLVER_CACHE_SEC", "300"))   # 5 min
+TTL_EXPAND_CACHE_SEC   = int(os.getenv("TTL_EXPAND_CACHE_SEC",   "60"))    # 1 min
+TTL_EVIDENCE_CACHE_SEC = int(os.getenv("TTL_EVIDENCE_CACHE_SEC", "900"))   # 15 min
+
 # ---------------------------------------------------------------------------
-# Model-identifier constants
+#  Model identifiers (override via ENV; spec §Milestone-2/3)
 # ---------------------------------------------------------------------------
-# Logged in `meta.model_metrics` for every request.  Defaults follow the
-# canonical names in the spec but can be overridden via env-vars.
-#
-# Keeping them in *core_config* prevents circular imports and lets any service
-# (gateway, metrics, etc.) share the same source of truth.
 SELECTOR_MODEL_ID = os.getenv("SELECTOR_MODEL_ID", "selector_v1")
 RESOLVER_MODEL_ID = os.getenv("RESOLVER_MODEL_ID", "bi_encoder_v1")
+
 
 # Stage budgets (ms)
 TIMEOUT_SEARCH_MS   = 800

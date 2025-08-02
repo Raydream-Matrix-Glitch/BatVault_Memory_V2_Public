@@ -41,3 +41,106 @@ ArangoDB: http://localhost:8529 (user: root / pass from .env)
 MinIO: http://localhost:9001 (console) (user/pass from .env)
 
 Redis: http://localhost:6379
+
+
+
+# Local Development Environment - Service Endpoints & Testing
+
+This README provides quick commands to test all services in your local development environment.
+
+## Core Services
+
+### API Edge – `localhost:8080`
+
+Test service health and core functionality:
+
+```bash
+# Service liveness / dependency readiness
+curl -s http://localhost:8080/healthz | jq
+curl -s http://localhost:8080/readyz | jq
+
+# Contract exercise – ask "why" about a known slug
+curl -s -X POST http://localhost:8080/v2/ask \
+  -H "Content-Type: application/json" \
+  -d '{"intent":"why_decision","decision_ref":"panasonic-exit-plasma-2012"}' | jq
+# → WhyDecisionResponse@1 JSON (anchor, evidence, answer, meta …)
+```
+
+**What you should see:** An HTTP 200 with the structured JSON body defined in the spec, plus `meta.latency_ms` etc.
+
+### Gateway – `localhost:8081`
+
+Check Prometheus metrics:
+
+```bash
+# Prometheus metrics (latency histograms, retries, bundle sizes …)
+curl -s http://localhost:8081/metrics | head
+```
+
+**What you should see:** Plain-text counters and histograms such as `gateway_request_latency_seconds_bucket{status="success",le="1.0"} …`.
+
+### Memory API – `localhost:8082`
+
+Test health and data enrichment:
+
+```bash
+curl -s http://localhost:8082/healthz | jq  # {"ok":true}
+curl -s http://localhost:8082/api/enrich/decision/panasonic-exit-plasma-2012 | jq
+```
+
+**What you should see:** A **normalized decision envelope** (`id`, `option`, `rationale`, `tags`, …) that the Gateway uses to build evidence bundles.
+
+### Ingest – `localhost:8083`
+
+Verify service status and metrics:
+
+```bash
+curl -s http://localhost:8083/healthz | jq  # {"ok":true}
+curl -s http://localhost:8083/metrics | head
+```
+
+**What you should see:** Liveness JSON, plus Prometheus lines like `ingest_batches_total 7` and `snapshot_etag` gauges showing the current corpus version.
+
+## Observability Stack
+
+| Component | Port | Quick check | Expected result |
+|-----------|------|-------------|-----------------|
+| **Prometheus** | 9090 | `curl -s http://localhost:9090/-/ready` | `Prometheus is Ready.` |
+| **Grafana** | 3000 | `curl -s http://localhost:3000/api/health` | `{"database":"ok"}` (UI at http://localhost:3000, default creds `admin / admin`) |
+| **OpenTelemetry Collector** | 13133 | `curl -I http://localhost:13133/` | `HTTP/1.1 200 OK` |
+| **ArangoDB** | 8529 | `curl -u root:<pwd> http://localhost:8529/_api/version` | version JSON (needs credentials) |
+| **Redis** | 6379 | `redis-cli -h localhost ping` | `PONG` |
+| **MinIO** | 9000 | `curl -I http://localhost:9000/minio/health/live` | `HTTP/1.1 200 OK` |
+
+## What to Expect in Grafana
+
+1. Open **http://localhost:3000** → log in.
+2. Dashboards "*API Latency*", "*Ingest Batches*", "*LLM Fallbacks*" etc. auto-provision themselves from `ops/grafana/…`.
+3. Data sources named **Prometheus** and **Loki** (if you enabled it) should be green.
+
+## Troubleshooting Checklist
+
+| Symptom | Quick test | Likely cause |
+|---------|------------|--------------|
+| `curl /readyz` returns 503 | Check `/metrics` for `service_dependencies_ready` flag. | ArangoDB or Redis not up. |
+| Prometheus targets show **DOWN** | http://localhost:9090/targets | Wrong scrape port or service name typo in `prometheus.yml`. |
+| Grafana shows "Datasource unavailable" | `curl /api/health` is OK but dashboards blank | Prometheus container not up / wrong URL in provisioning. |
+
+## Quick Fixes
+
+Re-running `docker compose restart <service>` after editing anything under **ops/** is enough; the containers pick up the new Prometheus, Grafana or OTEL configs on boot.
+
+## Common Commands Summary
+
+```bash
+# Health check all core services
+curl -s http://localhost:8080/healthz | jq  # API Edge
+curl -s http://localhost:8081/metrics | head  # Gateway
+curl -s http://localhost:8082/healthz | jq  # Memory API
+curl -s http://localhost:8083/healthz | jq  # Ingest
+
+# Check observability stack
+curl -s http://localhost:9090/-/ready  # Prometheus
+curl -s http://localhost:3000/api/health  # Grafana
+redis-cli -h localhost ping  # Redis
+```

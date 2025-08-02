@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Response, HTTPException
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span
