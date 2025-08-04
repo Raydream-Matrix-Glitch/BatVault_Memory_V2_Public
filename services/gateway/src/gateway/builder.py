@@ -102,6 +102,14 @@ async def build_why_decision_response(
     arte["envelope.json"]       = orjson.dumps(envelope)
     arte["rendered_prompt.txt"] = canonical_json(envelope)
 
+    # ── audit trail: raw-LLM payload (may be stub) ──────────────────────
+    # Milestone-3 audit contract (§ M5 in the tech-spec) requires this
+    # artefact for *every* request.  When the gateway is running in
+    # “LLM-off / templater” mode we still persist an empty JSON object so
+    # that the artefact set stays stable and downstream tooling (replay
+    # viewer, CI tests) can rely on its presence.
+    arte.setdefault("llm_raw.json", b"{}")
+
     # ── meta block ─────────────────────────────────────────────
     meta = {
         "policy_id": envelope["policy_id"],
