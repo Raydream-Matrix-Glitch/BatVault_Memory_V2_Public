@@ -26,12 +26,15 @@ def dummy_post(url, json=None, **kwargs):
 gw_app.httpx.get = dummy_get
 gw_app.httpx.post = dummy_post
 
+# keep a reference to the real client before patching
+_REAL_CLIENT = httpx.AsyncClient
+
 # ── short-circuit gw.httpx.AsyncClient so no real network is hit ──
 def _mock_async_client(*args, **kw):
     kw["transport"] = httpx.MockTransport(
         lambda r: httpx.Response(200, json={"id": "dummy"})
     )
-    return httpx.AsyncClient(*args, **kw)
+    return _REAL_CLIENT(*args, **kw)
 
 gw.httpx.AsyncClient = _mock_async_client
 

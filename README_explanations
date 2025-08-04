@@ -1,0 +1,13 @@
+Every batch of data has the basics.
+They check that each response includes the two IDs we absolutely need (prompt_id and policy_id) so we always know what question was asked and under which rules.
+
+Fields aren’t missing or empty.
+If somebody forgot to fill in a required box (for example an event’s “id” or the policy reference), the tests catch it immediately rather than letting it slip downstream.
+
+Values follow our style guide.
+Tags get lower-case and special characters turned into dashes, snippets are kept under 120 characters, and IDs follow a simple “slug” pattern. That consistency makes everything predictable for later stages.
+
+Bad or malformed inputs get rejected.
+If something sneaks in that doesn’t match the shape we expect (say a tag with weird symbols, or missing metadata), the validator flags it as an error rather than letting corrupted data flow through.
+
+

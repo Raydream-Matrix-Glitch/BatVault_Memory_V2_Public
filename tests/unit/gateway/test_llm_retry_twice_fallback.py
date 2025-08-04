@@ -1,3 +1,5 @@
+# tests/unit/gateway/test_llm_retry_twice_fallback.py
+
 import json
 from pathlib import Path
 
@@ -14,12 +16,23 @@ from core_models.models import (
 )
 
 # ──────────────────────────
-# constants / tiny fixture
+# Fixture loading
 # ──────────────────────────
+def _fixture_root() -> Path:
+    """
+    Locate the canonical memory/fixtures directory by walking up
+    from this test file until it’s found.
+    """
+    for parent in Path(__file__).resolve().parents:
+        cand = parent / "memory" / "fixtures"
+        if cand.is_dir():
+            return cand
+    raise FileNotFoundError("memory/fixtures directory not found")
+
+FIXTURES = _fixture_root()
 DECISION_ID = "panasonic-exit-plasma-2012"
-FIXTURES = Path(__file__).resolve().parents[5] / "memory" / "fixtures"
 _DECISION_JSON = json.loads(
-    (FIXTURES / "decisions" / f"{DECISION_ID}.json").read_text("utf-8")
+    (FIXTURES / "decisions" / f"{DECISION_ID}.json").read_text(encoding="utf-8")
 )
 
 # ──────────────────────────
@@ -48,7 +61,7 @@ def _stub_evidence_builder(monkeypatch):
 def _force_validator_fallback(monkeypatch):
     """Force the validator to fail once so the templater repair path is taken
     (sets `meta.fallback_used == True`)."""
-
+    # Make validate_response always return failure
     monkeypatch.setattr(
         gw_app,
         "validate_response",
@@ -56,7 +69,7 @@ def _force_validator_fallback(monkeypatch):
         raising=True,
     )
 
-    # make validate_and_fix report `changed=True`
+    # And ensure validate_and_fix reports a change
     import gateway.templater as templater
 
     monkeypatch.setattr(
@@ -66,9 +79,8 @@ def _force_validator_fallback(monkeypatch):
         raising=True,
     )
 
-
 # ──────────────────────────
-# test
+# Test
 # ──────────────────────────
 def test_retry_twice_then_fallback_meta_flags():
     client = TestClient(app)

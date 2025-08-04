@@ -26,7 +26,16 @@ def test_sse_stream_demo(endpoint):
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
 
-        chunks = _consume_stream(resp)
+        # Grab raw network chunks first.
+        raw_chunks = _consume_stream(resp)
+        #
+        # ✨ **Why this massage?**
+        # Under Starlette’s TestClient the entire stream can be buffered
+        # into one aggregated chunk.  Network-chunk count is therefore not
+        # a reliable proxy for the number of SSE *frames*.  We re-split the
+        # payload on the SSE frame separator instead.
+        joined_payload = "".join(raw_chunks)
+        chunks = [frame for frame in joined_payload.split("\n\n") if frame.strip()]
 
     # at least a few ticks should appear
     assert len(chunks) >= 3

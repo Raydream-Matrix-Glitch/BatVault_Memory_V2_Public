@@ -7,12 +7,28 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      API_RATE_LIMIT_EXCLUDE_PATHS: "/healthz,/metrics"
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install project dependencies
+        run: |
+          pip install -r requirements/runtime.txt
+
+      - name: Start API-edge background worker
+        run: |
+          uvicorn services.api_edge.src.api_edge.app:app \
+                 --host 0.0.0.0 --port 8000 --log-level warning &
+          export API_EDGE_PID=$!
+          # give it a few seconds to bind
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8000/readyz && break
+            sleep 1
+          done
 
       - name: Install tooling
         run: |
@@ -30,6 +46,10 @@ jobs:
           # run the whole suite (pytest.ini now includes “tests/”)
           pytest -q --cov=packages --cov=services \
                     --cov-report=term-missing --cov-fail-under=80
+
+      - name: Stop background API-edge
+        if: always()
+        run: kill -TERM $API_EDGE_PID
 
       - name: Integration / Smoke
         run: |

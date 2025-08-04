@@ -1,0 +1,167 @@
+#
+# 1.  Core libraries  ────────────────────────────────────────────────────
+#
+pytest -q tests/unit/core_logging        # logging helpers -> no deps
+pytest -q tests/unit/core_utils          # generic helpers, IDs, slugify…
+pytest -q tests/unit/core_validator      # validator uses core_utils
+pytest -q tests/unit/link_utils          # relies on core_utils & logging
+
+#
+# 2.  Service layers  ───────────────────────────────────────────────────
+#     Each suite exercises the *public* surface of a service; they
+#     implicitly depend on the core libs you just proved green.
+#
+for svc in api_edge gateway ingest memory_api; do
+  pytest -q tests/unit/$svc
+done
+
+#
+# 3.  Cross-cutting infrastructure & observability  ────────────────────
+#
+pytest -q tests/unit/observability
+
+#
+# 4.  Operational glue (k8s metrics, vector-index, etc.)  ───────────────
+#
+pytest -q tests/ops
+
+#
+# 5.  Integration tests (multi-service behaviours)  ────────────────────
+#
+pytest -q tests/integration
+
+#
+# 6.  Performance / latency smoke checks  ──────────────────────────────
+#     These are the slowest; run them last so earlier failures fail fast.
+#
+pytest -q tests/performance
+
+
+
+# Pytest Commands
+
+## Integration Tests (2)
+```bash
+pytest tests/integration/test_evidence_truncation_limits.py
+pytest tests/integration/test_missing_coverage.py
+```
+
+## Ops/Infrastructure Tests (3)
+```bash
+pytest tests/ops/test_metrics_smoke.py
+pytest tests/ops/test_vector_index_bootstrap.py
+pytest tests/ops/test_vector_index_hnsw.py
+```
+
+## Performance Tests (5)
+```bash
+pytest tests/performance/test_ask_latency.py
+pytest tests/performance/test_fallback_rate_under_load.py
+pytest tests/performance/test_model_inference_speed.py
+pytest tests/performance/test_query_latency.py
+pytest tests/performance/test_stage_timeouts.py
+```
+
+## Unit Tests (69)
+
+### API Edge (7)
+```bash
+pytest tests/unit/api_edge/test_api_edge_health.py
+pytest tests/unit/api_edge/test_api_edge_metrics_names.py
+pytest tests/unit/api_edge/test_auth_and_cors.py
+pytest tests/unit/api_edge/test_rate_limit.py
+pytest tests/unit/api_edge/test_resolve_text_vector.py
+pytest tests/unit/api_edge/test_sse_streaming_integration.py
+pytest tests/unit/api_edge/test_timeouts.py
+```
+
+### Core Logging (3)
+```bash
+pytest tests/unit/core_logging/test_log_format_compliance.py
+pytest tests/unit/core_logging/test_log_stage.py
+pytest tests/unit/core_logging/test_snapshot_etag_logging.py
+```
+
+### Core Utils (5)
+```bash
+pytest tests/unit/core_utils/test_fingerprint.py
+pytest tests/unit/core_utils/test_fp.py
+pytest tests/unit/core_utils/test_ids.py
+pytest tests/unit/core_utils/test_slugify.py
+pytest tests/unit/core_utils/test_snapshot.py
+```
+
+### Core Validator (3)
+```bash
+pytest tests/unit/core_validator/test_validator_golden_matrix.py
+pytest tests/unit/core_validator/test_validator_negative.py
+pytest tests/unit/core_validator/test_validator_edgecases.py
+```
+
+### Gateway (21)
+```bash
+pytest tests/unit/gateway/test_artifact_metric_names.py
+pytest tests/unit/gateway/test_artifact_retention_comprehensive.py
+pytest tests/unit/gateway/test_back_link_derivations.py
+pytest tests/unit/gateway/test_evidence_builder_cache.py
+pytest tests/unit/gateway/test_gateway_audit_metadata.py
+pytest tests/unit/gateway/test_gateway_health.py
+pytest tests/unit/gateway/test_llm_invalid_json_fallback.py
+pytest tests/unit/gateway/test_llm_retry_twice_fallback.py
+pytest tests/unit/gateway/test_prompt_builder_determinism.py
+pytest tests/unit/gateway/test_resolver.py
+pytest tests/unit/gateway/test_router_query.py
+pytest tests/unit/gateway/test_selector.py
+pytest tests/unit/gateway/test_selector_edge_cases.py
+pytest tests/unit/gateway/test_templater_ask.py
+pytest tests/unit/gateway/test_templater_golden.py
+pytest tests/unit/gateway/test_validator.py
+pytest tests/unit/gateway/test_validator_edgecases.py
+```
+
+### Ingest (19)
+```bash
+pytest tests/unit/ingest/test_backlink_derivation.py
+pytest tests/unit/ingest/test_contract_orphans.py
+pytest tests/unit/ingest/test_field_catalog_alias_learn.py
+pytest tests/unit/ingest/test_graph_upsert_idempotent.py
+pytest tests/unit/ingest/test_id_regex_schema_parity.py
+pytest tests/unit/ingest/test_new_field_normalization.py
+pytest tests/unit/ingest/test_normalize_empty_link_arrays.py
+pytest tests/unit/ingest/test_snippet_enricher.py
+pytest tests/unit/ingest/test_snippet_golden.py
+pytest tests/unit/ingest/test_snapshot_watcher.py
+pytest tests/unit/ingest/test_strict_id_timestamp.py
+pytest tests/unit/ingest/test_validation_bad_id.py
+pytest tests/unit/ingest/test_validation_fixtures.py
+pytest tests/unit/ingest/test_ingest_health.py
+pytest tests/unit/ingest/test_relation_catalog.py
+pytest tests/unit/ingest/test_vector_index_bootstrap.py
+pytest tests/unit/ingest/test_vector_index_hnsw.py
+```
+
+### Link Utils (1)
+```bash
+pytest tests/unit/link_utils/test_based_on_reciprocity.py
+```
+
+### Memory API (9)
+```bash
+pytest tests/unit/memory_api/test_enrich_stubs.py
+pytest tests/unit/memory_api/test_expand_and_resolve_contracts.py
+pytest tests/unit/memory_api/test_expand_candidates_unit.py
+pytest tests/unit/memory_api/test_memory_api_health.py
+pytest tests/unit/memory_api/test_resolve_behaviors.py
+pytest tests/unit/memory_api/test_schema_http_headers.py
+pytest tests/unit/memory_api/test_timeouts.py
+pytest tests/unit/memory_api/test_vector_index_bootstrap.py
+pytest tests/unit/memory_api/test_vector_index_hnsw.py
+```
+
+### Observability (1)
+```bash
+pytest tests/unit/observability/test_stage_span_coverage.py
+```
+
+
+

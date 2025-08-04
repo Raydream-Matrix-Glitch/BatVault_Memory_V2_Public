@@ -1,11 +1,10 @@
 from typing import Any, Dict, List
 import httpx
-from core_logging import trace_span, log_stage
+from core_logging import get_logger, trace_span, log_stage
 from core_config import get_settings
 
+logger = get_logger("gateway")
 settings = get_settings()
-
-
         
 async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
     """Fallback BM25 search against Memory-API (non-vector)."""
@@ -18,6 +17,7 @@ async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
             )
     doc = resp.json()
     log_stage(
+        logger,
         "gateway",
         "bm25_search_complete",
         match_count=len(doc.get("matches", [])),

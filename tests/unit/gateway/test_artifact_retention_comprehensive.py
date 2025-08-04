@@ -20,8 +20,12 @@ class _DummyResp:
         self.status_code = 200
     def json(self):  return self._json
 
-gw_app.httpx.get  = lambda *a, **k: _DummyResp({"id": "panasonic-exit-plasma-2012", "supported_by": [], "based_on": [], "transitions": []})
-gw_app.httpx.post = lambda *a, **k: _DummyResp({"neighbors": {"events": [], "transitions": []}, "meta": {"snapshot_etag": "test-etag"}})
+gw_app.httpx.get  = lambda *a, **k: _DummyResp(
+    {"id": "panasonic-exit-plasma-2012", "supported_by": [], "based_on": [], "transitions": []}
+)
+gw_app.httpx.post = lambda *a, **k: _DummyResp(
+    {"neighbors": {"events": [], "transitions": []}, "meta": {"snapshot_etag": "test-etag"}}
+)
 gw_app.httpx.AsyncClient = lambda *a, **kw: httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
 
 # ──────────────────────────────────────────────
@@ -55,7 +59,11 @@ def test_full_artefact_retention():
 
     # Perform a happy-path /v2/ask request (templater path – no LLM needed)
     resp = client.post("/v2/ask", json={"intent": "why_decision", "decision_ref": "panasonic-exit-plasma-2012"})
-    assert resp.status_code == 200
+    if resp.status_code != 200:
+        # Diagnostic: expose declared contract & validation failure
+        print("OpenAPI entry for /v2/ask:", client.get("/openapi.json").json()["paths"]["/v2/ask"])
+        print("Validation error detail:", resp.json())
+    assert resp.status_code == 200, f"unexpected status; body: {resp.text}"
 
     # Collect artefact keys written by gateway
     keys = {key.split("/", 1)[-1] for _, key, _ in _dummy_minio.put_calls}

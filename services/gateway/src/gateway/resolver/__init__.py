@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 import httpx
 import orjson
 import redis.asyncio as redis
+import inspect
 import core_metrics
 
 from .embedding_model import encode
@@ -42,18 +43,32 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
 
     # ---------- 1️⃣  slug short-circuit ---------------------------------- #
     if _SLUG_RE.match(text):
+        cache_key = f"resolver:{text}"
+        if _redis:
+            cached = await _redis.get(cache_key)
+            if cached:
+                core_metrics.counter("cache_hit_total", 1, service="resolver")
+                return orjson.loads(cached)
         try:
-            async with httpx.AsyncClient(timeout=0.25) as client:         # ≤ 800 ms spec budget
-                resp = await client.get(f"{settings.memory_api_url}/api/enrich/decision/{text}")
+            async with httpx.AsyncClient(timeout=0.25) as client:
+                resp = await client.get(
+                    f"{settings.memory_api_url}/api/enrich/decision/{text}"
+                )
             if resp.status_code == 200:
-                core_metrics.counter("resolver_slug_short_circuit_total", 1)
-                return resp.json()
+                doc = resp.json()
+                # sanity-check: Memory-API must echo the same ID
+                if doc.get("id") == text:
+                    core_metrics.counter("resolver_slug_short_circuit_total", 1)
+                    if _redis:
+                        await _redis.setex(cache_key, CACHE_TTL, orjson.dumps(doc))
+                    return doc
         except Exception:
             core_metrics.counter("resolver_slug_short_circuit_error_total", 1)
 # ---------- 2️⃣  BM25 → Cross-encoder path ------------------------------- #
     key = "resolver:" + hashlib.sha256(text.encode()).hexdigest()
     if _redis:
-        cached = await _redis.get(key)
+        _get = _redis.get
+        cached = await _get(key) if inspect.iscoroutinefunction(_get) else _get(key)
         if cached:
             core_metrics.counter("cache_hit_total", 1, service="resolver")
             return orjson.loads(cached)

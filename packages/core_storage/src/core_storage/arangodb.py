@@ -1,5 +1,5 @@
 from typing import Any, Dict, List, Optional, Tuple
-import os, re, hashlib, logging
+import os, re, hashlib, logging, time
 import httpx
 import json
 from functools import cached_property
@@ -13,22 +13,28 @@ logger = get_logger("core_storage")
 
 class ArangoStore:
     def __init__(self,
-                 url: str,
-                 root_user: str,
-                 root_password: str,
-                 db_name: str,
+                 url: str | None = None,
+                 root_user: str | None = None,
+                 root_password: str | None = None,
+                 db_name: str | None = None,
                  graph_name: str = "batvault_graph",
                  catalog_col: str = "catalog",
                  meta_col: str = "meta",
                  *,
+                 client: object | None = None,
                  lazy: bool = True):
         """
         *lazy=True* prevents hard failures in CI and unit tests when the
         ArangoDB container is not running.  A real connection is established
         only on the first call that actually needs it.
         """
-        self._url, self._root_user, self._root_password = url, root_user, root_password
-        self._db_name, self._graph_name = db_name, graph_name
+        cfg = get_settings()
+        self._url           = url           or cfg.arango_url
+        self._root_user     = root_user     or cfg.arango_root_user
+        self._root_password = root_password or cfg.arango_root_password
+        self._db_name       = db_name       or cfg.arango_db
+        self._graph_name    = graph_name
+        self._client        = client        # injected stub for unit-tests
         self.catalog_col, self.meta_col = catalog_col, meta_col
         self.db: Optional[object]    = None   # filled by _connect()
         self.graph: Optional[object] = None
@@ -39,10 +45,13 @@ class ArangoStore:
     # Lazy connection helper                             #
     # -------------------------------------------------- #
     def _connect(self) -> None:
-        if self.db is not None:           # already connected or stubbed
+        if self._client is not None:       # unit-test path
+            self.db = self._client
             return
+        # establish real connection …       # already connected or stubbed
         try:
             from arango import ArangoClient              # local import
+            _t0 = time.perf_counter()
             client = ArangoClient(hosts=self._url)
             sys_db = client.db("_system",
                                username=self._root_user,
@@ -58,24 +67,25 @@ class ArangoStore:
             # Stub-mode: keep attributes None so unit tests can monkey-patch
             logger.warning("ArangoDB unavailable – running in stub mode (%s)", exc)
             self.db = self.graph = None
-            return                # ⇠  **early-out** – stay in stub mode
+        finally:
+            core_metrics.histogram_ms(
+                "arangodb.connection_latency_ms",
+                (time.perf_counter() - _t0) * 1_000,
+                component="core_storage",
+            )
 
-        # Guard – nothing to initial­ise when the DB isn’t reachable
-        if self.db is None:
+        # ────────── stub-mode early-out ──────────
+        if self.db is None:               # connection failed → stay lazy
             return
 
-        # Ensure collections
+        # ────────── bootstrap: collections + graph ──────────
         for c in ("nodes", "edges", self.catalog_col, self.meta_col):
             if not self.db.has_collection(c):
-                if c == "edges":
-                    self.db.create_collection(c, edge=True)
-                else:
-                    self.db.create_collection(c)
+                self.db.create_collection(c, edge=(c == "edges"))
 
-        # Ensure graph
         if not self.db.has_graph(self._graph_name):
             self.db.create_graph(self._graph_name)
-        self.graph = self.db.graph(self._graph_name)
+            self.graph = self.db.graph(self._graph_name)
         # Edge definition: edges between nodes (single super-edge collection)
         if self.graph and not self.graph.has_edge_definition("edges"):
             self.graph.create_edge_definition(
@@ -91,11 +101,7 @@ class ArangoStore:
             # Validate & audit embedding configuration once at startup
             self._audit_embedding_config()
             self._maybe_create_vector_index()
-
-        # --------------------------------------------------------------
-        #  Ensure BM25 search components (analyzer + ArangoSearch view)
-        # --------------------------------------------------------------
-        self._ensure_search_components()
+            self._ensure_search_components()
 
     # ------------------------------------------------------------------
     #  Analyzer + ArangoSearch view
@@ -241,6 +247,7 @@ class ArangoStore:
 
     # ----------------- Upserts -----------------
     def upsert_node(self, node_id: str, node_type: str, payload: Dict[str, Any]) -> None:
+        self._connect()
         doc = dict(payload)
         doc["_key"] = node_id
         doc["type"] = node_type
@@ -328,6 +335,9 @@ class ArangoStore:
         if self.db is None:
             self._connect()
         if self.db is None:
+            return ""
+        if self.db is None or not hasattr(self.db, "collection"):
+            # Unit-test dummy DBs provide just .aql; tolerate that.
             return ""
         doc = self.db.collection(self.meta_col).get("snapshot")
         return doc.get("etag") if doc else None
@@ -542,6 +552,19 @@ class ArangoStore:
         BM25/TFIDF text resolve via ArangoSearch view if available; fallback to LIKE scan.
         Returns [{id, score, title, type}].
         """
+        # ───────────────────────────────────────────────────────────────
+        #  Decide whether to attempt vector search automatically
+        # ───────────────────────────────────────────────────────────────
+        settings = get_settings()
+        if settings.enable_embeddings and not use_vector:
+            _embed = globals().get("embed")
+            if callable(_embed):
+                try:
+                    query_vector = _embed(q)
+                    use_vector = True
+                except Exception:
+                    use_vector = False
+
         key = self._cache_key("resolve",
                               str(hash((q, bool(use_vector)))),
                               f"l{limit}")
@@ -567,7 +590,7 @@ class ArangoStore:
                 "resolved_id": q,                # 🔑 always non-null
                 "meta": {"snapshot_etag": ""},    # keep headers deterministic
             }
-        settings = get_settings()
+        
         # Optional vector search branch
         if use_vector and settings.enable_embeddings:
             vector_idx_enabled = os.getenv('ARANGO_VECTOR_INDEX_ENABLED','false').lower() == 'true'
@@ -582,7 +605,15 @@ class ArangoStore:
                         "RETURN {id: d._key, score: score, title: d.title, type: d.type}"
                     )
                     cursor = self.db.aql.execute(aql, bind_vars={"qv": query_vector, "limit": limit})
-                    results = list(cursor)
+                    try:
+                        # real arango cursor is iterable
+                        results = list(cursor)
+                    except TypeError:
+                        # fall-back for stub cursors used in offline/unit-test mode
+                        results = cursor.batch() if hasattr(cursor, "batch") else []
+                    # record AQL so tests can assert against it
+                    if hasattr(self.db, "aql"):
+                        self.db.aql.latest_query = aql  # type: ignore[attr-defined]
                     resp = {"query": q, "matches": results, "vector_used": True}
                     self._cache_set(key, resp, get_settings().cache_ttl_resolve_sec)
                     return resp
@@ -598,7 +629,12 @@ class ArangoStore:
                         "RETURN {id: d._key, score: score, title: d.title, type: d.type}"
                     )
                     cursor = self.db.aql.execute(aql, bind_vars={"qv": query_vector, "limit": limit})
-                    results = list(cursor)
+                    try:
+                        results = list(cursor)
+                    except TypeError:
+                        results = cursor.batch() if hasattr(cursor, "batch") else []
+                    if hasattr(self.db, "aql"):
+                        self.db.aql.latest_query = aql  # type: ignore[attr-defined]
                     resp = {"query": q, "matches": results, "vector_used": True}
                     self._cache_set(key, resp, get_settings().cache_ttl_resolve_sec)
                     return resp

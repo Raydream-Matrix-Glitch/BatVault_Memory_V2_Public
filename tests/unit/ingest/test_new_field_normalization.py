@@ -1,3 +1,5 @@
+# tests/unit/ingest/test_new_field_normalization.py
+
 import json
 from pathlib import Path
 
@@ -5,15 +7,18 @@ import pytest
 
 from ingest.pipeline.normalize import normalize_decision, normalize_event
 
+def _fixture_root() -> Path:
+    """
+    Locate the canonical memory/fixtures directory by walking up
+    from this test file until it’s found.
+    """
+    for parent in Path(__file__).resolve().parents:
+        cand = parent / "memory" / "fixtures"
+        if cand.is_dir():
+            return cand
+    raise FileNotFoundError("memory/fixtures directory not found")
 
-FIXTURES = (
-    Path(__file__)
-    .resolve()
-    .parents[5]  # …/tests/unit/services/ingest/ → repo root
-    / "memory"
-    / "fixtures"
-)
-
+FIXTURES = _fixture_root()
 
 @pytest.mark.parametrize(
     "rel_path,is_decision",

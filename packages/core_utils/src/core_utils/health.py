@@ -8,7 +8,8 @@ custom liveness and readiness checks.
 import asyncio
 from typing import Awaitable, Callable, Mapping, Union
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Request
+from core_config import get_settings
 
 # A health check can return:
 #  - bool
@@ -44,30 +45,37 @@ def attach_health_routes(app: FastAPI, *, checks: HealthChecks) -> None:
         except Exception:
             return False
 
+    limiter = getattr(app.state, "limiter", None)
+    _default_limit = get_settings().api_rate_limit_default
+    def _limit(fn):             # no-op when limiter is absent
+        return limiter.limit(_default_limit)(fn) if limiter else fn
+
     # Liveness endpoint
     if "liveness" in checks:
+        @_limit
         @router.get("/healthz")
-        async def _healthz():
+        async def _healthz(request: Request):         # ← accept request
             res = await _run_check(checks["liveness"])
             if isinstance(res, dict):
                 return res
-            return {"ok": bool(res)}
+            return {"status": "ok" if bool(res) else "fail"}
     else:
         @router.get("/healthz")
-        async def _healthz_default():
-            return {"ok": True}
+        async def _healthz_default(request: Request): # ← accept request
+            return {"status": "ok"}
 
     # Readiness endpoint
     if "readiness" in checks:
+        @_limit
         @router.get("/readyz")
-        async def _readyz():
+        async def _readyz(request: Request): 
             res = await _run_check(checks["readiness"])
             if isinstance(res, dict):
                 return res
             return {"ready": bool(res)}
     else:
         @router.get("/readyz")
-        async def _readyz_default():
+        async def _readyz_default(request: Request):  # ← accept request
             return {"ready": True}
 
     app.include_router(router)

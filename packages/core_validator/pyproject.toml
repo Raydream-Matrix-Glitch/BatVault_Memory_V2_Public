@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies    = [
     "core_models",
     "jsonschema>=4.22",
+    "core_logging",
 ]
 
 [build-system]

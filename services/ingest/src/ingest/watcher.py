@@ -75,8 +75,8 @@ class SnapshotWatcher:
             # emit a structured event for Kibana/dashboards
             log_stage(
                 logger,
-                stage="ingest",
-                op="new_snapshot",
+                "ingest",
+                "new_snapshot",
                 snapshot_etag=etag,
                 file_count=len(self._collect_files()),
             )

@@ -1,8 +1,9 @@
 from typing import Dict
 from core_storage import ArangoStore
 from link_utils.derive_links import derive_links               # spec §J1.5 canonical location
-from core_logging import log_stage, trace_span
+from core_logging import get_logger, log_stage, trace_span
 
+logger = get_logger("ingest")
 
 def upsert_all(
     store: ArangoStore,
@@ -16,6 +17,19 @@ def upsert_all(
     tagging each document with the batch-unique ``snapshot_etag`` so that
     stale records can be swept later.
     """
+
+    # ------------------------------------------------------------------ #
+    # 1️⃣  Derive reciprocal links *first* so attributes like
+    #     `decision.supported_by` are actually stored in Arango and
+    #     visible to downstream services (gateway selector, validator,
+    #     golden tests).                                                #
+    # ------------------------------------------------------------------ #
+    log_stage(logger, "ingest", "derive_links_begin", snapshot_etag=snapshot_etag)
+    derive_links(decisions, events, transitions)
+    log_stage(logger, "ingest", "derive_links_completed",
+              decision_count=len(decisions),
+              event_count=len(events),
+              transition_count=len(transitions))
 
     # ---------------------------  Nodes  ---------------------------
     for did, d in decisions.items():
@@ -33,14 +47,6 @@ def upsert_all(
         doc["snapshot_etag"] = snapshot_etag
         store.upsert_node(tid, "transition", doc)
 
-    # ---------------- back-link derivation (LED_TO / SUPPORTED_BY etc.) ----------------
-    log_stage("ingest", "derive_links_begin", snapshot_etag=snapshot_etag)
-    derive_links(decisions, events, transitions)
-    log_stage("ingest", "derive_links_completed",
-              decision_count=len(decisions),
-              event_count=len(events),
-              transition_count=len(transitions))
-
     # ---------------------------  Edges  ---------------------------
     # LED_TO  (event → decision)
     for eid, e in events.items():
@@ -53,7 +59,7 @@ def upsert_all(
     for tid, t in transitions.items():
         fr, to = t["from"], t["to"]
         if fr not in decisions or to not in decisions:          # spec §P orphan tolerance
-            log_stage("ingest", "orphan_transition_skipped",
+            log_stage(logger, "ingest", "orphan_transition_skipped",
                       transition_id=tid, from_id=fr, to_id=to)
             continue
         edge_id = f"transition:{tid}"

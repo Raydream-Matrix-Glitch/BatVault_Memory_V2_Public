@@ -76,6 +76,7 @@ def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dic
     if raw_size <= SELECTOR_TRUNCATION_THRESHOLD:
         ev.allowed_ids = _union_ids(ev)
         meta = {
+            # under soft limit ⇒ nothing was dropped
             "selector_truncation": False,
             "total_neighbors_found": len(ev.events)
                + len(ev.transitions.preceding)

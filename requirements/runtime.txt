@@ -1,6 +1,7 @@
 # Web framework & ASGI server
 fastapi>=0.112.0
 uvicorn[standard]>=0.29.0
+anyio>=4.3.0
 
 # HTTP client
 httpx>=0.27.0
@@ -9,6 +10,17 @@ httpx>=0.27.0
 python-arango>=7.9.1
 redis>=5.0.3
 minio>=7.2.7
+
+# -----------------------------------------------------------------------------
+# MinIO’s admin helper (`minioadmin`) started importing Argon2 primitives
+# in v7.2.6.  The library is *not* pulled in automatically, so we make the
+# dependency explicit for every runtime target (ingest, gateway, API-edge,
+# etc.) to prevent import-time failures in seed pipelines and CI.
+# -----------------------------------------------------------------------------
+argon2-cffi>=23.2          # required by minioadmin → crypto.py
+argon2-cffi-bindings>=21.2
+cffi>=1.16
+pycryptodome>=3.15.0
 
 # Data validation & serialization
 pydantic>=2.7

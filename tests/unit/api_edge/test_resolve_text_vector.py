@@ -41,10 +41,10 @@ def test_vector_aql_selected(monkeypatch):
     # stub embed() – 768-d constant vector
     monkeypatch.setattr(arango_mod, "embed", lambda _: [0.1] * 768, raising=False)
 
-    store = arango_mod.ArangoStore(client=None)
-    store._db = _DummyDB(aql=_DummyAQL())  # inject fake DB
+    dummy_db = _DummyDB(aql=_DummyAQL())           # supply a full fake client
+    store     = arango_mod.ArangoStore(client=dummy_db)
 
     store.resolve_text("hello world")
 
-    q = store._db.aql.latest_query
+    q = store.db.aql.latest_query
     assert "COSINE_SIMILARITY" in q, "lexical BM25 path was used, not vector"

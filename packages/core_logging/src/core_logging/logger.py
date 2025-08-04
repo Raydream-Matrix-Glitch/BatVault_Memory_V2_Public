@@ -1,5 +1,39 @@
-import logging, sys, time, orjson, os
-from typing import Any
+import logging, sys, orjson, os, asyncio
+from typing import Any, Optional, Dict
+from contextlib import contextmanager as _contextmanager
+import time
+import inspect
+import functools
+
+# ────────────────────────────────────────────────────────────
+# Global Snapshot-ETag support
+# ────────────────────────────────────────────────────────────
+# Unit-tests (and, eventually, the ingest/gateway services)
+# expect every log record to carry a `snapshot_etag` attribute.
+# We expose a simple setter plus a logging.Filter that injects
+# the value into each LogRecord as it is emitted.
+
+_SNAPSHOT_ETAG: Optional[str] = None
+
+
+
+
+def set_snapshot_etag(value: Optional[str]) -> None:          # pragma: no cover
+    """
+    Bind *value* as the current ``snapshot_etag``.  
+    Passing ``None`` clears the binding.
+    """
+    global _SNAPSHOT_ETAG
+    _SNAPSHOT_ETAG = value
+
+
+class _SnapshotFilter(logging.Filter):
+    """Inject the globally-configured ``snapshot_etag`` (if any)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if _SNAPSHOT_ETAG is not None:
+            record.snapshot_etag = _SNAPSHOT_ETAG
+        return True
 
 
 # Reserved LogRecord attributes we must not overwrite
@@ -61,14 +95,83 @@ class JsonFormatter(logging.Formatter):
 
         return orjson.dumps(base, default=_default).decode("utf-8")
 
-def get_logger(name: str="app", level: str|None=None) -> logging.Logger:
+class StructuredLogger(logging.Logger):
+    """
+    A drop-in `logging.Logger` replacement that **accepts arbitrary keyword
+    arguments** (e.g. `logger.info("msg", stage="plan")`) and transparently
+    merges them into the `extra` mapping.  
+
+    This prevents the `TypeError` raised by the standard library in
+    Python ≥ 3.11 and lets test-suites (and production code) attach structured
+    fields without boiler-plate.
+    """
+
+    def _log(                                   # noqa: PLR0913 – keep signature
+        self,
+        level: int,
+        msg: str,
+        args,
+        exc_info=None,
+        extra: Dict[str, Any] | None = None,
+        stack_info: bool = False,
+        stacklevel: int = 1,
+        **kwargs: Any,
+    ) -> None:
+        if kwargs:                              # merge kw-args → extra-dict
+            extra = {**(extra or {}), **kwargs}
+        super()._log(
+            level,
+            msg,
+            args,
+            exc_info=exc_info,
+            extra=extra,
+            stack_info=stack_info,
+            stacklevel=stacklevel,
+        )
+
+
+class DynamicStdoutHandler(logging.StreamHandler):
+    """
+    Ensures every *emit* writes to **the current** `sys.stdout`.
+
+    Unit tests (`redirect_stdout(...)`) replace `sys.stdout` *after* the logger
+    has been instantiated; refreshing the stream on each call guarantees the
+    log line is captured by the redirected buffer.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
+        self.setStream(sys.stdout)                      # always up-to-date
+        super().emit(record)
+
+
+# Make the subclass the default for *new* loggers created after this import
+logging.setLoggerClass(StructuredLogger)
+
+
+def get_logger(name: str = "app", level: str | None = None) -> logging.Logger:
     logger = logging.getLogger(name)
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
+    if not logger.handlers:                      # one-shot configuration guard
+        handler = DynamicStdoutHandler() 
         handler.setFormatter(JsonFormatter())
         logger.addHandler(handler)
-        logger.propagate = False
-        logger.setLevel(level or os.getenv("SERVICE_LOG_LEVEL","INFO"))
+        # ------------------------------------------------------------------
+        # Allow LogRecords to bubble up to the *root* logger so that
+        # third-party tooling (pytest-caplog, opentelemetry, Sentry, …) can
+        # observe them without having to attach a handler to every leaf logger.
+        #
+        # In typical production deployments the root logger either has **no**
+        # handlers (→ no duplicate output) or is configured exclusively for
+        # out-of-process shipping.  If a human-readable StreamHandler *is*
+        # attached higher up the tree, a second, plain-text copy of the log
+        # line may appear.  That edge-case has never been part of the public
+        # contract, but if it matters you can opt-out by setting
+        # `logger.propagate = False` at application bootstrap.
+        # ------------------------------------------------------------------
+        logger.propagate = True
+        logger.setLevel(level or os.getenv("SERVICE_LOG_LEVEL", "INFO"))
+
+        # ensure the snapshot-etag filter is attached exactly once
+        logger.addFilter(_SnapshotFilter())
     return logger
 
 def log_event(logger: logging.Logger, event: str, **kwargs: Any) -> None:
@@ -143,49 +246,59 @@ def log_stage(logger: logging.Logger, stage: str, event: str, **fixed: Any):
     _decorator.ctx = _ctx
     return _decorator
 
-# -- upgraded helper: decorator OR ctx-manager, sync OR async --------------
-import asyncio, types
-from contextlib import contextmanager, asynccontextmanager, nullcontext
+# ────────── Unified decorator **and** ctx-manager helper ──────────
+class _TraceSpan:
+    def __init__(self, name: str, logger: logging.Logger, **fixed):
+        self._name, self._fixed, self._logger = name, fixed, logger
 
-try: from opentelemetry import trace as _otel_trace          # optional
-except Exception: _otel_trace = None                         # pragma: no cover
+    # --- context-manager ---
+    def __enter__(self):
+        self._t0 = time.time()
+        log_stage(self._logger, self._name, "start", **self._fixed)
+        return self
 
-def _tracer():                                               # local helper
-    return _otel_trace.get_tracer("batvault") if _otel_trace else None
+    def __exit__(self, exc_type, exc, tb):
+        log_stage(
+            self._logger,
+            self._name,
+            "end",
+            latency_ms=int((time.time() - self._t0) * 1_000),
+            **self._fixed,
+        )
 
-def trace_span(name: str, **fixed):
-    """
-    Usage 1 – decorator:  
-        @trace_span("resolve") async def fn(...):
-    Usage 2 – ctx-manager:  
-        with trace_span.ctx("plan"): ...
-    Falls back to a no-op when OTEL is absent (unit tests, local dev).
-    """
-    tracer = _tracer()
+    def __call__(self, fn):
+        """
+        Decorator entry-point.
+        We proxy via *args/**kwargs but explicitly set `__signature__`
+        so FastAPI (and any other DI that relies on `inspect.signature`)
+        still sees the *original* parameters. That prevents spurious
+        “required query param” artefacts in OpenAPI or runtime validation.
+        """
+        sig = inspect.signature(fn)
 
-    # ➊ decorator ----------------------------------------------------------
-    def _decorator(fn):
         if asyncio.iscoroutinefunction(fn):
-            async def _aw(*a, **kw):
-                ctx = tracer.start_as_current_span(name) if tracer else nullcontext()
-                async with (asynccontextmanager(lambda: ctx)() if hasattr(ctx, "__aenter__") else ctx):
-                    span = _otel_trace.get_current_span() if tracer else None
-                    if span: [span.set_attribute(k, v) for k, v in fixed.items()]
-                    return await fn(*a, **kw)
-            return _aw
-        def _w(*a, **kw):
-            with (tracer.start_as_current_span(name) if tracer else nullcontext()) as span:
-                if span: [span.set_attribute(k, v) for k, v in fixed.items()]
-                return fn(*a, **kw)
-        return _w
+            async def _wrapped(*args, **kwargs):
+                with self:
+                    return await fn(*args, **kwargs)
+        else:
+            def _wrapped(*args, **kwargs):
+                with self:
+                    return fn(*args, **kwargs)
 
-    # ➋ ctx-manager --------------------------------------------------------
-    @contextmanager
-    def _ctx(**dynamic):
-        with (tracer.start_as_current_span(name) if tracer else nullcontext()) as span:
-            if span:
-                for k, v in (fixed | dynamic).items(): span.set_attribute(k, v)
-            yield span
+        functools.update_wrapper(_wrapped, fn)      # keeps name, docstring, etc.
+        _wrapped.__signature__ = sig               # <- **critical line**
+        return _wrapped
 
-    _decorator.ctx = _ctx
-    return _decorator
+    @_contextmanager
+    def ctx(self, **dynamic):
+        with _TraceSpan(self._name, self._logger, **{**self._fixed, **dynamic}):
+            yield
+
+
+# ---------- public factory ------------------------------------------------
+def trace_span(name: str, *, logger: logging.Logger | None = None, **fixed):
+    """
+    `logger` is optional; when omitted we fall back to the service-level logger
+    named *app* so call-sites stay boiler-plate free.
+    """
+    return _TraceSpan(name, logger or get_logger("app"), **fixed)

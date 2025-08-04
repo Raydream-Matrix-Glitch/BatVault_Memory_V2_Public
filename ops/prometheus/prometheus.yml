@@ -19,7 +19,7 @@ scrape_configs:
   - job_name: memory_api
     metrics_path: /metrics
     static_configs:
-      - targets: ["memory_api:8082"]
+      - targets: ["memory_api:8002"]
 
   - job_name: ingest
     metrics_path: /metrics

@@ -15,14 +15,16 @@ from typing import Any, Dict, TYPE_CHECKING
 if TYPE_CHECKING:  # real classes visible only to the type checker
     from prometheus_client import Counter as PromCounter
     from prometheus_client import Histogram as PromHistogram
+    from prometheus_client import Gauge as PromGauge
 
 try:
-    from prometheus_client import Counter as _pCounter, Histogram as _pHistogram
+    from prometheus_client import Counter as _pCounter, Histogram as _pHistogram, Gauge as _pGauge
 except ImportError:  # pragma: no cover – guarded by requirements/runtime.txt
-    _pCounter = _pHistogram = None  # type: ignore[assignment]
+    _pCounter = _pHistogram = _pGauge = None  # type: ignore[assignment]
 
 _P_COUNTERS: Dict[str, "PromCounter"] = {}  # type: ignore[name-defined]
 _P_HISTOS: Dict[str, "PromHistogram"] = {}  # type: ignore[name-defined]
+_P_GAUGES: Dict[str, "PromGauge"] = {}      # type: ignore[name-defined]
 
 # ── OpenTelemetry setup (preferred path) ────────────────────────────────────
 try:
@@ -104,5 +106,24 @@ def histogram_ms(name: str, elapsed_ms: float, **attrs: Any) -> None:
     """Shortcut: record *elapsed_ms* (milliseconds) in histogram *name*."""
     histogram(name, elapsed_ms, **attrs)
 
+# --------------------------------------------------------------------------- #
+# Gauge helper – gives us an unsuffixed metric line for CI checks             #
+# --------------------------------------------------------------------------- #
+def gauge(name: str, value: float, **attrs: Any) -> None:
+    """
+    Record *value* in Prometheus **Gauge** *name*.
 
-__all__ = ["counter", "histogram", "histogram_ms"]
+    Gauges expose the plain metric line (e.g. ``api_edge_ttfb_seconds``) that
+    the CI suite validates, while histograms still provide latency percentiles.
+    """
+    if _pGauge is None:     # Prometheus library missing
+        return
+
+    g = _P_GAUGES.get(name)
+    if g is None:
+        g = _pGauge(name, f"Gauge for {name}")  # type: ignore[call-arg]
+        _P_GAUGES[name] = g
+    g.set(value)
+
+
+__all__ = ["counter", "histogram", "histogram_ms", "gauge"]

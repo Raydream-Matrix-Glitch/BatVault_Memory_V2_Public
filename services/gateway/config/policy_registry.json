@@ -3,6 +3,10 @@
     "policy_id": "why_v1",
     "prompt_id": "why_v1.0",
     "policy_block": "Answer strictly in JSON matching WhyDecisionAnswer@1.",
-    "explanations": []
+    "explanations": [],
+    "json_mode": true,
+    "temperature": 0.0,
+    "retries": 2,
+    "max_tokens": 256
   }
 }

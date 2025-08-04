@@ -87,7 +87,7 @@ fi
 # First‑party packages/services (editable)
 # -----------------------------
 STEP="install_editable"
-for pkg in core_config core_logging core_models core_storage core_utils core_validator link_utils core_metrics; do
+for pkg in core_config core_logging core_models core_metrics core_utils core_storage core_validator link_utils; do
   if [[ -d "packages/$pkg" ]]; then
     log INFO "$INSTALL_ID" "installing package" name="$pkg"
     retry 3 bash -lc "$PIP_BIN install -e packages/$pkg"

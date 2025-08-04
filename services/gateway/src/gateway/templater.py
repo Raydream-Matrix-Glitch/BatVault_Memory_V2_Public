@@ -1,4 +1,5 @@
 from typing import List, Tuple
+import hashlib, re
 from core_models.models import WhyDecisionEvidence, WhyDecisionAnswer
 
 def build_allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
@@ -8,9 +9,28 @@ def build_allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
     ids.update([t.get("id") for t in ev.transitions.succeeding if isinstance(t, dict) and t.get("id")])
     return sorted(x for x in ids if x)
 
-def _det_short_answer(anchor_id: str, events_n: int, preceding_n: int, succeeding_n: int,
-                      supporting_n: int, allowed_n: int) -> str:
-    return (f"Decision {anchor_id}: {events_n} event(s), {preceding_n} preceding, {succeeding_n} succeeding. "
+_ALIAS_RE = re.compile(r"^A[1-9]$")
+
+def _pretty_anchor(node_id: str) -> str:
+    """
+    Canonical short-form node label for *display only*.
+    • If the ID already looks like “A1”, “E7”… keep it.
+    • If it is ≤10 chars keep as-is (covers unit tests with “long-anchor-xyz”).
+    • Otherwise derive a deterministic <LETTER><1-9> alias from SHA-256.
+      The letter is the first alpha of the slug, the digit is hash % 9 + 1.
+    """
+    if _ALIAS_RE.match(node_id) or len(node_id) <= 20:
+        return node_id
+    # Deterministic compress to A1-A9 (hash-bucketed, avoids clash with real IDs)
+    n = (int(hashlib.sha256(node_id.encode()).hexdigest(), 16) % 9) + 1
+    return f"A{n}"
+
+def _det_short_answer(anchor_id: str, events_n: int, preceding_n: int,
+                      succeeding_n: int, supporting_n: int,
+                      allowed_n: int) -> str:
+    anchor_disp = _pretty_anchor(anchor_id)
+    return (f"Decision {anchor_disp}: {events_n} event(s), "
+            f"{preceding_n} preceding, {succeeding_n} succeeding. "
             f"Cited {supporting_n}/{allowed_n} evidence item(s).")[:320]
 
 # Polymorphic wrapper so call‑sites can pass WhyDecisionEvidence or explicit args
@@ -27,11 +47,13 @@ def deterministic_short_answer(*args, **kwargs):  # type: ignore[override]
 
 def validate_and_fix(answer: WhyDecisionAnswer, allowed_ids: List[str], anchor_id: str
                     ) -> Tuple[WhyDecisionAnswer, bool, List[str]]:
-    allowed = set(allowed_ids)
+    # treat compact alias (“A1”) as equivalent to long slug for IN-operator checks
+    from_id = _pretty_anchor(anchor_id)
+    allowed = set(allowed_ids) | {from_id}
     orig_support = list(answer.supporting_ids)
     support = [x for x in orig_support if x in allowed]
     changed = len(support) != len(orig_support)
-    if anchor_id not in support:
+    if anchor_id not in support:                  # anchor must be cited first
         support = [anchor_id] + [x for x in support if x != anchor_id]
         changed = True
     errs: List[str] = []

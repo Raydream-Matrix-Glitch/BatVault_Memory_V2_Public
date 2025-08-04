@@ -1,8 +1,14 @@
+import pathlib
+import json
+import pytest
 from jsonschema import Draft202012Validator as V
 from ingest.cli import load_schema
 
-
 def _fixture_root() -> pathlib.Path:
+    """
+    Find the canonical memory/fixtures directory by walking up
+    from this test file until it’s found.
+    """
     for parent in pathlib.Path(__file__).resolve().parents:
         cand = parent / "memory" / "fixtures"
         if cand.is_dir():
@@ -12,9 +18,15 @@ def _fixture_root() -> pathlib.Path:
 ROOT = _fixture_root()
 
 def _infer_schema(doc: dict) -> str:
-    if {"from", "to"} <= doc.keys():   # transition
+    """
+    Decide which JSON schema to use based on the keys in the document:
+      - If it has both "from" & "to": transition
+      - If it has "option": decision
+      - Otherwise: event
+    """
+    if {"from", "to"} <= doc.keys():
         return "transition"
-    if "option" in doc:                # decision
+    if "option" in doc:
         return "decision"
     return "event"
 

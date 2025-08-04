@@ -15,9 +15,11 @@ services:
     image: grafana/grafana:10.4.2
     restart: unless-stopped
     environment:
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
-      - GF_INSTALL_PLUGINS=grafana-polystat-panel
+      # ── NEW ── allow read-only dashboards without login
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      # reduce “Failed to authenticate request” spam
+      - GF_LOG_FILTERS=authn.service:info     
     volumes:
       - ./ops/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./ops/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
@@ -110,17 +112,19 @@ services:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       - OTEL_SERVICE_NAME=api_edge
+      - BATVAULT_HEALTH_PORT=8082
     env_file: [.env]
     command: ["python", "-m", "api_edge.__main__"]
     ports: ["8080:8080"]
     healthcheck:
-      test: ["CMD","curl","-fsS","http://localhost:8080/healthz"]
+      test: ["CMD","curl","-fsS","http://localhost:8082/healthz"]
       interval: 10s
+      timeout: 5s
+      start_period: 15s
       retries: 5
-      disable: true
     depends_on:
-#      gateway:
-#        condition: service_healthy
+      gateway:
+        condition: service_healthy
       redis:
         condition: service_healthy
       minio:
@@ -138,17 +142,19 @@ services:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       - OTEL_SERVICE_NAME=gateway
+      - BATVAULT_HEALTH_PORT=8081
     env_file: [.env]
     command: ["python", "-m", "gateway.__main__"]
     ports: ["8081:8081"]
     healthcheck:
       test: ["CMD","curl","-fsS","http://localhost:8081/healthz"]
       interval: 10s
+      timeout: 5s
+      start_period: 15s
       retries: 5
-      disable: true
     depends_on:
-#      memory_api:
-#        condition: service_healthy
+      memory_api:
+        condition: service_healthy
       redis:
         condition: service_healthy
       minio:
@@ -167,14 +173,15 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       - OTEL_SERVICE_NAME=memory-api
       - ARANGO_VECTOR_INDEX_ENABLED=true
+      - BATVAULT_HEALTH_PORT=8000
     env_file: [.env]
     command: ["python", "-m", "memory_api.__main__"]
     ports: ["8082:8082"]
     healthcheck:
-      test: ["CMD","curl","-fsS","http://localhost:8082/healthz"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
       interval: 10s
+      start_period: 15s   # give the app time to warm-up
       retries: 5
-      disable: true
     depends_on:
       redis:
         condition: service_healthy
@@ -194,14 +201,16 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       - OTEL_SERVICE_NAME=ingest
       - ARANGO_VECTOR_INDEX_ENABLED=true
+      - BATVAULT_HEALTH_PORT=8083
     env_file: [.env]
     command: ["python", "-m", "ingest.__main__"]
     ports: ["8083:8083"]
     healthcheck:
       test: ["CMD","curl","-fsS","http://localhost:8083/healthz"]
       interval: 10s
+      timeout: 5s
+      start_period: 15s
       retries: 5
-      disable: true
     depends_on:
       - memory_api
       - minio
