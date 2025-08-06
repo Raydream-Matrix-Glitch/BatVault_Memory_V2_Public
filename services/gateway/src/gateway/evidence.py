@@ -63,29 +63,55 @@ def _make_cache_key(decision_id: str, intent: str, scope: str,
     raw = "|".join((decision_id, intent, scope, etag, str(truncated)))
     return "evidence:" + hashlib.sha256(raw.encode()).hexdigest()
 
-def _collect_allowed_ids(                       # backwards-compat shim
+def _collect_allowed_ids(
     shape_or_anchor,
     events: list | None = None,
     pre: list | None = None,
     suc: list | None = None,
 ) -> list[str]:
-    if events is None:                          # ── legacy 2-arg call ──
-        shape, anchor = shape_or_anchor, pre    # type: ignore
-        neigh = shape.get("neighbors", {})
-        if isinstance(neigh, list):             # flat list
-            events = [n for n in neigh if n.get("type") == "event"]
-            trans  = [n for n in neigh if n.get("type") == "transition"]
-            pre, suc = [], trans
-        else:                                   # namespaced dict
-            events = neigh.get("events", [])
-            trans  = neigh.get("transitions", [])
-            pre, suc = trans, []
-    else:                                       # ── new 4-arg call ──
-        anchor = shape_or_anchor                # type: ignore
+    """
+    Return the exact union of *anchor.id*, event ids and transition ids.
 
+    Back-compat – supports two call styles:
+        1. New   → _collect_allowed_ids(anchor, events, pre, suc)
+        2. Legacy→ _collect_allowed_ids(shape,  anchor)
+    The helper disambiguates the signature by inspecting argument types so the
+    anchor object is never confused with the events list.
+    """
+
+    from core_models.models import WhyDecisionAnchor  # local import avoids cycles
+
+    # ── 1. New signature: anchor comes first ────────────────────────────
+    if isinstance(shape_or_anchor, WhyDecisionAnchor):
+        anchor = shape_or_anchor
+        events = events or []
+        pre    = pre or []
+        suc    = suc or []
+
+    # ── 2. Legacy signature: shape, anchor ─────────────────────────────
+    elif isinstance(events, WhyDecisionAnchor):
+        shape  = shape_or_anchor
+        anchor = events
+
+        neighbours = shape.get("neighbors", {})
+        if isinstance(neighbours, list):               # flat list variant
+            events = [n for n in neighbours if n.get("type") == "event"]
+            transitions = [n for n in neighbours if n.get("type") == "transition"]
+            pre, suc = [], transitions
+        else:                                         # namespaced dict
+            events = neighbours.get("events", []) or []
+            transitions = neighbours.get("transitions", []) or []
+            pre, suc = transitions, []
+
+    # ── 3. Anything else is a programmer error ─────────────────────────
+    else:
+        raise TypeError("Unsupported _collect_allowed_ids() call signature")
+
+    # ── 4. Compute allowed_ids after neighbour flattening ──────────────
     ids = {anchor.id}
     ids.update(e.get("id") for e in (events or []) if isinstance(e, dict))
-    ids.update(t.get("id") for t in (pre or []) + (suc or []) if isinstance(t, dict))
+    ids.update(t.get("id") for t in (pre or []) if isinstance(t, dict))
+    ids.update(t.get("id") for t in (suc or []) if isinstance(t, dict))
     return sorted(i for i in ids if i)
 
 # trace-span fallback (unit-tests monkey-patch the real one)

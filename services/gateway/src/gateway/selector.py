@@ -5,9 +5,13 @@ import core_metrics
 
 import orjson
 
+from core_models.models import WhyDecisionAnchor, WhyDecisionEvidence
+
+# Expose shortcuts in the global namespace so Milestone-3 test-suites that
+# still import these symbols *bare* keep working until they migrate.
 import builtins as _b
-_b.WhyDecisionEvidence = WhyDecisionEvidence   # legacy tests rely on
-_b.WhyDecisionAnchor   = WhyDecisionAnchor     # bare names in global scope
+_b.WhyDecisionEvidence = WhyDecisionEvidence
+_b.WhyDecisionAnchor = WhyDecisionAnchor
 
 import time
 from core_logging import log_stage, get_logger
