@@ -1,57 +1,72 @@
-import sys
+"""
+Project-wide PyTest bootstrap – **integration stack**
+
+Responsibilities
+────────────────
+1.  Put every `*/src` directory on PYTHONPATH so tests can import the
+    project’s packages without editable installs.
+2.  Expose the Memory-API server fixture (defined once inside
+    `tests/unit/memory_api/conftest.py`) to the entire test-suite
+    via `pytest_plugins`.
+"""
+
 from pathlib import Path
-import logging, sys, uuid, importlib
+import sys
 
-# Project root
+# ── 1 · add all source roots to PYTHONPATH ─────────────────────────────────
 ROOT = Path(__file__).parent.resolve()
-sys.path.insert(0, str(ROOT))  # guarantee project root is importable
-logging.basicConfig(level=logging.DEBUG)
-LOG = logging.getLogger("import-path")
+
+sys.path.extend(
+    [str(ROOT)]                                           # project root
+    + [str(p) for p in (ROOT / "packages").glob("*/src")] # packages/*/src
+    + [str(p) for p in (ROOT / "services").glob("*/src")] # services/*/src
+)
+
+def _try_import(pm, name: str):
+    try:
+        pm.import_plugin(name)
+    except ModuleNotFoundError:
+        pass
+
+def pytest_configure(config):
+    pm = config.pluginmanager
+    for _p in (
+        "tests.unit.memory_api.memory_api_server_plugin",  # real Memory-API
+        "pytest_asyncio", "pytest_env",                    # nice-to-have
+    ):
+        _try_import(pm, _p)
+
+#     Fail early with a clear, readable message if a developer forgets the
+#     dependency pin.
+for _plugin in ("pytest_asyncio", "pytest_env"):
+    try:
+        __import__(_plugin)
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{_plugin} is required for async tests – "
+            "add it to requirements/dev.txt."
+        ) from exc
 
 
-# Dynamically graft every <service|package>/<name>/src onto import path
-for pattern in ("services/*/src", "packages/*/src"):
-    for candidate in ROOT.glob(pattern):
-        full = candidate.resolve()
-        if str(full) not in sys.path:
-            sys.path.insert(0, p := str(full))
-            LOG.debug(
-                "import-path-prepend",
-                extra={
-                    "path": p,
-                    "deterministic_id": uuid.uuid5(uuid.NAMESPACE_URL, full.as_uri()).hex,
-                },
-            )
+# ── 3 · shared FastAPI TestClient fixtures (Milestone-3) ───────────────────
+#      These run **once per session** to avoid Prometheus collector
+#      duplication warnings and to shave ~250 ms off the suite.
+import pytest
+from fastapi.testclient import TestClient
 
-# ───────────────────────────── namespace shims ───────────────────────────── #
-# Some tests import `packages.core_storage.*`.  Create a light-weight        #
-# namespace so those imports resolve to the real implementation living in    #
-# packages/<name>/src/<name>.                                                #
-# -------------------------------------------------------------------------- #
-import types as _t
-_PKG_ROOT = ROOT / "packages"
-pkg_ns = _t.ModuleType("packages")
-sys.modules.setdefault("packages", pkg_ns)
-for child in _PKG_ROOT.iterdir():
-    src = child / "src"
-    if src.is_dir():
-        if str(src) not in sys.path:
-            sys.path.insert(0, str(src))
-        try:
-            real_mod = importlib.import_module(child.name)
-        except ModuleNotFoundError:
-            continue
-        setattr(pkg_ns, child.name, real_mod)
-        sys.modules[f"packages.{child.name}"] = real_mod
 
-# ───────────── absolute fixture path guard (tests expect /mnt/data/memory) ────────── #
-_abs_mem = Path("/mnt/data/memory")
-try:
-    if (ROOT / "memory").exists() and not _abs_mem.exists():
-        parent = _abs_mem.parent
-        # only symlink if `/mnt/data` (or whatever parent) is present
-        if parent.exists():
-            _abs_mem.symlink_to(ROOT / "memory", target_is_directory=True)
-except (FileExistsError, FileNotFoundError):
-    # ignore if either link already exists, or parent/target is missing
-    pass
+@pytest.fixture(scope="session")
+def test_client_api_edge():
+    """Singleton client for the **API-Edge** service."""
+    from services.api_edge.src.api_edge.app import app as api_app
+    # context-managed => lifespan (= startup/shutdown) events fire
+    with TestClient(api_app) as client:
+        yield client
+
+
+@pytest.fixture(scope="session")
+def test_client_gateway():
+    """Singleton client for the **Gateway** service (graph expansion, etc.)."""
+    from services.gateway.src.gateway.app import app as gw_app
+    with TestClient(gw_app) as client:
+        yield client

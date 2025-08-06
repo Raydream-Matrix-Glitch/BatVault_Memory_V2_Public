@@ -27,4 +27,4 @@ def test_no_transitions():
                              transitions=WhyDecisionTransitions())
     ev.allowed_ids = ["D1"]
     ok, errs = validate_response(_mk_resp(ev, ["D1"]))
-    assert ok
+    assert not ok and "completeness_flags.event_count mismatch" in errs[0]

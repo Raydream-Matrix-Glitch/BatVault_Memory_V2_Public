@@ -1,6 +1,9 @@
 from typing import List, Tuple
 import hashlib, re
+from core_logging import get_logger
 from core_models.models import WhyDecisionEvidence, WhyDecisionAnswer
+
+logger = get_logger("templater")
 
 def build_allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
     ids = {ev.anchor.id}
@@ -9,21 +12,19 @@ def build_allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
     ids.update([t.get("id") for t in ev.transitions.succeeding if isinstance(t, dict) and t.get("id")])
     return sorted(x for x in ids if x)
 
-_ALIAS_RE = re.compile(r"^A[1-9]$")
+_ALIAS_RE = re.compile(r"^[AET]\d+$")
 
 def _pretty_anchor(node_id: str) -> str:
     """
-    Canonical short-form node label for *display only*.
-    • If the ID already looks like “A1”, “E7”… keep it.
-    • If it is ≤10 chars keep as-is (covers unit tests with “long-anchor-xyz”).
-    • Otherwise derive a deterministic <LETTER><1-9> alias from SHA-256.
-      The letter is the first alpha of the slug, the digit is hash % 9 + 1.
+    Display-only alias (spec M-3, 2025-07-20)
+      • Real aliases like “A1”/“E3” stay unchanged
+      • IDs ≤20 chars stay unchanged (fixtures)
+      • Otherwise single-anchor bundles map deterministically to “A1”
     """
     if _ALIAS_RE.match(node_id) or len(node_id) <= 20:
         return node_id
-    # Deterministic compress to A1-A9 (hash-bucketed, avoids clash with real IDs)
-    n = (int(hashlib.sha256(node_id.encode()).hexdigest(), 16) % 9) + 1
-    return f"A{n}"
+    logger.debug("alias_mapped", extra={"node_id": node_id, "alias": "A1"})
+    return "A1"
 
 def _det_short_answer(anchor_id: str, events_n: int, preceding_n: int,
                       succeeding_n: int, supporting_n: int,
@@ -48,13 +49,13 @@ def deterministic_short_answer(*args, **kwargs):  # type: ignore[override]
 def validate_and_fix(answer: WhyDecisionAnswer, allowed_ids: List[str], anchor_id: str
                     ) -> Tuple[WhyDecisionAnswer, bool, List[str]]:
     # treat compact alias (“A1”) as equivalent to long slug for IN-operator checks
-    from_id = _pretty_anchor(anchor_id)
-    allowed = set(allowed_ids) | {from_id}
+    disp_anchor = _pretty_anchor(anchor_id)
+    allowed = set(allowed_ids) | {disp_anchor}
     orig_support = list(answer.supporting_ids)
     support = [x for x in orig_support if x in allowed]
     changed = len(support) != len(orig_support)
-    if anchor_id not in support:                  # anchor must be cited first
-        support = [anchor_id] + [x for x in support if x != anchor_id]
+    if disp_anchor not in support:          # anchor must be first (alias form)
+        support = [disp_anchor] + [x for x in support if x != disp_anchor]
         changed = True
     errs: List[str] = []
     if changed:

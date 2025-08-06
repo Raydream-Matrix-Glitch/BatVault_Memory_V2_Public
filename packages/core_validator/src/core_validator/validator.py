@@ -45,11 +45,17 @@ def validate_response(resp: WhyDecisionResponse) -> Tuple[bool, List[str]]:
     if not support.issubset(allowed):
         errs.append("supporting_ids ⊈ allowed_ids")
 
-    # anchor cited
-    anchor_id = resp.evidence.anchor.id
+    # 1. Anchor citation (most user-actionable)
+    anchor_id   = resp.evidence.anchor.id
     anchor_short = _pretty_anchor(anchor_id)
+    support      = set(resp.answer.supporting_ids)
     if anchor_id not in support and anchor_short not in support:
-        errs.append("anchor.id missing from supporting_ids")
+        errs.append("anchor.id missing")
+
+    # 2. supporting_ids ⊆ allowed_ids
+    allowed = set(resp.evidence.allowed_ids) | {anchor_short}
+    if not support.issubset(allowed):
+        errs.append("supporting_ids ⊈ allowed_ids")
 
     # transitions cited
     trans_ids = [

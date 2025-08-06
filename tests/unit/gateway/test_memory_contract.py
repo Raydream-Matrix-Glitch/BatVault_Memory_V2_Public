@@ -1,4 +1,5 @@
 import pytest, json
+pytest.importorskip("pytest_asyncio")  # clean “SKIPPED – requires pytest-asyncio”
 from httpx import Response
 from gateway.evidence import EvidenceBuilder
 

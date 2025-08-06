@@ -22,6 +22,14 @@ class WhyDecisionEvidence(BaseModel):
     transitions: WhyDecisionTransitions = Field(default_factory=WhyDecisionTransitions)
     allowed_ids: List[str] = Field(default_factory=list)
 
+    snapshot_etag: Optional[str] = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "Corpus snapshot identifier returned by Memory-API. "
+            "Used exclusively for cache-key generation and freshness checks."
+        ),
+    )
 
 class WhyDecisionAnswer(BaseModel):
     short_answer: str

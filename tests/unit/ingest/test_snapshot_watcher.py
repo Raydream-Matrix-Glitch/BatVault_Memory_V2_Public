@@ -2,8 +2,13 @@ import shutil, time
 from pathlib import Path
 from types import SimpleNamespace
 
-from services.ingest.src.ingest.watcher import SnapshotWatcher, _dummy_app
-from packages.core_utils.snapshot import compute_snapshot_etag_for_files
+from ingest.watcher import SnapshotWatcher, _dummy_app
+from core_utils.snapshot import compute_snapshot_etag_for_files
+
+# Fail fast with a clear error if the helper can’t be imported.
+assert callable(
+    compute_snapshot_etag_for_files
+), "core_utils.snapshot not installed – run `pip install -e packages/core_utils`"
 
 
 def _freeze(monkeypatch, ts: int = 1_694_976_000):

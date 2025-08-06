@@ -19,5 +19,6 @@ def test_upsert_is_idempotent():
     for _ in range(2):                 # run twice
         # Provide a dummy snapshot_etag for idempotency
         upsert_all(store, *_sample_docs(), snapshot_etag="test-etag")
-    assert len(store.nodes) == 3
+    assert set(store.nodes) == {"ship", "E-1", "T-1"}, \
+        f"Store.nodes contained extras: {set(store.nodes) - {'ship','E-1','T-1'}}"
     assert len(store.edges) == 2       # LED_TO + CAUSAL_PRECEDES

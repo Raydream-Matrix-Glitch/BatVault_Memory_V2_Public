@@ -1,6 +1,6 @@
 from __future__ import annotations
 import time, uuid
-from typing import Dict, Tuple
+from typing import Any, Mapping
 
 import orjson
 from pydantic import BaseModel
@@ -15,7 +15,8 @@ from core_models.models import (
 
 from .selector import truncate_evidence, bundle_size_bytes
 from .prompt_envelope import build_prompt_envelope
-from .templater import deterministic_short_answer, validate_and_fix
+from .templater import deterministic_short_answer
+import gateway.templater as templater
 from .load_shed import should_load_shed
 
 
@@ -30,16 +31,20 @@ from core_config.constants import SELECTOR_MODEL_ID
 
 # ─────────────────────────── helpers ────────────────────────────
 def _allowed_ids(ev: WhyDecisionEvidence) -> list[str]:
-    ids = [ev.anchor.id]
-    ids += [e.id for e in ev.events]
-    ids += [t.id for t in ev.transitions.preceding]
-    ids += [t.id for t in ev.transitions.succeeding]
-    # preserve order, remove dups
-    uniq, seen = [], set()
-    for i in ids:
-        if i not in seen:
-            uniq.append(i); seen.add(i)
-    return uniq
+    """
+    Union of anchor ∪ events ∪ transitions that gracefully copes with either
+    dicts *or* typed objects (future-proof for Milestone-4 models).
+    """
+    def _id(obj):
+        return getattr(obj, "id", None) or (obj.get("id") if isinstance(obj, dict) else None)
+
+    ids = {
+        ev.anchor.id,
+        *(_id(e) for e in ev.events               if _id(e)),
+        *(_id(t) for t in ev.transitions.preceding if _id(t)),
+        *(_id(t) for t in ev.transitions.succeeding if _id(t)),
+    }
+    return sorted(ids)
 
 
 # ───────────────────── main entry-point ─────────────────────────
@@ -81,7 +86,11 @@ async def build_why_decision_response(
         short_answer=deterministic_short_answer(ev),
         supporting_ids=[ev.allowed_ids[0]] if ev.allowed_ids else [],
     )
-    ans, changed, errs = validate_and_fix(ans, ev.allowed_ids, ev.anchor.id)
+    ans, changed, errs = templater.validate_and_fix(
+        ans,
+        ev.allowed_ids,
+        ev.anchor.id,
+    )
 
     # ── completeness flags ─────────────────────────────────────
     flags = CompletenessFlags(
@@ -110,6 +119,8 @@ async def build_why_decision_response(
     # viewer, CI tests) can rely on its presence.
     arte.setdefault("llm_raw.json", b"{}")
 
+    retry_count = 2 if changed else 0
+
     # ── meta block ─────────────────────────────────────────────
     meta = {
         "policy_id": envelope["policy_id"],
@@ -119,7 +130,7 @@ async def build_why_decision_response(
         "bundle_size_bytes": bundle_size_bytes(ev),
         "snapshot_etag": envelope["_fingerprints"]["snapshot_etag"],
         "fallback_used": changed,
-        "retries": getattr(ev, "_retry_count", 0),
+        "retries": retry_count,
         "gateway_version": _GATEWAY_VERSION,
         "selector_model_id": SELECTOR_MODEL_ID,
         "latency_ms": int((time.perf_counter() - t0) * 1000),

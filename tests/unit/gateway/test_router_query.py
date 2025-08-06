@@ -62,15 +62,16 @@ gw_app.httpx.get = _dummy_get
 gw_app.httpx.post = _dummy_post
 
 # AsyncClient stub so any async HTTP call is short-circuited
+_REAL_CLIENT = httpx.AsyncClient
 def _mock_async_client(*args, **kwargs):
     kwargs["transport"] = httpx.MockTransport(
-        lambda req: httpx.Response(
+        lambda r: httpx.Response(
             200,
             json={"matches": [{"id": DECISION_ID}]},
             headers={"x-snapshot-etag": "dummy"},
         )
     )
-    return httpx.AsyncClient(*args, **kwargs)
+    return _REAL_CLIENT(*args, **kwargs)
 
 gw_app.httpx.AsyncClient = _mock_async_client
 

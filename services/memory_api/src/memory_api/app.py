@@ -14,6 +14,13 @@ import re
 import time
 import core_metrics
 
+# ---------------------------------------------------------------------------
+# Legacy module alias needed by unit tests that monkey-patch `embed()` on
+# the storage layer.  Importing the module here keeps the public surface
+# of `memory_api.app` stable after the recent refactor.
+import core_storage.arangodb as arango_mod  # noqa: F401
+# ---------------------------------------------------------------------------
+
 settings = get_settings()
 logger = get_logger("memory_api")
 logger.propagate = True
@@ -116,7 +123,10 @@ def _clear_store_cache() -> None:
 @app.on_event("startup")
 async def bootstrap_arango():
     # Ensure DB/collections via ArangoStore init (it handles vector index creation)
-    _ = store()
+    try:
+        _ = store()
+    except Exception as exc:
+        logger.warning("Lazy ArangoStore bootstrap skipped: %s", exc)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared helper: always attach the current snapshot ETag
@@ -408,3 +418,5 @@ async def expand_candidates_slash(payload: dict, response: Response):
 async def resolve_text_slash(payload: dict, response: Response):
     """Back-compat: delegate trailing-slash variant to the canonical handler."""
     return await resolve_text(payload, response)
+
+

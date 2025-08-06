@@ -1,6 +1,8 @@
-import httpx
+import os, httpx
 
-BASE = "http://memory_api:8000"
+# The _memory_api_server fixture publishes the actual base URL via
+# an env-var when it has to fall back to a random free port.
+BASE = os.getenv("MEMORY_API_BASE", "http://memory_api:8000")
 
 def test_expand_candidates_contract():
     # Without data, should still return shape with neighbors list

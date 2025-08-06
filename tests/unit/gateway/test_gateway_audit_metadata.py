@@ -22,10 +22,10 @@ class _DummyResp:
 # Patch gateway.httpx calls to return our dummy responses
 gw_app.httpx.get = lambda *a, **k: _DummyResp({
     "id": "panasonic-exit-plasma-2012",
-    "supported_by": [], "based_on": [], "transitions": [],
 })
 gw_app.httpx.post = lambda *a, **k: _DummyResp({
-    "neighbors": {"events": [], "transitions": []},
+    # Milestone-3: generic flat neighbours list
+    "neighbors": [],
     "meta": {"snapshot_etag": "test-etag"},
 })
 gw_app.httpx.AsyncClient = lambda *a, **kw: httpx.AsyncClient(

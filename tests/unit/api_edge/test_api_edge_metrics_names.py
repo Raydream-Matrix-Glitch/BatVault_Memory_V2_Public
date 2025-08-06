@@ -16,6 +16,9 @@ def test_api_edge_metric_names_present(test_client_api_edge):
     ]
 
     for name in expected_names:
-        assert re.search(
-            rf"^{name}(?:{{[^}}]*}})?\s+\d+", body, flags=re.MULTILINE
-        ), f"Metric {name} not found in /metrics output"
+        if not re.search(rf"^{name}(?:{{[^}}]*}})?\s+\d+", body, flags=re.MULTILINE):
+            excerpt = "\n".join(body.splitlines()[:40])
+            raise AssertionError(
+                f"Metric ‘{name}’ not found in /metrics output.\n"
+                f"First 40 lines for context:\n{excerpt}"
+        )

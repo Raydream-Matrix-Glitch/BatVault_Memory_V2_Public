@@ -19,8 +19,8 @@ def dummy_get(url, **kwargs):
     return DummyResponse({"id":"pause-paas-rollout-2024-q3","supported_by":[],"transitions":[]})
 
 def dummy_post(url, json=None, **kwargs):
-    # Dummy /api/graph/expand_candidates response
-    return DummyResponse({"neighbors":{"events":[],"transitions":[]},"meta":{"snapshot_etag":""}})
+    # Dummy /api/graph/expand_candidates response (Milestone-3)
+    return DummyResponse({"neighbors": [], "meta": {"snapshot_etag": ""}})
 
 # Apply stubs to prevent real HTTP calls
 gw_app.httpx.get = dummy_get

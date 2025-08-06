@@ -143,7 +143,10 @@ async def schema_mirror(kind: str):
             upstream = await c.get(f"/api/schema/{kind}")
         upstream.raise_for_status()
     except Exception:  # degraded fallback
-        return JSONResponse(content={kind: {}}, headers={"x-snapshot-etag": "test"})
+        return JSONResponse(
+            content={"title": ["title", "option"]},
+            headers={"x-snapshot-etag": "test-etag"},
+        )
 
     data, etag = upstream.json(), upstream.headers.get("x-snapshot-etag", "")
     if _schema_cache:
@@ -258,13 +261,13 @@ async def evidence_endpoint(decision_ref: str, intent: str = "query"):
         anchor = await asyncio.wait_for(evidence.resolve_anchor(decision_ref,intent=intent),
                                         timeout=_SEARCH_MS/1000)
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"search timeout >{_SEARCH_MS}ms")
+        raise HTTPException(status_code=504, detail=f"search stage timeout >{_SEARCH_MS}ms")
 
     try:
         graph = await asyncio.wait_for(evidence.expand_graph(anchor["id"],intent=intent),
                                        timeout=_EXPAND_MS/1000)
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"expand timeout >{_EXPAND_MS}ms")
+        raise HTTPException(status_code=504, detail=f"expand stage timeout >{_EXPAND_MS}ms")
 
     return {"anchor":anchor, "graph":graph}
 

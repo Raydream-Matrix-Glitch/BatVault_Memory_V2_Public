@@ -11,7 +11,7 @@ evidence.py – build WhyDecisionEvidence bundles
 # 1 ─────────────────────────── Imports ────────────────────────────────
 from __future__ import annotations
 
-import asyncio, hashlib, inspect, random
+import asyncio, hashlib, inspect, random, httpx
 from contextlib import asynccontextmanager, contextmanager
 from typing import Optional
 
@@ -35,15 +35,27 @@ CACHE_TTL_SEC   = 900          # 15 min
 ALIAS_TPL       = "evidence:{anchor_id}:latest"
 
 # 3 ───────────── Public test stubs ────────────────────────────────────
-__all__ = ["resolve_anchor", "expand_graph"]
+__all__ = [
+    "resolve_anchor",
+    "expand_graph",
+    "WhyDecisionEvidence",
+    "_collect_allowed_ids",
+]
 
 async def resolve_anchor(decision_ref: str, *, intent: str | None = None):
     await asyncio.sleep(0)
     return {"id": decision_ref}
 
-async def expand_graph(decision_id: str, *, intent: str | None = None):
-    await asyncio.sleep(0)
-    return {"nodes": [], "edges": []}
+async def expand_graph(decision_id: str, *, intent: str | None = None, k: int = 1):
+    settings = get_settings()
+    url      = f"{settings.memory_api_url.rstrip('/')}/api/graph/expand_candidates"
+    payload  = {"anchor": decision_id, "k": k}
+
+    timeout_s = 0.25
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json()
 
 # 4 ─────────────────────── Helpers ────────────────────────────────────
 def _make_cache_key(decision_id: str, intent: str, scope: str,
@@ -51,12 +63,30 @@ def _make_cache_key(decision_id: str, intent: str, scope: str,
     raw = "|".join((decision_id, intent, scope, etag, str(truncated)))
     return "evidence:" + hashlib.sha256(raw.encode()).hexdigest()
 
-def _collect_allowed_ids(anchor: WhyDecisionAnchor, events,
-                         pre, suc) -> list[str]:
+def _collect_allowed_ids(                       # backwards-compat shim
+    shape_or_anchor,
+    events: list | None = None,
+    pre: list | None = None,
+    suc: list | None = None,
+) -> list[str]:
+    if events is None:                          # ── legacy 2-arg call ──
+        shape, anchor = shape_or_anchor, pre    # type: ignore
+        neigh = shape.get("neighbors", {})
+        if isinstance(neigh, list):             # flat list
+            events = [n for n in neigh if n.get("type") == "event"]
+            trans  = [n for n in neigh if n.get("type") == "transition"]
+            pre, suc = [], trans
+        else:                                   # namespaced dict
+            events = neigh.get("events", [])
+            trans  = neigh.get("transitions", [])
+            pre, suc = trans, []
+    else:                                       # ── new 4-arg call ──
+        anchor = shape_or_anchor                # type: ignore
+
     ids = {anchor.id}
-    ids.update(e.get("id") for e in events if isinstance(e, dict))
-    ids.update(t.get("id") for t in pre + suc if isinstance(t, dict))
-    return sorted(ids)
+    ids.update(e.get("id") for e in (events or []) if isinstance(e, dict))
+    ids.update(t.get("id") for t in (pre or []) + (suc or []) if isinstance(t, dict))
+    return sorted(i for i in ids if i)
 
 # trace-span fallback (unit-tests monkey-patch the real one)
 if not hasattr(trace_span, "ctx"):
@@ -144,22 +174,55 @@ class EvidenceBuilder:
             except Exception:
                 anchor_json, snapshot_etag = {"id": anchor_id}, "unknown"
 
-        neigh   = resp_neigh.json()
-        events  = neigh.get("events", [])
-        pre     = neigh.get("preceding", [])
-        suc     = neigh.get("succeeding", [])
+        neigh  = resp_neigh.json()
 
-        # new flattened contract
-        if not events and "neighbors" in neigh:
-            for n in neigh["neighbors"]:
-                if n.get("type") == "event":
+        # Merge evidence from every contract variant we recognise so that
+        # any future additive change is *automatically* included.
+        events: list[dict] = []
+        pre:    list[dict] = []
+        suc:    list[dict] = []
+
+        # ── legacy v1 keys ──────────────────────────────────────────────
+        events.extend(neigh.get("events",     []) or [])
+        pre.extend   (neigh.get("preceding",  []) or [])
+        suc.extend   (neigh.get("succeeding", []) or [])
+
+        # ── unified v2 key ─────────────────────────────────────────────
+        neighbors = neigh.get("neighbors")
+        if neighbors:
+            if isinstance(neighbors, dict):         # v2 namespaced shape
+                events.extend(neighbors.get("events",        []) or [])
+                pre.extend   (neighbors.get("transitions",   []) or [])
+            else:                                   # flattened list
+                for n in neighbors:                 # type: ignore[arg-type]
+                    ntype = n.get("type") or n.get("entity_type")
+                    # ① explicit type keys
+                    if ntype == "event":
+                        events.append(n);  continue
+                    if ntype == "transition":
+                        pre.append(n);     continue
+                    # ② infer from edge metadata (v2.1 draft)
+                    edge = n.get("edge") or {}
+                    rel  = edge.get("rel")
+                    if rel in {"preceding", "succeeding"}:
+                        (pre if rel == "preceding" else suc).append(n); continue
+                    # ③ last-resort – treat as event so we never lose evidence
                     events.append(n)
-                elif n.get("type") == "transition":
-                    pre.append(n)          # direction TBD
 
-        # guarantee ≥ 1 event for contract tests
-        if not events:
-            events.append({"id": f"{anchor_id}-e0", "summary": "stub event"})
+#        if not events and anchor_json.get("supported_by"):
+#            async with _safe_async_client(
+#                timeout=settings.timeout_search_ms / 1000.0,
+#                base_url=settings.memory_api_url,
+#            ) as client:
+#                for eid in anchor_json["supported_by"]:
+#                    try:
+#                        eresp = await client.get(f"/api/enrich/event/{eid}")
+#                        eresp.raise_for_status()
+#                        events.append(eresp.json())
+#                    except Exception:
+#                        logger.warning("event_enrich_failed",
+#                                       extra={"event_id": eid,
+#                                              "anchor_id": anchor_id})
 
         anchor = WhyDecisionAnchor(**anchor_json)
         ev = WhyDecisionEvidence(
@@ -168,6 +231,7 @@ class EvidenceBuilder:
             transitions=WhyDecisionTransitions(preceding=pre, succeeding=suc),
             allowed_ids=_collect_allowed_ids(anchor, events, pre, suc),
         )
+
         ev.snapshot_etag = snapshot_etag
         ev.__dict__["_retry_count"] = retry_count
 
@@ -181,10 +245,15 @@ class EvidenceBuilder:
                 composite = _make_cache_key(anchor_id, "why_decision", "k1",
                                             snapshot_etag, False)
                 ttl  = settings.cache_ttl_evidence_sec or CACHE_TTL_SEC
-                pipe = self._redis.pipeline()
-                pipe.setex(alias_key, ttl, composite)
-                pipe.setex(composite, ttl, ev.model_dump_json())
-                pipe.execute()
+                try:
+                    pipe = self._redis.pipeline()              # real Redis
+                    pipe.setex(alias_key, ttl, composite)
+                    pipe.setex(composite, ttl, ev.model_dump_json())
+                    pipe.execute()
+                except AttributeError:
+                    # ultra-thin fakes in unit-tests expose only setex(…)
+                    self._redis.setex(alias_key, ttl, composite)
+                    self._redis.setex(composite, ev.model_dump_json())
             except Exception:
                 logger.warning("redis write error", exc_info=True)
 
@@ -211,3 +280,6 @@ class EvidenceBuilder:
             return resp.headers.get("snapshot_etag", "unknown") == cached_etag
         except Exception:
             return True      # fail-open
+    # ── temporary alias until tests migrate in M-4 ──────────────────────────
+    async def get_evidence(self, anchor_id: str) -> WhyDecisionEvidence:
+        return await self.build(anchor_id)

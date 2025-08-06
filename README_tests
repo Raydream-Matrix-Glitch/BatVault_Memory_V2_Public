@@ -36,6 +36,28 @@ pytest -q tests/integration
 #
 pytest -q tests/performance
 
+docker compose -f docker-compose.dev.yml up --build -d
+
+# 2. open a shell in the dev container
+docker compose exec dev bash
+
+# 3. install python deps (≈25 s w/ cache)
+pip install -r requirements/dev.txt
+
+# 4. run the whole matrix
+pytest -q
+
+# 0. (once) build & start backing services
+docker compose -f docker-compose.dev.yml up -d --build redis arango minio
+
+# 1. quick feedback loop – pure unit tests
+docker compose -f docker-compose.dev.yml run --rm dev pytest -q
+
+# 2. gateway tests (exercise real HTTP against live Memory-API)
+docker compose -f docker-compose.dev.yml run --rm dev pytest -q -m gateway
+
+# 3. Memory-API service’s own unit / contract tests
+docker compose -f docker-compose.dev.yml run --rm dev pytest -q services/memory_api/tests
 
 
 # Pytest Commands

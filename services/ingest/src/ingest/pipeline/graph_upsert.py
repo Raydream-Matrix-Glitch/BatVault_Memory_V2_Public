@@ -57,7 +57,14 @@ def upsert_all(
 
     # CAUSAL_PRECEDES  (transition)
     for tid, t in transitions.items():
-        fr, to = t["from"], t["to"]
+        # Skip synthetic or malformed entries (future-proofing)
+        if "_edge_hint" in t:
+            log_stage(logger, "ingest", "transition_skipped_edge_hint", transition_id=tid)
+            continue
+        fr, to = t.get("from"), t.get("to")
+        if fr is None or to is None:
+            log_stage(logger, "ingest", "transition_missing_endpoints", transition_id=tid)
+            continue
         if fr not in decisions or to not in decisions:          # spec §P orphan tolerance
             log_stage(logger, "ingest", "orphan_transition_skipped",
                       transition_id=tid, from_id=fr, to_id=to)

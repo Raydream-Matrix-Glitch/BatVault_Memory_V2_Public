@@ -3,6 +3,7 @@ import asyncio
 import json
 
 import pytest
+pytest.importorskip("pytest_asyncio")  # clean “SKIPPED – requires pytest-asyncio”
 
 from gateway.evidence import EvidenceBuilder
 from core_models.models import WhyDecisionEvidence
@@ -79,8 +80,9 @@ async def test_cache_hit(monkeypatch):
         async def get(self, url):
             return DummyResp(decision, {"snapshot_etag": snapshot_etag})
         async def post(self, url, json):
+            # Milestone-3: everything comes back in one flat list
             return DummyResp(
-                {"events": events, "preceding": trans_pre, "succeeding": trans_suc},
+                {"neighbors": events + trans_pre + trans_suc, "meta": {}},
                 {},
             )
         async def aclose(self):
@@ -143,7 +145,7 @@ async def test_etag_change_eviction(monkeypatch):
 
         async def post(self, url, json):
             return DummyResp(
-                {"events": events, "preceding": trans_pre, "succeeding": trans_suc},
+                {"neighbors": events + trans_pre + trans_suc, "meta": {}},
                 {},
             )
 
@@ -165,10 +167,14 @@ async def test_etag_change_eviction(monkeypatch):
 
     builder = EvidenceBuilder()
     ev1 = await builder.build(anchor_id)
+    # internal field present …
     assert ev1.snapshot_etag == etags[0]
+    # … but never serialised
+    assert "snapshot_etag" not in ev1.model_dump()
     assert calls["setex"] == 1
 
     ev2 = await builder.build(anchor_id)
     assert ev2.snapshot_etag == etags[1]
+    assert "snapshot_etag" not in ev2.model_dump()
     # New etag → new cache write
     assert calls["setex"] == 2

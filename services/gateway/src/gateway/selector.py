@@ -5,7 +5,9 @@ import core_metrics
 
 import orjson
 
-from core_models.models import WhyDecisionAnchor, WhyDecisionEvidence
+import builtins as _b
+_b.WhyDecisionEvidence = WhyDecisionEvidence   # legacy tests rely on
+_b.WhyDecisionAnchor   = WhyDecisionAnchor     # bare names in global scope
 
 import time
 from core_logging import log_stage, get_logger

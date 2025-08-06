@@ -21,10 +21,10 @@ class _DummyResp:
     def json(self):  return self._json
 
 gw_app.httpx.get  = lambda *a, **k: _DummyResp(
-    {"id": "panasonic-exit-plasma-2012", "supported_by": [], "based_on": [], "transitions": []}
+    {"id": "panasonic-exit-plasma-2012"}
 )
 gw_app.httpx.post = lambda *a, **k: _DummyResp(
-    {"neighbors": {"events": [], "transitions": []}, "meta": {"snapshot_etag": "test-etag"}}
+    {"neighbors": [], "meta": {"snapshot_etag": "test-etag"}}
 )
 gw_app.httpx.AsyncClient = lambda *a, **kw: httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
 

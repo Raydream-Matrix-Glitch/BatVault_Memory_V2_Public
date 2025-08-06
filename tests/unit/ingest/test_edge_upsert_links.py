@@ -43,6 +43,9 @@ def _sample_docs():
 def test_edges_upserted():
     store = DummyStore()
     d, e, t = _sample_docs()
-    upsert_all(store, d, e, t, snapshot_etag="snap123")
+    upsert_all(store, d, e, t, snapshot_etag="snap123")  # should not raise
+    # sanity: derive_links must NOT have introduced edge-hint pseudo-nodes
+    offending = [tid for tid, doc in t.items() if "_edge_hint" in doc]
+    assert not offending, f"Unexpected _edge_hint docs leaked: {offending}"
     assert "ledto:bar-ev->foo-dec" in store.edges
     assert "transition:baz-tr" in store.edges

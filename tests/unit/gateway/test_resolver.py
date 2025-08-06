@@ -1,4 +1,5 @@
 import pytest
+pytest.importorskip("pytest_asyncio")  # clean “SKIPPED – requires pytest-asyncio”
 
 from gateway.resolver import resolve_decision_text
 

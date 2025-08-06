@@ -3,8 +3,11 @@
 from pathlib import Path
 import json
 import httpx
-import gateway.app as gw_app
+import json, gateway.app as gw_app
 from gateway.app import app
+from tests.helpers.memory_api_stub import patch_httpx
+from contextlib import ExitStack
+import httpx 
 from fastapi.testclient import TestClient
 
 # --------------------------------------------------------------------------- #
@@ -44,34 +47,51 @@ class DummyResponse:
         return self._payload
 
 
-def _dummy_get(url, *args, **kwargs):
-    if url.endswith(f"/api/enrich/decision/{DECISION}"):
-        return DummyResponse(decision_json)
-    return DummyResponse({})
-
-
-def _dummy_post(url, *args, **kwargs):
-    if url.endswith("/api/graph/expand_candidates"):
-        return DummyResponse({
-            "neighbors": {
-                "events": [event_json],
-                "transitions": [],
+# --------------------------------------------------------------------------- #
+#  Unified HTTPX transport stub (v2 contract)                                #
+# --------------------------------------------------------------------------- #
+def _httpx_handler(req: httpx.Request) -> httpx.Response:
+    """
+    In-memory stub that reproduces the Memory-API **v2** contract:
+      • /api/graph/expand_candidates → flattened `neighbors` list
+      • /api/enrich/decision/<id>    → decision envelope with ETag header
+    It covers both sync helpers and `httpx.AsyncClient` traffic.
+    """
+    if req.url.path.startswith("/api/graph/expand_candidates"):
+        return httpx.Response(
+            200,
+            json={
+                "anchor":    DECISION,
+                "neighbors": [{**event_json, "type": "event"}],
+                "meta":      {"snapshot_etag": "dummy"},
             },
-            "meta": {"snapshot_etag": "dummy"},
-        })
-    return DummyResponse({})
+        )
 
+    if req.url.path == f"/api/enrich/decision/{DECISION}":
+        return httpx.Response(
+            200,
+            json=decision_json,
+            headers={"snapshot_etag": "dummy"},
+        )
 
-# Patch the httpx calls in the gateway app
-gw_app.httpx.get  = _dummy_get
-gw_app.httpx.post = _dummy_post
+    # Fallback → mirrors real API behaviour for unknown paths
+    return httpx.Response(404, json={})
 
-
+# AsyncClient factory used by EvidenceBuilder
 def _mock_async_client(*args, **kwargs):
-    kwargs["transport"] = httpx.MockTransport(lambda req: httpx.Response(200, json={"id": "dummy"}))
+    kwargs["transport"] = httpx.MockTransport(_httpx_handler)
     return httpx.AsyncClient(*args, **kwargs)
 
-gw_app.httpx.AsyncClient = _mock_async_client
+# ────────────────────────── unified stub ─────────────────────────── #
+# Activate the in-memory Memory-API stub _before_ the Gateway spins up
+# any AsyncClient pools, and keep it alive for the lifetime of the test
+# module.  ExitStack guarantees deterministic teardown when PyTest
+# reloads modules (e.g. `--lf`, xdist, etc.).
+_httpx_patch = patch_httpx(anchor_id=DECISION, event_id=EVENT)
+ExitStack().enter_context(_httpx_patch)
+
+# Don’t hit MinIO in unit-tests
+gw_app._minio_put_batch = lambda *_a, **_kw: None
 
 
 # --------------------------------------------------------------------------- #
@@ -88,11 +108,18 @@ def test_backlink_derivation_contract():
 
     payload = resp.json()
     anchor  = payload["evidence"]["anchor"]
-    events = payload["evidence"]["events"]
+    events  = payload["evidence"]["events"]
+
+    # Fail fast if the Gateway mis-parses the Memory-API response shape
+    assert "neighbors" in httpx._memory_api_handler(httpx.Request("POST","/api/graph/expand_candidates")).json(), \
+        "Stub not exercising v2 neighbour contract – test invalid"
+
+    if not events:
+        print("DEBUG-EVIDENCE:", json.dumps(payload["evidence"], indent=2))
     # Fail fast if normalisation ever regresses again.
     assert events, (
         "Gateway EvidenceBuilder produced 0 events – "
-        "probable mismatch with Memory-API neighbour contract."
+        "probable mismatch with Memory-API neighbour contract or Memory-API stub not active – check patch_httpx usage"
     )
     # ① supported_by → event present
     assert EVENT in anchor.get("supported_by", []), (

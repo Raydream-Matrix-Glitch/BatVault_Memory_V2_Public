@@ -6,6 +6,7 @@ import os
 import re
 import time
 from typing import Callable, Dict
+from fastapi import HTTPException 
 
 import httpx
 from fastapi import FastAPI, Request
@@ -17,6 +18,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from contextlib import asynccontextmanager
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from api_edge.rate_limit import RateLimitMiddleware
@@ -42,7 +44,22 @@ settings: Settings = get_settings()
 logger = get_logger("api_edge")
 logger.propagate = True
 
-app = FastAPI(title="BatVault API Edge", version="0.2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Prime Prometheus metric families before the first /metrics scrape
+    and provide a single hook for future startup/shutdown tasks.
+    """
+    core_metrics.gauge("api_edge_ttfb_seconds", 0.0)
+    core_metrics.counter("api_edge_fallback_total", 0)
+    yield            # ─ app is running ─
+    # (optional) graceful-shutdown logic goes here
+
+app = FastAPI(
+    title="BatVault API Edge",
+    version="0.2.0",
+    lifespan=lifespan,
+)
 
 # ────────────────────────────────────────────────────────────────────────────
 # 3. Production-grade middlewares
@@ -132,6 +149,7 @@ async def req_logger(request: Request, call_next):  # noqa: D401
         dt_ms = (time.perf_counter() - t0) * 1000.0
 
         core_metrics.histogram("ttfb_seconds", dt_ms / 1000.0)
+        core_metrics.gauge("api_edge_ttfb_seconds", dt_ms / 1000.0)
         core_metrics.counter(
             "api_edge_http_requests_total",
             1,
@@ -227,10 +245,14 @@ if settings.environment in {"dev", "test"}:
 # ────────────────────────────────────────────────────────────────────────────
 # Startup metric priming (names must exist before first scrape)
 # ────────────────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-def _prime_metrics() -> None:  # noqa: D401
-    try:
-        core_metrics.gauge("api_edge_ttfb_seconds", 0.0)
-        core_metrics.counter("api_edge_fallback_total", 0)
-    except Exception:
-        pass
+
+@app.get("/healthz", include_in_schema=False)
+def healthz() -> dict:                # liveness probe
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz() -> dict:           # readiness probe
+    if await check_gateway_ready():
+        return {"status": "ready"}
+    raise HTTPException(status_code=503, detail="dependencies not ready")

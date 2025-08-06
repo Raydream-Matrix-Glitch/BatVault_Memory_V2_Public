@@ -32,6 +32,7 @@ def derive_links(decisions: Dict[str, dict],
                               fixup_id=_fixup_id(eid, "supported_by", did))
                 dec["supported_by"] = _dedup_sorted(list(after))
 
+
     # transitions listed in both decisions
     for tid, tr in transitions.items():
         fr, to = tr.get("from"), tr.get("to")

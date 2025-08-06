@@ -1,5 +1,3 @@
-# File: services/gateway/tests/test_llm_invalid_json_fallback.py
-
 import pytest
 import gateway.app as gw_app
 from gateway.app import app
@@ -21,18 +19,13 @@ class _DummyResp:
         return self._json
 
 def _dummy_get(url, **kw):
-    # Minimal decision envelope fixture
-    return _DummyResp({
-        "id": "panasonic-exit-plasma-2012",
-        "supported_by": [],
-        "based_on": [],
-        "transitions": [],
-    })
+    """Stub for gateway.app.httpx.get: return only the anchor decision envelope."""
+    return _DummyResp({"id": "panasonic-exit-plasma-2012"})
 
 def _dummy_post(url, json=None, **kw):
-    # k=1 neighbours – empty to keep bundle tiny
+    """Stub for gateway.app.httpx.post: k=1 neighbours – empty to keep bundle tiny."""
     return _DummyResp({
-        "neighbors": {"events": [], "transitions": []},
+        "neighbors": [],
         "meta": {"snapshot_etag": ""},
     })
 
@@ -40,7 +33,7 @@ def _dummy_post(url, json=None, **kw):
 gw_app.httpx.get = _dummy_get
 gw_app.httpx.post = _dummy_post
 gw_app.httpx.AsyncClient = lambda *a, **kw: httpx.AsyncClient(
-    transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    transport=httpx.MockTransport(lambda req: httpx.Response(200, json={}))
 )
 
 # ────────────────────────────────────────────────────────────────
