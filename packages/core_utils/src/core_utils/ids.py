@@ -46,3 +46,12 @@ def generate_request_id(
     if path:
         return compute_request_id(path, query, body)
     return uuid.uuid4().hex[:16]
+
+def is_slug(s: str) -> bool:
+    """
+    Return True if *s* is already a canonical slug (spec §B-2).
+    Forward-compatible with Milestone 4 by centralizing slug semantics.
+    """
+    if not s:
+        return False
+    return bool(_SLUG_OK.match(s.strip()))

@@ -32,9 +32,17 @@ def _dummy_post(url, json=None, **kw):
 # Patch sync + async httpx used inside gateway.app
 gw_app.httpx.get = _dummy_get
 gw_app.httpx.post = _dummy_post
-gw_app.httpx.AsyncClient = lambda *a, **kw: httpx.AsyncClient(
-    transport=httpx.MockTransport(lambda req: httpx.Response(200, json={}))
-)
+# Preserve kwargs such as ``base_url`` while forcing an in-memory transport
+_orig_async_client = httpx.AsyncClient
+
+def _mock_async_client(*args, **kwargs):
+    kwargs.setdefault(
+        "transport",
+        httpx.MockTransport(lambda _req: httpx.Response(200, json={})),
+    )
+    return _orig_async_client(*args, **kwargs)
+
+gw_app.httpx.AsyncClient = _mock_async_client
 
 # ────────────────────────────────────────────────────────────────
 # The actual test

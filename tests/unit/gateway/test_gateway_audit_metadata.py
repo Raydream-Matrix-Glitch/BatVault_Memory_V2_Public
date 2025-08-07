@@ -28,9 +28,22 @@ gw_app.httpx.post = lambda *a, **k: _DummyResp({
     "neighbors": [],
     "meta": {"snapshot_etag": "test-etag"},
 })
-gw_app.httpx.AsyncClient = lambda *a, **kw: httpx.AsyncClient(
-    transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
-)
+# keep a reference to the genuine class *before* we patch the module object
+_orig_async_client = httpx.AsyncClient
+
+def _dummy_async_client(*args, **kwargs):
+    """
+    Drop-in replacement that preserves *all* original parameters
+    (e.g. ``base_url``, ``timeout``) **and** injects an in-memory transport so
+    no real network traffic occurs.
+    """
+    kwargs.setdefault(
+        "transport",
+        httpx.MockTransport(lambda _req: httpx.Response(200, json={})),
+    )
+    return _orig_async_client(*args, **kwargs)
+
+gw_app.httpx.AsyncClient = _dummy_async_client
 
 # ────────────────────────────────────────────────────────────────
 # MinIO stub – captures artefacts in-memory

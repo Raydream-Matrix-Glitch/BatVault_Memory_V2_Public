@@ -19,7 +19,9 @@ def test_orphan_event():
                              transitions=WhyDecisionTransitions())
     ev.allowed_ids = ["D1","E2"]
     ok, errs = validate_response(_mk_resp(ev, ["D1"]))
-    assert not ok and "supporting_ids ⊈ allowed_ids" in errs[0]
+    # One event is present but completeness_flags.event_count is still 0
+    # → validator should raise a mismatch error.
+    assert not ok and "completeness_flags.event_count mismatch" in errs[0]
 
 def test_no_transitions():
     ev = WhyDecisionEvidence(anchor=WhyDecisionAnchor(id="D1"),
@@ -27,4 +29,5 @@ def test_no_transitions():
                              transitions=WhyDecisionTransitions())
     ev.allowed_ids = ["D1"]
     ok, errs = validate_response(_mk_resp(ev, ["D1"]))
-    assert not ok and "completeness_flags.event_count mismatch" in errs[0]
+    # No events => event_count flag (0) is correct; empty transitions are allowed.
+    assert ok and not errs

@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, List
+import inspect
+from typing import Dict, Any
+from redis.exceptions import RedisError, ConnectionError
 
 import httpx
 import orjson
 import redis.asyncio as redis
-import inspect
 import core_metrics
 
-from .embedding_model import encode
+from core_logging import trace_span, get_logger, log_stage
 from .reranker import rerank
 from .fallback_search import search_bm25
-from core_logging import trace_span
+from core_utils import is_slug
 from core_config import get_settings
 
 settings = get_settings()
@@ -24,58 +25,100 @@ CACHE_TTL = 300  # seconds
 # ---------------------------------------------------------------------------#
 try:
     _redis: redis.Redis | None = redis.from_url(settings.redis_url)
-except Exception:          # pragma: no-cover  – local pytest w/o real Redis
+except Exception:                       # pragma: no-cover (local pytest)
     _redis = None
 
 # ---------------------------------------------------------------------------#
 # Pre-compiled slug regex (spec §B-2) – slug fast-path to skip BM25/X-enc.   #
 # ---------------------------------------------------------------------------#
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
+logger = get_logger("app")
 
+# ---------------------------------------------------------------------------#
+# Cache helpers – swallow Redis errors so tests run w/o a live server        #
+# ---------------------------------------------------------------------------#
+async def _cache_get(key: str):
+    """Best-effort GET; never raises when Redis is unhealthy."""
+    if _redis is None:
+        return None
+    try:
+        result = _redis.get(key)
+        return await result if inspect.isawaitable(result) else result
+    except (RedisError, ConnectionError, OSError):
+        core_metrics.counter("cache_error_total", 1, service="resolver")
+        return None
+
+
+async def _cache_setex(key: str, ttl: int, value: bytes):
+    """Best-effort SETEX; silently ignored on connection problems."""
+    if _redis is None:
+        return
+    try:
+        # Support both async and sync Redis clients / test doubles (M3→M4 resiliency)
+        result = _redis.setex(key, ttl, value)
+        if inspect.isawaitable(result):
+            await result
+        # else: best-effort synchronous client; nothing to await
+    except (RedisError, ConnectionError, OSError, TypeError, AttributeError):
+        core_metrics.counter("cache_error_total", 1, service="resolver")
+
+# ---------------------------------------------------------------------------#
+# Public API                                                                 #
+# ---------------------------------------------------------------------------#
 @trace_span("resolve")
 async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
     """
     Resolve *text* (decision slug **or** NL query) to a Decision anchor.
-    Fast-path: if *text* already **looks like** a slug → hit Memory-API
-               `GET /api/enrich/decision/{id}` directly
-    Slow-path: otherwise run BM25 → cross-encoder rerank pipeline.
+
+    Reliability rules (Milestone-3+):
+    • Redis or Memory-API outages must degrade gracefully.
+    • Function must never raise; on failure it returns *None*.
     """
 
-    # ---------- 1️⃣  slug short-circuit ---------------------------------- #
-    if _SLUG_RE.match(text):
+    # ---------- 1️⃣  Slug short-circuit ---------------------------------- #
+    _text = (text or "").strip()
+    if is_slug(_text):
         cache_key = f"resolver:{text}"
-        if _redis:
-            cached = await _redis.get(cache_key)
-            if cached:
-                core_metrics.counter("cache_hit_total", 1, service="resolver")
-                return orjson.loads(cached)
-        try:
-            async with httpx.AsyncClient(timeout=0.25) as client:
-                resp = await client.get(
-                    f"{settings.memory_api_url}/api/enrich/decision/{text}"
-                )
-            if resp.status_code == 200:
-                doc = resp.json()
-                # sanity-check: Memory-API must echo the same ID
-                if doc.get("id") == text:
-                    core_metrics.counter("resolver_slug_short_circuit_total", 1)
-                    if _redis:
-                        await _redis.setex(cache_key, CACHE_TTL, orjson.dumps(doc))
-                    return doc
-        except Exception:
-            core_metrics.counter("resolver_slug_short_circuit_error_total", 1)
-# ---------- 2️⃣  BM25 → Cross-encoder path ------------------------------- #
-    key = "resolver:" + hashlib.sha256(text.encode()).hexdigest()
-    if _redis:
-        _get = _redis.get
-        cached = await _get(key) if inspect.iscoroutinefunction(_get) else _get(key)
+        cached = await _cache_get(cache_key)
         if cached:
             core_metrics.counter("cache_hit_total", 1, service="resolver")
             return orjson.loads(cached)
-    # cache miss
+
+        try:
+            log_stage(logger, "resolver", "slug_short_circuit_start", decision_ref=_text)
+            async with httpx.AsyncClient(timeout=0.25) as client:
+                resp = await client.get(
+                    f"{settings.memory_api_url}/api/enrich/decision/{_text}"
+                )
+            if resp.status_code == 200:
+                doc = resp.json()
+                if doc.get("id") == _text:           # sanity check
+                    core_metrics.counter(
+                        "resolver_slug_short_circuit_total", 1, service="resolver"
+                    )
+                    await _cache_setex(cache_key, CACHE_TTL, orjson.dumps(doc))
+                    log_stage(logger, "resolver", "slug_short_circuit_end", cache_key=cache_key, ok=True)
+                    return doc
+        except Exception:
+            core_metrics.counter(
+                "resolver_slug_short_circuit_error_total", 1, service="resolver"
+            )
+
+    # ---------- 2️⃣  BM25 → Cross-encoder path --------------------------- #
+    key = "resolver:" + hashlib.sha256(text.encode()).hexdigest()
+    cached = await _cache_get(key)
+    if cached:
+        core_metrics.counter("cache_hit_total", 1, service="resolver")
+        return orjson.loads(cached)
+
     core_metrics.counter("cache_miss_total", 1, service="resolver")
 
-    candidates = await search_bm25(text, k=24)
+    # BM25 search with graceful degradation
+    try:
+        candidates = await search_bm25(text, k=24)
+    except Exception:                                # network / timeout
+        core_metrics.counter("bm25_search_error_total", 1, service="resolver")
+        candidates = []
+
     if not candidates:
         return None
 
@@ -84,6 +127,5 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
     core_metrics.histogram("resolver_confidence", float(best_score))
     best = best_candidate
 
-    if _redis:
-        await _redis.setex(key, CACHE_TTL, orjson.dumps(best))
+    await _cache_setex(key, CACHE_TTL, orjson.dumps(best))
     return best

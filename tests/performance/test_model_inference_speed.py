@@ -1,53 +1,100 @@
+# tests/performance/test_model_inference_speed.py
 """
-Micro-benchmarks for resolver (≤5 ms) & selector (≤2 ms) per call.
+Performance smoke-tests (non-legacy).
 
-The tests are resilient to refactors:
- ▸ They look for an obvious callable attribute.
- ▸ They skip but do not fail when the module cannot be imported
-   (e.g. model swapped out of tree); CI will surface the skip.
+• **Resolver**: `gateway.resolver.resolve_decision_text` must respond in ≤ 5 ms.
+• **Selector**: `gateway.selector.truncate_evidence` must respond in ≤ 2 ms.
+
+The helper automatically handles sync/async callables.
+Latency budgets can be overridden via `services.config.performance`.
 """
-import importlib, inspect, time, pytest, statistics
+from __future__ import annotations
 
-# -------- utilities ----------------------------------------------------------
-def _best_callable(mod, candidates):
-    for name in candidates:
-        if hasattr(mod, name) and callable(getattr(mod, name)):
-            fn = getattr(mod, name)
-            # unwrap @lru_cache etc.
+import asyncio
+import importlib
+import importlib.util
+import inspect
+import time
+import pytest
+
+# ────────────────────────── performance budgets ─────────────────────────── #
+
+try:
+    perf_cfg = importlib.import_module("services.config.performance")
+    RESOLVER_BUDGET_MS: float = getattr(perf_cfg, "RESOLVER_INFERENCE_MS", 5.0)
+    SELECTOR_BUDGET_MS: float = getattr(perf_cfg, "SELECTOR_INFERENCE_MS", 2.0)
+except ModuleNotFoundError:
+    RESOLVER_BUDGET_MS, SELECTOR_BUDGET_MS = 5.0, 2.0
+
+# ─────────────────────────────── helpers ────────────────────────────────── #
+
+
+def _find_callable(module, names: list[str]):
+    """Return the first attribute in *module* whose name matches one in *names*."""
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
             return inspect.unwrap(fn)
     return None
 
-def _avg_ms(fn, *args, runs=200, **kwargs):
-    t0 = time.perf_counter()
+
+def _avg_latency_ms(fn, *args, runs: int | None = None, **kwargs) -> float:
+    """Average runtime of *fn* in **milliseconds** across *runs* invocations."""
+    if inspect.iscoroutinefunction(fn):
+        runs = runs or 50  # amortise event-loop start-up
+        async def _bench():
+            start = time.perf_counter()
+            for _ in range(runs):
+                await fn(*args, **kwargs)
+            return (time.perf_counter() - start) * 1_000 / runs
+        return asyncio.run(_bench())
+
+    runs = runs or 200
+    start = time.perf_counter()
     for _ in range(runs):
         fn(*args, **kwargs)
-    return (time.perf_counter() - t0) * 1_000 / runs
+    return (time.perf_counter() - start) * 1_000 / runs
 
-# -------- resolver -----------------------------------------------------------
+# ────────────────────────────── resolver ────────────────────────────────── #
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("gateway.resolver") is None,
-    reason="resolver package not present")
+    reason="gateway.resolver package not present",
+)
 def test_resolver_avg_latency():
     mod = importlib.import_module("gateway.resolver")
-    fn  = _best_callable(mod, ["resolve_anchor",
-                               "resolve_text",
-                               "embed_text",
-                               "encode"])
+    fn = _find_callable(mod, ["resolve_decision_text"])
     if fn is None:
-        pytest.skip("no resolver callable found")
-    avg = _avg_ms(fn, "dummy text")
-    assert avg <= 5, f"Resolver avg {avg:.3f} ms > 5 ms budget"
+        pytest.skip("resolver callable 'resolve_decision_text' not found")
 
-# -------- selector -----------------------------------------------------------
+    avg = _avg_latency_ms(fn, "Why did Panasonic exit plasma?")
+    assert avg <= RESOLVER_BUDGET_MS, (
+        f"Resolver avg {avg:.3f} ms > {RESOLVER_BUDGET_MS} ms budget"
+    )
+
+# ────────────────────────────── selector ────────────────────────────────── #
+
+
 @pytest.mark.skipif(
     importlib.util.find_spec("gateway.selector") is None,
-    reason="selector module not present")
+    reason="gateway.selector module not present",
+)
 def test_selector_avg_latency():
-    selector = importlib.import_module("gateway.selector")
-    fn = _best_callable(selector, ["score_evidence", "rank", "select"])
+    selector_mod = importlib.import_module("gateway.selector")
+    fn = _find_callable(selector_mod, ["truncate_evidence"])
     if fn is None:
-        pytest.skip("no selector callable found")
+        pytest.skip("selector callable 'truncate_evidence' not found")
 
-    dummy_ev = [{"id": f"ev-{i}", "text": "foo"} for i in range(10)]
-    avg = _avg_ms(fn, dummy_ev)
-    assert avg <= 2, f"Selector avg {avg:.3f} ms > 2 ms budget"
+    # Build minimal valid WhyDecisionEvidence instance
+    core_models = importlib.import_module("core_models.models")
+    WhyDecisionAnchor = getattr(core_models, "WhyDecisionAnchor")
+    WhyDecisionEvidence = getattr(core_models, "WhyDecisionEvidence")
+
+    dummy_anchor = WhyDecisionAnchor(id="anchor-1")
+    dummy_evidence = WhyDecisionEvidence(anchor=dummy_anchor)
+
+    avg = _avg_latency_ms(fn, dummy_evidence)
+    assert avg <= SELECTOR_BUDGET_MS, (
+        f"Selector avg {avg:.3f} ms > {SELECTOR_BUDGET_MS} ms budget"
+    )

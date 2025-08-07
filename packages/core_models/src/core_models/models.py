@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import Any, Dict, List, Optional
 import re
 
@@ -9,6 +9,8 @@ class WhyDecisionAnchor(BaseModel):
     rationale: Optional[str] = None
     timestamp: Optional[str] = None
     decision_maker: Optional[str] = None
+    supported_by: Optional[List[str]] = None
+    model_config = ConfigDict(extra='allow')
 
 
 class WhyDecisionTransitions(BaseModel):

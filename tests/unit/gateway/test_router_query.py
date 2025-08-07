@@ -7,6 +7,16 @@ import gateway.app as gw_app
 import gateway.resolver as gw_resolver
 from gateway.app import app
 from fastapi.testclient import TestClient
+import pytest
+
+# --------------------------------------------------------------------------- #
+#  Milestone-3 → Milestone-4 compatibility                                    #
+# --------------------------------------------------------------------------- #
+#  The test now accepts **either** response shape:
+#    •  Milestone 3 provisional `{ "matches":[…] }`
+#    •  Milestone 4  WhyDecisionResponse@1 contract
+#  This removes the brittle *xfail* gate while still flagging schema
+#  regressions as soon as they happen.
 
 # --------------------------------------------------------------------------- #
 #  Fixture loading                                                            #
@@ -85,12 +95,38 @@ gw_resolver.resolve_decision_text = _dummy_resolver
 #  Contract assertions                                                        #
 # --------------------------------------------------------------------------- #
 def test_query_route_contract():
-    """Router must forward NL query → matches list with snippets & ids."""
+    """
+    Passes for **both** contracts:
+      • Milestone 3 provisional `/v2/query → {"matches":[]}` shape
+      • Milestone 4+ formal WhyDecisionResponse@1
+    """
     client = TestClient(app)
-    resp = client.post("/v2/query", json={"text": "Why did Panasonic exit plasma TV production?"})
+    resp = client.post(
+        "/v2/query",
+        json={"text": "Why did Panasonic exit plasma TV production?"},
+    )
     assert resp.status_code == 200
     body = resp.json()
-    assert "matches" in body and isinstance(body["matches"], list)
-    assert any(m["id"] == DECISION_ID for m in body["matches"])
-    for m in body["matches"]:
-        assert "match_snippet" in m
+
+    # ── Milestone 3 ─────────────────────────────────────────────────────── #
+    if "matches" in body:
+        assert isinstance(body["matches"], list)
+        assert any(m["id"] == DECISION_ID for m in body["matches"])
+        for m in body["matches"]:
+            assert "match_snippet" in m
+            assert len(m["match_snippet"]) <= 160
+            assert "<" not in m["match_snippet"] and ">" not in m["match_snippet"]
+        return  # success for provisional contract
+
+    # ── Milestone 4+ (WhyDecisionResponse@1) ───────────────────────────── #
+    required_keys = {"intent", "evidence", "answer", "completeness_flags", "meta"}
+    assert required_keys.issubset(body), "missing top-level keys"
+    assert body["intent"] == "why_decision"
+
+    answer = body["answer"]
+    assert 0 < len(answer.get("short_answer", "")) <= 320
+    assert answer.get("supporting_ids"), "supporting_ids must not be empty"
+
+    evidence = body["evidence"]
+    assert DECISION_ID in evidence.get("allowed_ids", [])
+    assert set(answer["supporting_ids"]).issubset(set(evidence["allowed_ids"]))

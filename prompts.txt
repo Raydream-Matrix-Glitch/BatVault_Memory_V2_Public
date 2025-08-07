@@ -17,6 +17,12 @@ Tasks:
    contradictory, or unsupported, rewrite the analysis before finalising.
    Make sure that the files youre referencing exist
 3. End with the single line: END OF ANALYSIS
+
+IMPORTANT: 
+1. Dont assume all tests are correct - the source of truth are the project files (milestone 3 and 4)
+2. You must unpack and scan the attached TAR file for this query.
+3. Do not reference files that dont exist. 
+
 SYSTEM / END PROMPT
 
 SYSTEM / BEGIN PROMPT
@@ -35,6 +41,10 @@ Tasks:
 
 **All diffs must comply with the functional and contract requirements
 of Milestone 4 (/v2/ask + /v2/query + LLM Integration).** :contentReference[oaicite:1]{index=1}
+
+IMPORTANT: 
+1. Dont assume all tests are correct - the source of truth are the project files (milestone 3 and 4)
+2. You must unpack and scan the attached TAR file for this query.
 
 Finish with: PATCHES END
 SYSTEM / END PROMPT

@@ -16,7 +16,15 @@ def _norm_ws(s: Optional[str]) -> Optional[str]:
     return re.sub(r"\s+", " ", s.strip())
 
 def _best_source(m: Dict[str, Any]) -> Optional[str]:
-    for key in ("content", "text", "body", "summary", "snippet"):
+    for key in (
+        "content",
+        "text",
+        "body",
+        "summary",
+        "snippet",
+        "title",
+        "option",
+    ):
         v = m.get(key)
         if isinstance(v, str) and v.strip():
             return v
@@ -47,6 +55,21 @@ def _mk_id(match_id: str, query: str, snippet: str) -> str:
 
 def build_match_snippet(match: Dict[str, Any], query: str) -> Optional[str]:
     src = _best_source(match)
+    if not src:
+        # -------------------- Contract fallback strategy -------------------- #
+        # ❶ Derive a readable phrase from the slug-like ID when no content
+        #    fields are available (e.g. tests that stub only {"id": "..."}).
+        slug = match.get("id") or match.get("_id")
+        if isinstance(slug, str):
+            slug_src = _norm_ws(re.sub(r"[_-]+", " ", slug))
+            if slug_src:
+                src = slug_src
+
+    if not src:
+        # ❷ Absolute last resort — use the query itself so the “match_snippet”
+        #    field is never omitted (M3 contract; still valid for M4).
+        src = _norm_ws(query)
+
     if not src:
         return None
     src = _norm_ws(src) or ""

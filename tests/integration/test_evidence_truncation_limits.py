@@ -41,4 +41,4 @@ def test_selector_truncates_when_bundle_exceeds_budget():
     assert meta["bundle_size_bytes"] <= selector.MAX_PROMPT_BYTES
     # Confirm selector flagged the truncation & actually removed items
     assert meta["selector_truncation"] is True
-    assert meta["final_evidence_count"] < original_cnt
+    assert 1 <= meta["final_evidence_count"] < original_cnt

@@ -49,13 +49,12 @@ def deterministic_short_answer(*args, **kwargs):  # type: ignore[override]
 def validate_and_fix(answer: WhyDecisionAnswer, allowed_ids: List[str], anchor_id: str
                     ) -> Tuple[WhyDecisionAnswer, bool, List[str]]:
     # treat compact alias (“A1”) as equivalent to long slug for IN-operator checks
-    disp_anchor = _pretty_anchor(anchor_id)
-    allowed = set(allowed_ids) | {disp_anchor}
+    allowed = set(allowed_ids)
     orig_support = list(answer.supporting_ids)
     support = [x for x in orig_support if x in allowed]
     changed = len(support) != len(orig_support)
-    if disp_anchor not in support:          # anchor must be first (alias form)
-        support = [disp_anchor] + [x for x in support if x != disp_anchor]
+    if anchor_id not in support:            # anchor must be first (raw slug)
+        support = [anchor_id] + [x for x in support if x != anchor_id]
         changed = True
     errs: List[str] = []
     if changed:

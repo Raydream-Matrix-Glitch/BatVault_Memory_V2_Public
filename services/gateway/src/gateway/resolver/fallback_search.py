@@ -11,14 +11,9 @@ async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
     payload = {"q": text, "limit": k, "use_vector": False}
     async with httpx.AsyncClient(timeout=0.8) as client:
         with trace_span("gateway.bm25_search", q=text, limit=k):
-            if hasattr(client, "post"):
-                resp = await client.post(
-                    f"{settings.memory_api_url}/api/resolve/text", json=payload
-                )
-            else:
-                resp = await client.request(
-                    "POST", f"{settings.memory_api_url}/api/resolve/text", json=payload
-                )
+            resp = await client.post(
+                f"{settings.memory_api_url}/api/resolve/text", json=payload
+            )
     doc = resp.json()
     log_stage(
         logger,

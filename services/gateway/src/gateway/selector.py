@@ -76,7 +76,11 @@ def _score(item: Dict[str, Any], anchor: WhyDecisionAnchor) -> Tuple[float, floa
 
 
 def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dict[str, Any]]:
-    """Return (possibly) truncated evidence and the selector_meta block."""
+
+    # ── Work on a deep copy so the caller keeps the original ──────────────
+    ev = ev.model_copy(deep=True)
+    _pre_trunc_ids: set[str] = set(_union_ids(ev))          # snapshot
+
     # 1) If under the soft threshold, emit no-truncate meta and exit early.
     raw_size = bundle_size_bytes(ev)
     if raw_size <= SELECTOR_TRUNCATION_THRESHOLD:
@@ -126,7 +130,7 @@ def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dic
             ev.transitions.succeeding.remove(item)
 
     while (
-        bundle_size_bytes(ev) > MAX_PROMPT_BYTES
+        bundle_size_bytes(ev) > SELECTOR_TRUNCATION_THRESHOLD
         and (
             len(ev.events)
             + len(ev.transitions.preceding)
@@ -139,14 +143,41 @@ def truncate_evidence(ev: WhyDecisionEvidence) -> Tuple[WhyDecisionEvidence, Dic
     # emit selector latency histogram (for p95 ≤2ms target)
     core_metrics.histogram("selector_ms", elapsed_ms)
 
+    # ------------------------------------------------------------------ #
+    # 2b) Hard guarantee: never exceed MAX_PROMPT_BYTES (§M4).           #
+    #     First clip long prose fields, then – as an absolute last       #
+    #     resort – keep pruning below MIN_EVIDENCE_ITEMS (anchor only).  #
+    # ------------------------------------------------------------------ #
+
+    def _clip_text(obj: dict | Any) -> None:
+        """Trim very long strings to ≤128 chars with an ellipsis."""
+        for fld in ("summary", "description", "snippet", "rationale", "reason"):
+            if isinstance(obj, dict):
+                if fld in obj and isinstance(obj[fld], str) and len(obj[fld]) > 128:
+                    obj[fld] = obj[fld][:125] + "…"
+            else:  # Pydantic model / attr object
+                if hasattr(obj, fld):
+                    val = getattr(obj, fld)
+                    if isinstance(val, str) and len(val) > 128:
+                        setattr(obj, fld, val[:125] + "…")
+
+    if bundle_size_bytes(ev) > MAX_PROMPT_BYTES:
+        _clip_text(ev.anchor)
+        for _e in ev.events:
+            _clip_text(_e)
+        for _t in ev.transitions.preceding + ev.transitions.succeeding:
+            _clip_text(_t)
+
+    while bundle_size_bytes(ev) > MAX_PROMPT_BYTES and len(ev.events) > 0:
+        _drop(*candidates.pop())
+
     # 3) Build metadata
-    original_ids: set[str] = set(ev.allowed_ids)      # snapshot *before* truncation
-    kept_ids:     set[str] = set(_union_ids(ev))      # after truncation
-    dropped:      list[str] = sorted(original_ids - kept_ids)
+    kept_ids: set[str] = set(_union_ids(ev))            # after *all* pruning
+    dropped:  list[str] = sorted(_pre_trunc_ids - kept_ids)
     ev.allowed_ids = sorted(kept_ids)
 
     # neighbours considered *before* truncation (anchor excluded)
-    neighbor_count = max(len(original_ids) - 1, 0)
+    neighbor_count = max(len(_pre_trunc_ids) - 1, 0)
 
     # final bundle size after pruning
     final_size = bundle_size_bytes(ev)

@@ -38,22 +38,18 @@ def validate_response(resp: WhyDecisionResponse) -> Tuple[bool, List[str]]:
 
     # fingerprint fields become mandatory in milestone-4 – tolerate absence now
 
+    anchor_id = resp.evidence.anchor.id
+    support = set(resp.answer.supporting_ids)
+    if anchor_id not in support:
+        errs.append("anchor.id missing")
+
     # supporting_ids ⊆ allowed_ids
     allowed = set(resp.evidence.allowed_ids)
-    allowed.add(_pretty_anchor(resp.evidence.anchor.id))
-    support = set(resp.answer.supporting_ids)
     if not support.issubset(allowed):
         errs.append("supporting_ids ⊈ allowed_ids")
 
-    # 1. Anchor citation (most user-actionable)
-    anchor_id   = resp.evidence.anchor.id
-    anchor_short = _pretty_anchor(anchor_id)
-    support      = set(resp.answer.supporting_ids)
-    if anchor_id not in support and anchor_short not in support:
-        errs.append("anchor.id missing")
-
     # 2. supporting_ids ⊆ allowed_ids
-    allowed = set(resp.evidence.allowed_ids) | {anchor_short}
+    allowed = set(resp.evidence.allowed_ids)
     if not support.issubset(allowed):
         errs.append("supporting_ids ⊈ allowed_ids")
 

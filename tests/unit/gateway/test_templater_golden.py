@@ -53,14 +53,14 @@ def test_validate_and_fix_no_change():
     If supporting_ids are already a subset of allowed and include the anchor,
     validate_and_fix must leave them unchanged.
     """
-    original = WhyDecisionAnswer(short_answer="x", supporting_ids=["A1", "B1"])
+    original = WhyDecisionAnswer(short_answer="x", supporting_ids=[ANCHOR_ID, "B1"])
     anchor = ANCHOR_ID
     allowed = [ANCHOR_ID, "B1"]
     fixed, changed, errors = validate_and_fix(original, allowed, anchor)
 
     assert not changed
     assert errors == []
-    assert fixed.supporting_ids == ["A1", "B1"]
+    assert fixed.supporting_ids == [ANCHOR_ID, "B1"]
 
 
 def test_validate_and_fix_remove_and_add_anchor():
@@ -80,4 +80,4 @@ def test_validate_and_fix_remove_and_add_anchor():
         for e in errors
     )
     # Anchor first, then any other allowed IDs
-    assert fixed.supporting_ids == ["A1", "Y1"]
+    assert fixed.supporting_ids == [ANCHOR_ID, "Y1"]

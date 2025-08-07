@@ -26,8 +26,17 @@ gw_app.httpx.get  = lambda *a, **k: _DummyResp(
 gw_app.httpx.post = lambda *a, **k: _DummyResp(
     {"neighbors": [], "meta": {"snapshot_etag": "test-etag"}}
 )
-gw_app.httpx.AsyncClient = lambda *a, **kw: httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+# safeguard against self-calling lambda
+_orig_async_client = httpx.AsyncClient
 
+def _mock_async_client(*args, **kwargs):
+    kwargs.setdefault(
+        "transport",
+        httpx.MockTransport(lambda _req: httpx.Response(200, json={})),
+    )
+    return _orig_async_client(*args, **kwargs)
+
+gw_app.httpx.AsyncClient = _mock_async_client
 # ──────────────────────────────────────────────
 # MinIO stub  (captures artefact writes in-memory)
 # ──────────────────────────────────────────────

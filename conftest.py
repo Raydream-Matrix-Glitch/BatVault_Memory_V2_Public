@@ -11,7 +11,16 @@ Responsibilities
 """
 
 from pathlib import Path
-import sys
+import os, sys
+
+# ── Environment glue ────────────────────────────────────────────────────
+# The autouse Memory-API plugin chooses a random free port and exports it
+# via MEMORY_API_TEST_PORT.  Down-stream services (the Gateway) discover the
+# Memory-API through the canonical MEMORY_API_URL, so we mirror the port
+# *before* those services are imported.
+_mem_port = os.getenv("MEMORY_API_TEST_PORT")
+if _mem_port:
+    os.environ.setdefault("MEMORY_API_URL", f"http://memory_api:{_mem_port}")
 
 # ── 1 · add all source roots to PYTHONPATH ─────────────────────────────────
 ROOT = Path(__file__).parent.resolve()
@@ -70,3 +79,49 @@ def test_client_gateway():
     from services.gateway.src.gateway.app import app as gw_app
     with TestClient(gw_app) as client:
         yield client
+
+# ── Real HTTP base-URL for performance tests ────────────────────────────
+@pytest.fixture(scope="session")
+def gw_url(unused_tcp_port_factory):
+    """
+    Provide a *real* Gateway URL.
+
+    • Honour GW_URL / GATEWAY_BASE_URL when they’re set.  
+    • Otherwise start Uvicorn in-process on a free port.
+    """
+    import threading, socket, time, uvicorn
+
+    explicit = (os.getenv("GW_URL") or os.getenv("GATEWAY_BASE_URL") or "").rstrip("/")
+    if explicit:
+        yield explicit
+        return
+
+    # Ensure Gateway sees the live Memory-API port
+    mem_port = os.getenv("MEMORY_API_TEST_PORT", "8000")
+    os.environ.setdefault("MEMORY_API_URL", f"http://memory_api:{mem_port}")
+
+    # Spin up Gateway server
+    from services.gateway.src.gateway.app import app as gw_app
+
+    host = "127.0.0.1"
+    port = unused_tcp_port_factory()
+    cfg  = uvicorn.Config(gw_app, host=host, port=port, log_level="warning", lifespan="on")
+    server = uvicorn.Server(cfg)
+
+    th = threading.Thread(target=server.run, daemon=True, name="gateway-uvicorn")
+    th.start()
+
+    # Wait (≤3 s) until the socket accepts connections
+    for _ in range(30):
+        with socket.socket() as s:
+            if s.connect_ex((host, port)) == 0:
+                break
+            time.sleep(0.1)
+    else:
+        raise RuntimeError("Gateway server failed to start")
+
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        server.should_exit = True
+        th.join(timeout=5)

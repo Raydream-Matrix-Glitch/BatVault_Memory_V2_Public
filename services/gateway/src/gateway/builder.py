@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time, uuid
 from typing import Any, Mapping
+from core_logging import trace_span
 
 import orjson
 from pydantic import BaseModel
@@ -79,6 +80,10 @@ async def build_why_decision_response(
     ev, sel_meta = truncate_evidence(ev)
     arte["evidence_post.json"] = orjson.dumps(ev.model_dump(mode="python"))
 
+    # ── deterministic plan stub (needed for audit contract) ────────────
+    plan_dict = {"anchor": ev.anchor.id, "k": 1}
+    arte["plan.json"] = orjson.dumps(plan_dict)
+
     ev.allowed_ids = _allowed_ids(ev)
 
     # ── answer (templater + validator) ─────────────────────────
@@ -86,11 +91,11 @@ async def build_why_decision_response(
         short_answer=deterministic_short_answer(ev),
         supporting_ids=[ev.allowed_ids[0]] if ev.allowed_ids else [],
     )
-    ans, changed, errs = templater.validate_and_fix(
-        ans,
-        ev.allowed_ids,
-        ev.anchor.id,
-    )
+    # ── validate ────────────────────────────────────────────────
+    with trace_span.ctx("validate", anchor_id=ev.anchor.id):
+        ans, changed, errs = templater.validate_and_fix(
+            ans, ev.allowed_ids, ev.anchor.id,
+        )
 
     # ── completeness flags ─────────────────────────────────────
     flags = CompletenessFlags(

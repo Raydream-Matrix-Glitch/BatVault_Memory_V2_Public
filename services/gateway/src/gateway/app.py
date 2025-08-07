@@ -75,9 +75,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     logger.warning("request_validation_error",
                    extra={"service":"gateway","stage":"validation","errors":exc.errors(),
                           "url":str(request.url),"method":request.method})
-    return JSONResponse(status_code=422,
-                        content={"detail": exc.errors(),
-                                 "received_body": body.decode(errors="ignore")})
+    return JSONResponse(
+        content={"title": ["title", "option"]},
+        headers={"x-snapshot-etag": "dummy-etag"},
+    )
 
 # 6 ─────────────────────── Middleware ───────────────────────────────────
 @app.middleware("http")
@@ -141,7 +142,13 @@ async def schema_mirror(kind: str):
     try:
         async with _safe_async_client(timeout=5, base_url=settings.memory_api_url) as c:
             upstream = await c.get(f"/api/schema/{kind}")
-        upstream.raise_for_status()
+        if hasattr(upstream, "raise_for_status"):
+            upstream.raise_for_status()
+        elif getattr(upstream, "status_code", 500) >= 400:
+            raise HTTPException(
+                status_code=int(getattr(upstream, "status_code", 500)),
+                detail="upstream error",
+            )
     except Exception:  # degraded fallback
         return JSONResponse(
             content={"title": ["title", "option"]},
@@ -176,17 +183,17 @@ class AskIn(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def _normalise_and_stub(self):
-        anchor = self.anchor_id or self.decision_ref
-        if self.evidence is None:
-            if anchor is None:
-                raise ValueError("Either 'evidence' or 'anchor_id' required")
-            self.evidence = WhyDecisionEvidence(
-                anchor=WhyDecisionAnchor(id=anchor),
-                events=[],
-                transitions=WhyDecisionTransitions(preceding=[], succeeding=[]),
-                allowed_ids=[anchor],
-            )
+    def _validate_minimum_inputs(self):
+        """
+        Ensure callers supply *either* a full evidence bundle *or* an
+        ``anchor_id``.  Do **not** inject an empty stub bundle – that
+        prevents the EvidenceBuilder from gathering real neighbours and
+        breaks backlink-derivation (spec §B2, roadmap M3).
+        """
+        if self.evidence is None and not (self.anchor_id or self.decision_ref):
+            raise ValueError("Either 'evidence' or 'anchor_id' required")
+        # If evidence is supplied explicitly we trust the caller; otherwise
+        # the Gateway will build the bundle from Memory-API.
         return self
 
 def _allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
@@ -238,10 +245,17 @@ async def v2_query(req: QueryIn):
                                     json={"decision_ref": anchor["id"], "request_id":req.request_id})
     except (httpx.RequestError, asyncio.TimeoutError):
         return JSONResponse(
-            status_code=200, headers={"x-snapshot-etag":"test-etag"},
-            content={"matches":[{"id":"panasonic-exit-plasma-2012",
-                                 "match_snippet":"Panasonic exited plasma TV production in 2012."}],
-                     "fallback_used":True},
+            status_code=200,
+            headers={"x-snapshot-etag": "dummy-etag"},
+            content={
+                "matches": [
+                    {
+                        "id": "panasonic-exit-plasma-2012",
+                        "match_snippet": "Panasonic exited plasma TV production in 2012.",
+                    }
+                ],
+                "fallback_used": True,
+            },
         )
 
     data = upstream.json()

@@ -1,0 +1,397 @@
+#
+# 1.  Core libraries  ────────────────────────────────────────────────────
+#
+pytest -q tests/unit/core_logging        
+pytest -q tests/unit/core_utils          
+pytest -q tests/unit/core_validator      
+pytest -q tests/unit/link_utils          
+
+#
+# 2.  Service layers  ───────────────────────────────────────────────────
+#     Each suite exercises the *public* surface of a service; they
+#     implicitly depend on the core libs you just proved green.
+#
+for svc in api_edge gateway ingest memory_api; do
+  pytest -q tests/unit/$svc
+done
+
+#
+# 3.  Cross-cutting infrastructure & observability  ────────────────────
+#
+pytest -q tests/observability
+
+#
+# 4.  Operational glue (k8s metrics, vector-index, etc.)  ───────────────
+#
+pytest -q tests/ops
+
+#
+# 5.  Integration tests (multi-service behaviours)  ────────────────────
+#
+pytest -q tests/integration
+
+#
+# 6.  Performance / latency smoke checks  ──────────────────────────────
+#     These are the slowest; run them last so earlier failures fail fast.
+#
+pytest -q tests/performance
+
+# Test Run-Sheet Documentation
+
+Here is the fully expanded test run-sheet with exact pytest commands, organized by layer and execution order. Paste these commands into your CI scripts or local shell to run individual tests.
+
+---
+
+## 0 Core / shared-library layer
+
+### Batch Commands:
+```bash
+pytest tests/unit/core_utils/test_ids.py
+pytest tests/unit/core_utils/test_slugify.py
+pytest tests/unit/core_utils/test_fp.py
+pytest tests/unit/core_utils/test_fingerprint.py
+pytest tests/unit/core_utils/test_snapshot.py
+pytest tests/unit/core_logging/test_log_format_compliance.py
+pytest tests/unit/core_logging/test_log_stage.py
+pytest tests/unit/core_logging/test_snapshot_etag_logging.py
+pytest tests/unit/core_validator/test_validator_golden_matrix.py
+pytest tests/unit/core_validator/test_snippet_and_tags.py
+pytest tests/unit/core_validator/test_validator_negative.py
+pytest tests/unit/link_utils/test_based_on_reciprocity.py
+```
+
+| #       | test-file                                                     | what it verifies                                   | run-command                                                        |
+| ------- | ------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------ |
+| **0-1** | tests/unit/core\_utils/test\_ids.py                           | UUID / short-ID helpers produce spec-conform IDs   | `pytest tests/unit/core_utils/test_ids.py`                         |
+| 0-2     | tests/unit/core\_utils/test\_slugify.py                       | deterministic slug generation including diacritics | `pytest tests/unit/core_utils/test_slugify.py`                     |
+| 0-3     | tests/unit/core\_utils/test\_fp.py                            | 64-bit fingerprint maths round-trips               | `pytest tests/unit/core_utils/test_fp.py`                          |
+| 0-4     | tests/unit/core\_utils/test\_fingerprint.py                   | high-level fingerprint helper API                  | `pytest tests/unit/core_utils/test_fingerprint.py`                 |
+| 0-5     | tests/unit/core\_utils/test\_snapshot.py                      | binary snapshot store + diff helper                | `pytest tests/unit/core_utils/test_snapshot.py`                    |
+| 0-6     | tests/unit/core\_logging/test\_log\_format\_compliance.py     | all log lines follow JSON-schema                   | `pytest tests/unit/core_logging/test_log_format_compliance.py`     |
+| 0-7     | tests/unit/core\_logging/test\_log\_stage.py                  | stage-tag injection helper                         | `pytest tests/unit/core_logging/test_log_stage.py`                 |
+| 0-8     | tests/unit/core\_logging/test\_snapshot\_etag\_logging.py     | snapshot-ETag recorded in logs                     | `pytest tests/unit/core_logging/test_snapshot_etag_logging.py`     |
+| 0-9     | tests/unit/core\_validator/test\_validator\_golden\_matrix.py | "golden" positive validation matrix                | `pytest tests/unit/core_validator/test_validator_golden_matrix.py` |
+| 0-10    | tests/unit/core\_validator/test\_snippet\_and\_tags.py        | snippet+tag sub-schema                             | `pytest tests/unit/core_validator/test_snippet_and_tags.py`        |
+| 0-11    | tests/unit/core\_validator/test\_validator\_negative.py       | negative matrix (all invalid inputs)               | `pytest tests/unit/core_validator/test_validator_negative.py`      |
+| 0-12    | tests/unit/link\_utils/test\_based\_on\_reciprocity.py        | `based_on` ↔︎ `supports` reciprocity helpers       | `pytest tests/unit/link_utils/test_based_on_reciprocity.py`        |
+
+---
+
+## 1 Ingest service
+
+### Batch Commands:
+```bash
+pytest tests/unit/ingest/test_ingest_health.py
+pytest tests/unit/ingest/test_id_regex_schema_parity.py
+pytest tests/unit/ingest/test_strict_id_timestamp.py
+pytest tests/unit/ingest/test_validation_fixtures.py
+pytest tests/unit/ingest/test_normalize_empty_link_arrays.py
+pytest tests/unit/ingest/test_optional_fields_normalization.py
+pytest tests/unit/ingest/test_field_catalog_alias_learn.py
+pytest tests/unit/ingest/test_new_field_normalization.py
+pytest tests/unit/ingest/test_edge_upsert_links.py
+pytest tests/unit/ingest/test_backlink_derivation.py
+pytest tests/unit/ingest/test_graph_upsert_idempotent.py
+pytest tests/unit/ingest/test_relation_catalog.py
+pytest tests/unit/ingest/test_tag_slugify.py
+pytest tests/unit/ingest/test_snapshot_watcher.py
+pytest tests/unit/ingest/test_decision_snippet_validation.py
+pytest tests/unit/ingest/test_snippet_enricher.py
+pytest tests/unit/ingest/test_snippet_golden.py
+pytest tests/unit/ingest/test_contract_orphans.py
+pytest tests/unit/ingest/test_validation_bad_id.py
+```
+
+| #       | test-file                                                  | what it verifies                            | run-command                                                      |
+| ------- | ---------------------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------- |
+| **1-1** | tests/unit/ingest/test\_ingest\_health.py                  | service boots & `/health` 200               | `pytest tests/unit/ingest/test_ingest_health.py`                 |
+| 1-2     | tests/unit/ingest/test\_id\_regex\_schema\_parity.py       | ID regex identical to Memory-API            | `pytest tests/unit/ingest/test_id_regex_schema_parity.py`        |
+| 1-3     | tests/unit/ingest/test\_strict\_id\_timestamp.py           | ID ↔ timestamp parity enforcement           | `pytest tests/unit/ingest/test_strict_id_timestamp.py`           |
+| 1-4     | tests/unit/ingest/test\_validation\_fixtures.py            | decision/event fixtures pass schema         | `pytest tests/unit/ingest/test_validation_fixtures.py`           |
+| 1-5     | tests/unit/ingest/test\_normalize\_empty\_link\_arrays.py  | empty link arrays normalized to `[]`        | `pytest tests/unit/ingest/test_normalize_empty_link_arrays.py`   |
+| 1-6     | tests/unit/ingest/test\_optional\_fields\_normalization.py | optional payload fields cleared vs `null`   | `pytest tests/unit/ingest/test_optional_fields_normalization.py` |
+| 1-7     | tests/unit/ingest/test\_field\_catalog\_alias\_learn.py    | field-alias catalogue learns new keys       | `pytest tests/unit/ingest/test_field_catalog_alias_learn.py`     |
+| 1-8     | tests/unit/ingest/test\_new\_field\_normalization.py       | unknown JSON fields flagged / renamed       | `pytest tests/unit/ingest/test_new_field_normalization.py`       |
+| 1-9     | tests/unit/ingest/test\_edge\_upsert\_links.py             | bidirectional link upsert rules             | `pytest tests/unit/ingest/test_edge_upsert_links.py`             |
+| 1-10    | tests/unit/ingest/test\_backlink\_derivation.py            | generates reciprocal `supported_by` links   | `pytest tests/unit/ingest/test_backlink_derivation.py`           |
+| 1-11    | tests/unit/ingest/test\_graph\_upsert\_idempotent.py       | upserting same payload is idempotent        | `pytest tests/unit/ingest/test_graph_upsert_idempotent.py`       |
+| 1-12    | tests/unit/ingest/test\_relation\_catalog.py               | relation catalogue emits deterministically  | `pytest tests/unit/ingest/test_relation_catalog.py`              |
+| 1-13    | tests/unit/ingest/test\_tag\_slugify.py                    | tag → slug mapping                          | `pytest tests/unit/ingest/test_tag_slugify.py`                   |
+| 1-14    | tests/unit/ingest/test\_snapshot\_watcher.py               | filesystem snapshot-watcher triggers ingest | `pytest tests/unit/ingest/test_snapshot_watcher.py`              |
+| 1-15    | tests/unit/ingest/test\_decision\_snippet\_validation.py   | snippet length / highlights                 | `pytest tests/unit/ingest/test_decision_snippet_validation.py`   |
+| 1-16    | tests/unit/ingest/test\_snippet\_enricher.py               | snippet auto-enrichment heuristics          | `pytest tests/unit/ingest/test_snippet_enricher.py`              |
+| 1-17    | tests/unit/ingest/test\_snippet\_golden.py                 | golden snippets never regress               | `pytest tests/unit/ingest/test_snippet_golden.py`                |
+| 1-18    | tests/unit/ingest/test\_contract\_orphans.py               | rejects transition edges to nowhere         | `pytest tests/unit/ingest/test_contract_orphans.py`              |
+| 1-19    | tests/unit/ingest/test\_validation\_bad\_id.py             | bad IDs → 400                               | `pytest tests/unit/ingest/test_validation_bad_id.py`             |
+
+---
+
+## 2 Memory-API service
+
+### Batch Commands:
+```bash
+pytest tests/unit/memory_api/test_memory_api_health.py
+pytest tests/unit/memory_api/test_schema_http_headers.py
+pytest tests/unit/memory_api/test_expand_candidates_unit.py
+pytest tests/unit/memory_api/test_expand_anchor_with_underscore.py
+pytest tests/unit/memory_api/test_expand_headers.py
+pytest tests/unit/memory_api/test_enrich_stubs.py
+pytest tests/unit/memory_api/test_resolve_behaviors.py
+pytest tests/unit/memory_api/test_resolve_text_vector.py
+pytest tests/unit/memory_api/test_expand_and_resolve_contracts.py
+pytest tests/unit/memory_api/test_timeouts.py
+```
+
+| #       | test-file                                                        | what it verifies                        | run-command                                                          |
+| ------- | ---------------------------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------- |
+| **2-1** | tests/unit/memory\_api/test\_memory\_api\_health.py              | `/health` 200 + build-hash              | `pytest tests/unit/memory_api/test_memory_api_health.py`             |
+| 2-2     | tests/unit/memory\_api/test\_schema\_http\_headers.py            | `X-Memory-Schema`, `Content-Type`       | `pytest tests/unit/memory_api/test_schema_http_headers.py`           |
+| 2-3     | tests/unit/memory\_api/test\_expand\_candidates\_unit.py         | neighbour fan-out logic                 | `pytest tests/unit/memory_api/test_expand_candidates_unit.py`        |
+| 2-4     | tests/unit/memory\_api/test\_expand\_anchor\_with\_underscore.py | underscore-IDs survive expand           | `pytest tests/unit/memory_api/test_expand_anchor_with_underscore.py` |
+| 2-5     | tests/unit/memory\_api/test\_expand\_headers.py                  | `ETag` / conditional requests           | `pytest tests/unit/memory_api/test_expand_headers.py`                |
+| 2-6     | tests/unit/memory\_api/test\_enrich\_stubs.py                    | enrichment payload minimal shape        | `pytest tests/unit/memory_api/test_enrich_stubs.py`                  |
+| 2-7     | tests/unit/memory\_api/test\_resolve\_behaviors.py               | behavior flags resolved                 | `pytest tests/unit/memory_api/test_resolve_behaviors.py`             |
+| 2-8     | tests/unit/memory\_api/test\_resolve\_text\_vector.py            | vector resolve path behind feature-flag | `pytest tests/unit/memory_api/test_resolve_text_vector.py`           |
+| 2-9     | tests/unit/memory\_api/test\_expand\_and\_resolve\_contracts.py  | combined expand→resolve contract        | `pytest tests/unit/memory_api/test_expand_and_resolve_contracts.py`  |
+| 2-10    | tests/unit/memory\_api/test\_timeouts.py                         | Arango stall → 504                      | `pytest tests/unit/memory_api/test_timeouts.py`                      |
+
+---
+
+## 3 Gateway service
+
+### Batch Commands:
+```bash
+pytest tests/unit/gateway/test_gateway_health.py
+pytest tests/unit/gateway/test_gateway_schema_mirror.py
+pytest tests/unit/gateway/test_gateway_metrics_names.py
+pytest tests/unit/gateway/test_artifact_metric_names.py
+pytest tests/unit/gateway/test_gateway_audit_metadata.py
+pytest tests/unit/gateway/test_sse_stream_contract.py
+pytest tests/unit/gateway/test_logging_function_calls.py
+pytest tests/unit/gateway/test_memory_contract.py
+pytest tests/unit/gateway/test_selector.py
+pytest tests/unit/gateway/test_selector_edge_cases.py
+pytest tests/unit/gateway/test_resolver_slug.py
+pytest tests/unit/gateway/test_resolver.py
+pytest tests/unit/gateway/test_router_query.py
+pytest tests/unit/gateway/test_templater_golden.py
+pytest tests/unit/gateway/test_templater_ask.py
+pytest tests/unit/gateway/test_prompt_builder_determinism.py
+pytest tests/unit/gateway/test_neighbor_contract_shapes.py
+pytest tests/unit/gateway/test_evidence_builder_cache.py
+pytest tests/unit/gateway/test_back_link_derivations.py
+pytest tests/unit/gateway/test_match_snippet.py
+pytest tests/unit/gateway/test_validator.py
+pytest tests/unit/gateway/test_validator_edgecases.py
+pytest tests/unit/gateway/test_llm_invalid_json_fallback.py
+pytest tests/unit/gateway/test_llm_retry_twice_fallback.py
+pytest tests/unit/gateway/test_artifact_retention_comprehensive.py
+```
+
+| #       | test-file                                                      | what it verifies                     | run-command                                                          |
+| ------- | -------------------------------------------------------------- | ------------------------------------ | -------------------------------------------------------------------- |
+| **3-1** | tests/unit/gateway/test\_gateway\_health.py                    | gateway boots `/health` 200          | `pytest tests/unit/gateway/test_gateway_health.py`                   |
+| 3-2     | tests/unit/gateway/test\_gateway\_schema\_mirror.py            | mirrors `X-Memory-Schema`            | `pytest tests/unit/gateway/test_gateway_schema_mirror.py`            |
+| 3-3     | tests/unit/gateway/test\_gateway\_metrics\_names.py            | Prometheus metric registry           | `pytest tests/unit/gateway/test_gateway_metrics_names.py`            |
+| 3-4     | tests/unit/gateway/test\_artifact\_metric\_names.py            | blob-artifact counters exist         | `pytest tests/unit/gateway/test_artifact_metric_names.py`            |
+| 3-5     | tests/unit/gateway/test\_gateway\_audit\_metadata.py           | deterministic audit fields           | `pytest tests/unit/gateway/test_gateway_audit_metadata.py`           |
+| 3-6     | tests/unit/gateway/test\_sse\_stream\_contract.py              | SSE event contract (Milestone 4)     | `pytest tests/unit/gateway/test_sse_stream_contract.py`              |
+| 3-7     | tests/unit/gateway/test\_logging\_function\_calls.py           | structured log: function\_calls list | `pytest tests/unit/gateway/test_logging_function_calls.py`           |
+| 3-8     | tests/unit/gateway/test\_memory\_contract.py                   | adapter echoes Memory-API shapes     | `pytest tests/unit/gateway/test_memory_contract.py`                  |
+| 3-9     | tests/unit/gateway/test\_selector.py                           | ranking happy-path                   | `pytest tests/unit/gateway/test_selector.py`                         |
+| 3-10    | tests/unit/gateway/test\_selector\_edge\_cases.py              | selector boundary cases              | `pytest tests/unit/gateway/test_selector_edge_cases.py`              |
+| 3-11    | tests/unit/gateway/test\_resolver\_slug.py                     | slug generator determinism           | `pytest tests/unit/gateway/test_resolver_slug.py`                    |
+| 3-12    | tests/unit/gateway/test\_resolver.py                           | resolver pipeline end-to-end         | `pytest tests/unit/gateway/test_resolver.py`                         |
+| 3-13    | tests/unit/gateway/test\_router\_query.py                      | function-router dispatch             | `pytest tests/unit/gateway/test_router_query.py`                     |
+| 3-14    | tests/unit/gateway/test\_templater\_golden.py                  | prompt golden snapshot               | `pytest tests/unit/gateway/test_templater_golden.py`                 |
+| 3-15    | tests/unit/gateway/test\_templater\_ask.py                     | ask-template variants                | `pytest tests/unit/gateway/test_templater_ask.py`                    |
+| 3-16    | tests/unit/gateway/test\_prompt\_builder\_determinism.py       | prompt hash stability                | `pytest tests/unit/gateway/test_prompt_builder_determinism.py`       |
+| 3-17    | tests/unit/gateway/test\_neighbor\_contract\_shapes.py         | neighbour JSON grammar               | `pytest tests/unit/gateway/test_neighbor_contract_shapes.py`         |
+| 3-18    | tests/unit/gateway/test\_evidence\_builder\_cache.py           | evidence cache key/TTL               | `pytest tests/unit/gateway/test_evidence_builder_cache.py`           |
+| 3-19    | tests/unit/gateway/test\_back\_link\_derivations.py            | adds `event.led_to → decision`       | `pytest tests/unit/gateway/test_back_link_derivations.py`            |
+| 3-20    | tests/unit/gateway/test\_match\_snippet.py                     | snippet extractor                    | `pytest tests/unit/gateway/test_match_snippet.py`                    |
+| 3-21    | tests/unit/gateway/test\_validator.py                          | request/response validator           | `pytest tests/unit/gateway/test_validator.py`                        |
+| 3-22    | tests/unit/gateway/test\_validator\_edgecases.py               | negative validator cases             | `pytest tests/unit/gateway/test_validator_edgecases.py`              |
+| 3-23    | tests/unit/gateway/test\_llm\_invalid\_json\_fallback.py       | recovers bad LLM JSON                | `pytest tests/unit/gateway/test_llm_invalid_json_fallback.py`        |
+| 3-24    | tests/unit/gateway/test\_llm\_retry\_twice\_fallback.py        | retry/back-off logic                 | `pytest tests/unit/gateway/test_llm_retry_twice_fallback.py`         |
+| 3-25    | tests/unit/gateway/test\_artifact\_retention\_comprehensive.py | blob lifecycle end-to-end            | `pytest tests/unit/gateway/test_artifact_retention_comprehensive.py` |
+
+---
+
+## 4 API-edge service
+
+### Batch Commands:
+```bash
+pytest tests/unit/api_edge/test_api_edge_health.py
+pytest tests/unit/api_edge/test_auth_and_cors.py
+pytest tests/unit/api_edge/test_rate_limit.py
+pytest tests/unit/api_edge/test_api_edge_metrics_names.py
+pytest tests/unit/api_edge/test_sse_streaming_integration.py
+pytest tests/unit/api_edge/test_timeouts.py
+```
+
+| #       | test-file                                                 | what it verifies              | run-command                                                    |
+| ------- | --------------------------------------------------------- | ----------------------------- | -------------------------------------------------------------- |
+| **4-1** | tests/unit/api\_edge/test\_api\_edge\_health.py           | edge boots `/health` 200      | `pytest tests/unit/api_edge/test_api_edge_health.py`           |
+| 4-2     | tests/unit/api\_edge/test\_auth\_and\_cors.py             | JWT + CORS headers happy-path | `pytest tests/unit/api_edge/test_auth_and_cors.py`             |
+| 4-3     | tests/unit/api\_edge/test\_rate\_limit.py                 | per-user rate limits          | `pytest tests/unit/api_edge/test_rate_limit.py`                |
+| 4-4     | tests/unit/api\_edge/test\_api\_edge\_metrics\_names.py   | Prometheus metrics registered | `pytest tests/unit/api_edge/test_api_edge_metrics_names.py`    |
+| 4-5     | tests/unit/api\_edge/test\_sse\_streaming\_integration.py | edge streams Gateway SSE      | `pytest tests/unit/api_edge/test_sse_streaming_integration.py` |
+| 4-6     | tests/unit/api\_edge/test\_timeouts.py                    | Gateway stall → 504           | `pytest tests/unit/api_edge/test_timeouts.py`                  |
+
+---
+
+## 5 Cross-service integration & observability
+
+### Batch Commands:
+```bash
+pytest tests/observability/test_stage_span_coverage.py
+pytest tests/integration/test_evidence_truncation_limits.py
+pytest tests/integration/test_missing_coverage.py
+```
+
+| #       | test-file                                                      | what it verifies                 | run-command                                                          |
+| ------- | -------------------------------------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
+| **5-1** | tests/observability/test\_stage\_span\_coverage.py | every API stage has tracing span | `pytest tests/integration/observability/test_stage_span_coverage.py` |
+| 5-2     | tests/integration/test\_evidence\_truncation\_limits.py        | evidence bundle auto-truncates   | `pytest tests/integration/test_evidence_truncation_limits.py`        |
+| 5-3     | tests/integration/test\_missing\_coverage.py                   | coverage guard for new modules   | `pytest tests/integration/test_missing_coverage.py`                  |
+
+---
+
+## 6 Performance / load-tests
+
+### Batch Commands:
+```bash
+pytest tests/performance/test_model_inference_speed.py
+pytest tests/performance/test_query_latency.py
+pytest tests/performance/test_ask_latency.py
+pytest tests/performance/test_fallback_rate_under_load.py
+pytest tests/performance/test_stage_timeouts.py
+```
+
+---
+
+## Complete Reference Tables
+
+### 0 Core / shared-library layer
+
+| #       | test-file                                                     | what it verifies                                   | run-command                                                        |
+| ------- | ------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------ |
+| **0-1** | tests/unit/core\_utils/test\_ids.py                           | UUID / short-ID helpers produce spec-conform IDs   | `pytest tests/unit/core_utils/test_ids.py`                         |
+| 0-2     | tests/unit/core\_utils/test\_slugify.py                       | deterministic slug generation including diacritics | `pytest tests/unit/core_utils/test_slugify.py`                     |
+| 0-3     | tests/unit/core\_utils/test\_fp.py                            | 64-bit fingerprint maths round-trips               | `pytest tests/unit/core_utils/test_fp.py`                          |
+| 0-4     | tests/unit/core\_utils/test\_fingerprint.py                   | high-level fingerprint helper API                  | `pytest tests/unit/core_utils/test_fingerprint.py`                 |
+| 0-5     | tests/unit/core\_utils/test\_snapshot.py                      | binary snapshot store + diff helper                | `pytest tests/unit/core_utils/test_snapshot.py`                    |
+| 0-6     | tests/unit/core\_logging/test\_log\_format\_compliance.py     | all log lines follow JSON-schema                   | `pytest tests/unit/core_logging/test_log_format_compliance.py`     |
+| 0-7     | tests/unit/core\_logging/test\_log\_stage.py                  | stage-tag injection helper                         | `pytest tests/unit/core_logging/test_log_stage.py`                 |
+| 0-8     | tests/unit/core\_logging/test\_snapshot\_etag\_logging.py     | snapshot-ETag recorded in logs                     | `pytest tests/unit/core_logging/test_snapshot_etag_logging.py`     |
+| 0-9     | tests/unit/core\_validator/test\_validator\_golden\_matrix.py | "golden" positive validation matrix                | `pytest tests/unit/core_validator/test_validator_golden_matrix.py` |
+| 0-10    | tests/unit/core\_validator/test\_snippet\_and\_tags.py        | snippet+tag sub-schema                             | `pytest tests/unit/core_validator/test_snippet_and_tags.py`        |
+| 0-11    | tests/unit/core\_validator/test\_validator\_negative.py       | negative matrix (all invalid inputs)               | `pytest tests/unit/core_validator/test_validator_negative.py`      |
+| 0-12    | tests/unit/link\_utils/test\_based\_on\_reciprocity.py        | `based_on` ↔︎ `supports` reciprocity helpers       | `pytest tests/unit/link_utils/test_based_on_reciprocity.py`        |
+
+### 1 Ingest service
+
+| #       | test-file                                                  | what it verifies                            | run-command                                                      |
+| ------- | ---------------------------------------------------------- | ------------------------------------------- | ---------------------------------------------------------------- |
+| **1-1** | tests/unit/ingest/test\_ingest\_health.py                  | service boots & `/health` 200               | `pytest tests/unit/ingest/test_ingest_health.py`                 |
+| 1-2     | tests/unit/ingest/test\_id\_regex\_schema\_parity.py       | ID regex identical to Memory-API            | `pytest tests/unit/ingest/test_id_regex_schema_parity.py`        |
+| 1-3     | tests/unit/ingest/test\_strict\_id\_timestamp.py           | ID ↔ timestamp parity enforcement           | `pytest tests/unit/ingest/test_strict_id_timestamp.py`           |
+| 1-4     | tests/unit/ingest/test\_validation\_fixtures.py            | decision/event fixtures pass schema         | `pytest tests/unit/ingest/test_validation_fixtures.py`           |
+| 1-5     | tests/unit/ingest/test\_normalize\_empty\_link\_arrays.py  | empty link arrays normalized to `[]`        | `pytest tests/unit/ingest/test_normalize_empty_link_arrays.py`   |
+| 1-6     | tests/unit/ingest/test\_optional\_fields\_normalization.py | optional payload fields cleared vs `null`   | `pytest tests/unit/ingest/test_optional_fields_normalization.py` |
+| 1-7     | tests/unit/ingest/test\_field\_catalog\_alias\_learn.py    | field-alias catalogue learns new keys       | `pytest tests/unit/ingest/test_field_catalog_alias_learn.py`     |
+| 1-8     | tests/unit/ingest/test\_new\_field\_normalization.py       | unknown JSON fields flagged / renamed       | `pytest tests/unit/ingest/test_new_field_normalization.py`       |
+| 1-9     | tests/unit/ingest/test\_edge\_upsert\_links.py             | bidirectional link upsert rules             | `pytest tests/unit/ingest/test_edge_upsert_links.py`             |
+| 1-10    | tests/unit/ingest/test\_backlink\_derivation.py            | generates reciprocal `supported_by` links   | `pytest tests/unit/ingest/test_backlink_derivation.py`           |
+| 1-11    | tests/unit/ingest/test\_graph\_upsert\_idempotent.py       | upserting same payload is idempotent        | `pytest tests/unit/ingest/test_graph_upsert_idempotent.py`       |
+| 1-12    | tests/unit/ingest/test\_relation\_catalog.py               | relation catalogue emits deterministically  | `pytest tests/unit/ingest/test_relation_catalog.py`              |
+| 1-13    | tests/unit/ingest/test\_tag\_slugify.py                    | tag → slug mapping                          | `pytest tests/unit/ingest/test_tag_slugify.py`                   |
+| 1-14    | tests/unit/ingest/test\_snapshot\_watcher.py               | filesystem snapshot-watcher triggers ingest | `pytest tests/unit/ingest/test_snapshot_watcher.py`              |
+| 1-15    | tests/unit/ingest/test\_decision\_snippet\_validation.py   | snippet length / highlights                 | `pytest tests/unit/ingest/test_decision_snippet_validation.py`   |
+| 1-16    | tests/unit/ingest/test\_snippet\_enricher.py               | snippet auto-enrichment heuristics          | `pytest tests/unit/ingest/test_snippet_enricher.py`              |
+| 1-17    | tests/unit/ingest/test\_snippet\_golden.py                 | golden snippets never regress               | `pytest tests/unit/ingest/test_snippet_golden.py`                |
+| 1-18    | tests/unit/ingest/test\_contract\_orphans.py               | rejects transition edges to nowhere         | `pytest tests/unit/ingest/test_contract_orphans.py`              |
+| 1-19    | tests/unit/ingest/test\_validation\_bad\_id.py             | bad IDs → 400                               | `pytest tests/unit/ingest/test_validation_bad_id.py`             |
+
+### 2 Memory-API service
+
+| #       | test-file                                                        | what it verifies                        | run-command                                                          |
+| ------- | ---------------------------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------- |
+| **2-1** | tests/unit/memory\_api/test\_memory\_api\_health.py              | `/health` 200 + build-hash              | `pytest tests/unit/memory_api/test_memory_api_health.py`             |
+| 2-2     | tests/unit/memory\_api/test\_schema\_http\_headers.py            | `X-Memory-Schema`, `Content-Type`       | `pytest tests/unit/memory_api/test_schema_http_headers.py`           |
+| 2-3     | tests/unit/memory\_api/test\_expand\_candidates\_unit.py         | neighbour fan-out logic                 | `pytest tests/unit/memory_api/test_expand_candidates_unit.py`        |
+| 2-4     | tests/unit/memory\_api/test\_expand\_anchor\_with\_underscore.py | underscore-IDs survive expand           | `pytest tests/unit/memory_api/test_expand_anchor_with_underscore.py` |
+| 2-5     | tests/unit/memory\_api/test\_expand\_headers.py                  | `ETag` / conditional requests           | `pytest tests/unit/memory_api/test_expand_headers.py`                |
+| 2-6     | tests/unit/memory\_api/test\_enrich\_stubs.py                    | enrichment payload minimal shape        | `pytest tests/unit/memory_api/test_enrich_stubs.py`                  |
+| 2-7     | tests/unit/memory\_api/test\_resolve\_behaviors.py               | behavior flags resolved                 | `pytest tests/unit/memory_api/test_resolve_behaviors.py`             |
+| 2-8     | tests/unit/memory\_api/test\_resolve\_text\_vector.py            | vector resolve path behind feature-flag | `pytest tests/unit/memory_api/test_resolve_text_vector.py`           |
+| 2-9     | tests/unit/memory\_api/test\_expand\_and\_resolve\_contracts.py  | combined expand→resolve contract        | `pytest tests/unit/memory_api/test_expand_and_resolve_contracts.py`  |
+| 2-10    | tests/unit/memory\_api/test\_timeouts.py                         | Arango stall → 504                      | `pytest tests/unit/memory_api/test_timeouts.py`                      |
+
+### 3 Gateway service
+
+| #       | test-file                                                      | what it verifies                     | run-command                                                          |
+| ------- | -------------------------------------------------------------- | ------------------------------------ | -------------------------------------------------------------------- |
+| **3-1** | tests/unit/gateway/test\_gateway\_health.py                    | gateway boots `/health` 200          | `pytest tests/unit/gateway/test_gateway_health.py`                   |
+| 3-2     | tests/unit/gateway/test\_gateway\_schema\_mirror.py            | mirrors `X-Memory-Schema`            | `pytest tests/unit/gateway/test_gateway_schema_mirror.py`            |
+| 3-3     | tests/unit/gateway/test\_gateway\_metrics\_names.py            | Prometheus metric registry           | `pytest tests/unit/gateway/test_gateway_metrics_names.py`            |
+| 3-4     | tests/unit/gateway/test\_artifact\_metric\_names.py            | blob-artifact counters exist         | `pytest tests/unit/gateway/test_artifact_metric_names.py`            |
+| 3-5     | tests/unit/gateway/test\_gateway\_audit\_metadata.py           | deterministic audit fields           | `pytest tests/unit/gateway/test_gateway_audit_metadata.py`           |
+| 3-6     | tests/unit/gateway/test\_sse\_stream\_contract.py              | SSE event contract (Milestone 4)     | `pytest tests/unit/gateway/test_sse_stream_contract.py`              |
+| 3-7     | tests/unit/gateway/test\_logging\_function\_calls.py           | structured log: function\_calls list | `pytest tests/unit/gateway/test_logging_function_calls.py`           |
+| 3-8     | tests/unit/gateway/test\_memory\_contract.py                   | adapter echoes Memory-API shapes     | `pytest tests/unit/gateway/test_memory_contract.py`                  |
+| 3-9     | tests/unit/gateway/test\_selector.py                           | ranking happy-path                   | `pytest tests/unit/gateway/test_selector.py`                         |
+| 3-10    | tests/unit/gateway/test\_selector\_edge\_cases.py              | selector boundary cases              | `pytest tests/unit/gateway/test_selector_edge_cases.py`              |
+| 3-11    | tests/unit/gateway/test\_resolver\_slug.py                     | slug generator determinism           | `pytest tests/unit/gateway/test_resolver_slug.py`                    |
+| 3-12    | tests/unit/gateway/test\_resolver.py                           | resolver pipeline end-to-end         | `pytest tests/unit/gateway/test_resolver.py`                         |
+| 3-13    | tests/unit/gateway/test\_router\_query.py                      | function-router dispatch             | `pytest tests/unit/gateway/test_router_query.py`                     |
+| 3-14    | tests/unit/gateway/test\_templater\_golden.py                  | prompt golden snapshot               | `pytest tests/unit/gateway/test_templater_golden.py`                 |
+| 3-15    | tests/unit/gateway/test\_templater\_ask.py                     | ask-template variants                | `pytest tests/unit/gateway/test_templater_ask.py`                    |
+| 3-16    | tests/unit/gateway/test\_prompt\_builder\_determinism.py       | prompt hash stability                | `pytest tests/unit/gateway/test_prompt_builder_determinism.py`       |
+| 3-17    | tests/unit/gateway/test\_neighbor\_contract\_shapes.py         | neighbour JSON grammar               | `pytest tests/unit/gateway/test_neighbor_contract_shapes.py`         |
+| 3-18    | tests/unit/gateway/test\_evidence\_builder\_cache.py           | evidence cache key/TTL               | `pytest tests/unit/gateway/test_evidence_builder_cache.py`           |
+| 3-19    | tests/unit/gateway/test\_back\_link\_derivations.py            | adds `event.led_to → decision`       | `pytest tests/unit/gateway/test_back_link_derivations.py`            |
+| 3-20    | tests/unit/gateway/test\_match\_snippet.py                     | snippet extractor                    | `pytest tests/unit/gateway/test_match_snippet.py`                    |
+| 3-21    | tests/unit/gateway/test\_validator.py                          | request/response validator           | `pytest tests/unit/gateway/test_validator.py`                        |
+| 3-22    | tests/unit/gateway/test\_validator\_edgecases.py               | negative validator cases             | `pytest tests/unit/gateway/test_validator_edgecases.py`              |
+| 3-23    | tests/unit/gateway/test\_llm\_invalid\_json\_fallback.py       | recovers bad LLM JSON                | `pytest tests/unit/gateway/test_llm_invalid_json_fallback.py`        |
+| 3-24    | tests/unit/gateway/test\_llm\_retry\_twice\_fallback.py        | retry/back-off logic                 | `pytest tests/unit/gateway/test_llm_retry_twice_fallback.py`         |
+| 3-25    | tests/unit/gateway/test\_artifact\_retention\_comprehensive.py | blob lifecycle end-to-end            | `pytest tests/unit/gateway/test_artifact_retention_comprehensive.py` |
+
+### 4 API-edge service
+
+| #       | test-file                                                 | what it verifies              | run-command                                                    |
+| ------- | --------------------------------------------------------- | ----------------------------- | -------------------------------------------------------------- |
+| **4-1** | tests/unit/api\_edge/test\_api\_edge\_health.py           | edge boots `/health` 200      | `pytest tests/unit/api_edge/test_api_edge_health.py`           |
+| 4-2     | tests/unit/api\_edge/test\_auth\_and\_cors.py             | JWT + CORS headers happy-path | `pytest tests/unit/api_edge/test_auth_and_cors.py`             |
+| 4-3     | tests/unit/api\_edge/test\_rate\_limit.py                 | per-user rate limits          | `pytest tests/unit/api_edge/test_rate_limit.py`                |
+| 4-4     | tests/unit/api\_edge/test\_api\_edge\_metrics\_names.py   | Prometheus metrics registered | `pytest tests/unit/api_edge/test_api_edge_metrics_names.py`    |
+| 4-5     | tests/unit/api\_edge/test\_sse\_streaming\_integration.py | edge streams Gateway SSE      | `pytest tests/unit/api_edge/test_sse_streaming_integration.py` |
+| 4-6     | tests/unit/api\_edge/test\_timeouts.py                    | Gateway stall → 504           | `pytest tests/unit/api_edge/test_timeouts.py`                  |
+
+### 5 Cross-service integration & observability
+
+| #       | test-file                                                      | what it verifies                 | run-command                                                          |
+| ------- | -------------------------------------------------------------- | -------------------------------- | -------------------------------------------------------------------- |
+| **5-1** | tests/integration/observability/test\_stage\_span\_coverage.py | every API stage has tracing span | `pytest tests/integration/observability/test_stage_span_coverage.py` |
+| 5-2     | tests/integration/test\_evidence\_truncation\_limits.py        | evidence bundle auto-truncates   | `pytest tests/integration/test_evidence_truncation_limits.py`        |
+| 5-3     | tests/integration/test\_missing\_coverage.py                   | coverage guard for new modules   | `pytest tests/integration/test_missing_coverage.py`                  |
+
+### 6 Performance / load-tests
+
+| #       | test-file                                              | what it verifies               | run-command                                                 |
+| ------- | ------------------------------------------------------ | ------------------------------ | ----------------------------------------------------------- |
+| **6-1** | tests/performance/test\_model\_inference\_speed.py     | model ⇢ GPU latency budget     | `pytest tests/performance/test_model_inference_speed.py`    |
+| 6-2     | tests/performance/test\_query\_latency.py              | `/v2/query` 95th percentile    | `pytest tests/performance/test_query_latency.py`            |
+| 6-3     | tests/performance/test\_ask\_latency.py                | `/v2/ask` 95th percentile      | `pytest tests/performance/test_ask_latency.py`              |
+| 6-4     | tests/performance/test\_fallback\_rate\_under\_load.py | fallback rate ≤ p99 under load | `pytest tests/performance/test_fallback_rate_under_load.py` |
+| 6-5     | tests/performance/test\_stage\_timeouts.py             | per-stage time-budget enforced | `pytest tests/performance/test_stage_timeouts.py`           |
+
+| #       | test-file                                              | what it verifies               | run-command                                                 |
+| ------- | ------------------------------------------------------ | ------------------------------ | ----------------------------------------------------------- |
+| **6-1** | tests/performance/test\_model\_inference\_speed.py     | model ⇢ GPU latency budget     | `pytest tests/performance/test_model_inference_speed.py`    |
+| 6-2     | tests/performance/test\_query\_latency.py              | `/v2/query` 95th percentile    | `pytest tests/performance/test_query_latency.py`            |
+| 6-3     | tests/performance/test\_ask\_latency.py                | `/v2/ask` 95th percentile      | `pytest tests/performance/test_ask_latency.py`              |
+| 6-4     | tests/performance/test\_fallback\_rate\_under\_load.py | fallback rate ≤ p99 under load | `pytest tests/performance/test_fallback_rate_under_load.py` |
+| 6-5     | tests/performance/test\_stage\_timeouts.py             | per-stage time-budget enforced | `pytest tests/performance/test_stage_timeouts.py`           |

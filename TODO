@@ -26,3 +26,50 @@ Not yet. In the current codebase, the ingest service doesn’t use Redis. The ch
 Try to connect to Redis (using the address we’ve configured elsewhere).
 If Redis is available, use it as a cache.
 If not, just skip caching and fall back to the old behavior.
+
+
+pytest tests/unit/gateway/test_artifact_metric_names.py
+pytest tests/unit/gateway/test_artifact_retention_comprehensive.py
+pytest tests/unit/gateway/test_back_link_derivations.py
+pytest tests/unit/gateway/test_evidence_builder_cache.py
+pytest tests/unit/gateway/test_gateway_audit_metadata.py
+pytest tests/unit/gateway/test_gateway_health.py
+pytest tests/unit/gateway/test_llm_invalid_json_fallback.py
+pytest tests/unit/gateway/test_llm_retry_twice_fallback.py
+pytest tests/unit/gateway/test_prompt_builder_determinism.py
+pytest tests/unit/gateway/test_resolver.py
+pytest tests/unit/gateway/test_router_query.py
+pytest tests/unit/gateway/test_selector.py
+pytest tests/unit/gateway/test_selector_edge_cases.py
+pytest tests/unit/gateway/test_templater_ask.py
+pytest tests/unit/gateway/test_templater_golden.py
+pytest tests/unit/gateway/test_validator.py
+pytest tests/unit/gateway/test_validator_edgecases.py
+```
+
+
+# Test(s) unlocked
+
+Why this comes first | What must work (summary) | Key spec hooks
+
+**1** | `test_resolver.py::test_resolver_stub` & `test_router_query.py::test_query_route_contract` (post-error) | Both crash because the HTTP stub lacks `.post` – nothing else can run until basic I/O works. | • Add `post()` (and friends) to `_DummyClient` used by Gateway/Memory-API stubs. • Ensure it returns a `response.json()` compatible object. | Gateway and Memory API exchange is the first hop in every request flow | project_development_mil…
+
+**2** | `test_resolver_slug.py::test_slug_fast_path` | Validates the resolver's "slug → skip search" rule; needed by most higher tests. | • Detect slug via regex `^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$`. • Return a high-confidence hit without hitting search‐similar. | Regex & fast-path requirement | tech-spec
+
+**3** | `test_router_query.py::test_query_route_contract` (assertions) | After the resolver, `/v2/query` must call the Memory-API functions; later stages depend on a routed bundle. | • Wire the Intent-router to call `search_similar` / `get_graph_neighbors` stubs. • Populate `meta.function_calls[]`, `routing_confidence`. | Intent-router contract | tech-spec
+
+**4** | `test_gateway_schema_mirror.py::test_schema_mirror_fields_route` | Gateway must mirror `/api/schema/fields`; other components (validator, planner) read from it. | • Proxy `GET /v2/schema/fields` to Memory-API and forward the `ETag` header unchanged. • Cache result until ETag changes. | Mirror & ETag caching rule | tech-spec
+
+**5** | `test_back_link_derivations.py::test_backlink_derivation_contract` | Ingest must derive reciprocal links; evidence builder can't assemble bundles without them. | • During ingest, write `event.led_to ↔ decision.supported_by` and `based_on ↔ transition` backlinks. • Emit them in k=1 expansion. | Back-link derivation spec | tech-spec
+
+**6** | `test_evidence_builder_cache.py::{test_cache_hit,test_etag_change_eviction}` | Evidence cache must be right before we tune truncation or validation. | • 15-min TTL cache keyed by `(decision_id,intent,graph_scope,snapshot_etag)`. • Invalidate on ETag change. | Evidence-cache contract | project_development_mil…
+
+**7** | `test_selector.py::test_selector_truncates` | Ensures size-based truncation (or non-truncation) logic is correct; relies on a working bundle. | • Implement deterministic selector (recency + similarity). • Only drop items if `len(bytes)>MAX_PROMPT_BYTES`, keep ≥ `MIN_EVIDENCE_ITEMS`. | Selector & limits | tech-spec
+
+**8** | `test_validator.py::{test_validator_subset_rule,test_validator_missing_anchor}` & `test_validator_edgecases.py::*` | Validation must guard outputs before we freeze golden answers or persist artefacts. | • Enforce `supporting_ids ⊆ allowed_ids` and mandatory anchor citation. • Edge-case: orphan bundles, zero transitions. | Validator rules | tech-spec
+
+**9** | `test_templater_golden.py::*` | Golden answers rely on a working validator & selector but not on full artefact storage. | • Make templater idempotent (`validate_and_fix` should -– in place –- add missing anchors, strip stray IDs). | Templater fallback flow | tech-spec
+
+**10** | `test_gateway_audit_metadata.py::test_audit_metadata_and_artefact_persistence` | Meta fields must be present before artefact retention check. | • Inject `snapshot_etag`, `prompt_id`, `policy_id`, `prompt_fingerprint` into `meta`. | Audit-metadata requirement | tech-spec
+
+**11 (final)** | `test_artifact_retention_comprehensive.py::test_full_artefact_retention` | All earlier layers must succeed; this just verifies we persisted every file. | • Write envelope, rendered prompt, raw LLM JSON, validator report, response JSON to artefact store. | Artefact governance | tech-spec
