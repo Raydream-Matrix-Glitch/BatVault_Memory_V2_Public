@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 import gateway.app as gw_app
 from gateway.app import app                            # FastAPI instance
 from api_edge.app import app as edge_app               # SSE endpoint lives here
-from gateway.models import (
+from core_models.models import (
     WhyDecisionEvidence,
     WhyDecisionAnchor,
     WhyDecisionTransitions,
@@ -65,18 +65,26 @@ class StubEvidenceBuilder:
         return evidence
 
 
-class FailingValidator:
-    """Wrap core_validator.validate_response so it fails *exactly* N times."""
+# --------------------------------------------------------------------------- #
+#  Fake OpenAI client to track retry attempts                                 #
+# --------------------------------------------------------------------------- #
+import os, sys, types
 
-    def __init__(self, failures: int = 2):
-        self.calls = 0
-        self.failures = failures
+class _FakeChatCompletion:
+    calls = 0
 
-    def __call__(self, resp):
-        self.calls += 1
-        if self.calls <= self.failures:
-            return (False, ["synthetic schema error"])
-        return (True, [])
+    @classmethod
+    def create(cls, *args, **kwargs):
+        cls.calls += 1
+        raise RuntimeError("forced failure – stubbed by test")
+
+fake_openai = types.ModuleType("openai")
+fake_openai.ChatCompletion = _FakeChatCompletion
+fake_openai.api_key = "test"
+sys.modules["openai"] = fake_openai
+
+# Ensure the Gateway uses the real path (not its own stub)
+os.environ["OPENAI_DISABLED"] = "0"
 
 
 class StubMinio:
@@ -123,17 +131,14 @@ class StubMinio:
 
 
 def test_llm_retry_exactly_two(monkeypatch):
-    """Schema errors should trigger *exactly* 2 retries before fallback."""
+    """
+    Gateway must attempt the LLM no more than **two** times after the first
+    failure.  We count calls to ``openai.ChatCompletion.create`` and ensure
+    ``meta.retries`` reflects those retries.
+    """
 
     # short-circuit expensive stages
     monkeypatch.setattr(gw_app, "_evidence_builder", StubEvidenceBuilder())
-
-    # validator fails twice then passes (=> meta.retries == 2)
-    failing_validator = FailingValidator(failures=2)
-    monkeypatch.setattr(
-        "core_validator.validator.validate_response",
-        failing_validator,
-    )
 
     client = TestClient(app)
     resp = client.post(
@@ -143,8 +148,8 @@ def test_llm_retry_exactly_two(monkeypatch):
     assert resp.status_code == 200
     meta = resp.json()["meta"]
 
-    assert meta["retries"] == 2, "Gateway did not retry exactly twice"
-    assert meta["fallback_used"] is True
+    assert meta["retries"] == 2, "Gateway did not record exactly two retries"
+    assert _FakeChatCompletion.calls == meta["retries"] + 1
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -9,7 +9,7 @@ metrics so the collector or Prometheus server can consume them.
 from __future__ import annotations
 
 import threading
-from typing import Any, Dict, TYPE_CHECKING
+from typing import Any, Dict, TYPE_CHECKING, cast
 
 # ── Prometheus fallback (used for /metrics endpoint) ────────────────────────
 if TYPE_CHECKING:  # real classes visible only to the type checker
@@ -18,9 +18,15 @@ if TYPE_CHECKING:  # real classes visible only to the type checker
     from prometheus_client import Gauge as PromGauge
 
 try:
-    from prometheus_client import Counter as _pCounter, Histogram as _pHistogram, Gauge as _pGauge
+    from prometheus_client import (
+        REGISTRY as _PROM_REGISTRY,
+        Counter as _pCounter,
+        Histogram as _pHistogram,
+        Gauge as _pGauge,
+    )
 except ImportError:  # pragma: no cover – guarded by requirements/runtime.txt
-    _pCounter = _pHistogram = _pGauge = None  # type: ignore[assignment]
+    _PROM_REGISTRY = None                          # type: ignore[assignment]
+    _pCounter = _pHistogram = _pGauge = None       # type: ignore[assignment]
 
 _P_COUNTERS: Dict[str, "PromCounter"] = {}  # type: ignore[name-defined]
 _P_HISTOS: Dict[str, "PromHistogram"] = {}  # type: ignore[name-defined]
@@ -73,7 +79,8 @@ def counter(name: str, inc: int | float = 1, **attrs: Any) -> None:
     if _pCounter is not None:
         pc = _P_COUNTERS.get(name)
         if pc is None:
-            pc = _pCounter(name, f"Counter for {name}")  # type: ignore[call-arg]
+            existing = None if _PROM_REGISTRY is None else _PROM_REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+            pc = cast("PromCounter", existing) if existing is not None else _pCounter(name, f"Counter for {name}")  # type: ignore[call-arg]
             _P_COUNTERS[name] = pc
         pc.inc(inc)
 
@@ -96,7 +103,8 @@ def histogram(name: str, value: float, **attrs: Any) -> None:
     if _pHistogram is not None:
         ph = _P_HISTOS.get(name)
         if ph is None:
-            ph = _pHistogram(name, f"Histogram for {name}")  # type: ignore[call-arg]
+            existing = None if _PROM_REGISTRY is None else _PROM_REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+            ph = cast("PromHistogram", existing) if existing is not None else _pHistogram(name, f"Histogram for {name}")  # type: ignore[call-arg]
             _P_HISTOS[name] = ph
         ph.observe(value)
 
@@ -121,7 +129,8 @@ def gauge(name: str, value: float, **attrs: Any) -> None:
 
     g = _P_GAUGES.get(name)
     if g is None:
-        g = _pGauge(name, f"Gauge for {name}")  # type: ignore[call-arg]
+        existing = None if _PROM_REGISTRY is None else _PROM_REGISTRY._names_to_collectors.get(name)  # type: ignore[attr-defined]
+        g = cast("PromGauge", existing) if existing is not None else _pGauge(name, f"Gauge for {name}")  # type: ignore[call-arg]
         _P_GAUGES[name] = g
     g.set(value)
 

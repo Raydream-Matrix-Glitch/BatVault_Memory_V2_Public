@@ -162,12 +162,11 @@ pytest tests/unit/memory_api/test_timeouts.py
 ### Batch Commands:
 ```bash
 pytest tests/unit/gateway/test_gateway_health.py
+pytest tests/unit/gateway/test_alias_normalisation.py
 pytest tests/unit/gateway/test_gateway_schema_mirror.py
 pytest tests/unit/gateway/test_gateway_metrics_names.py
 pytest tests/unit/gateway/test_artifact_metric_names.py
 pytest tests/unit/gateway/test_gateway_audit_metadata.py
-pytest tests/unit/gateway/test_sse_stream_contract.py
-pytest tests/unit/gateway/test_logging_function_calls.py
 pytest tests/unit/gateway/test_memory_contract.py
 pytest tests/unit/gateway/test_selector.py
 pytest tests/unit/gateway/test_selector_edge_cases.py
@@ -186,7 +185,136 @@ pytest tests/unit/gateway/test_validator_edgecases.py
 pytest tests/unit/gateway/test_llm_invalid_json_fallback.py
 pytest tests/unit/gateway/test_llm_retry_twice_fallback.py
 pytest tests/unit/gateway/test_artifact_retention_comprehensive.py
+pytest tests/unit/gateway/test_sse_query_contract.py
+pytest tests/unit/gateway/test_structured_logging.py
+pytest tests/unit/gateway/test_intent_router_calls.py
+pytest tests/unit/gateway/test_response_schema.py
+
+
+TEST SUITE START
+
+pytest tests/unit/core_config/test_gateway_constants.py
+pytest tests/unit/core_config/test_stage_timeouts_constants.py
+
+pytest tests/unit/core_utils/test_fingerprint.py
+pytest tests/unit/core_utils/test_fp.py
+pytest tests/unit/core_utils/test_ids.py
+pytest tests/unit/core_utils/test_slugify.py
+pytest tests/unit/core_utils/test_snapshot.py
+
+pytest tests/unit/core_logging/test_log_format_compliance.py
+pytest tests/unit/core_logging/test_log_stage.py
+pytest tests/unit/core_logging/test_snapshot_etag_logging.py
+
+pytest tests/unit/core_validator/test_snippet_and_tags.py
+pytest tests/unit/core_validator/test_validator_golden_matrix.py
+pytest tests/unit/core_validator/test_validator_negative.py
+
+pytest tests/unit/link_utils/test_based_on_reciprocity.py
+
+# ── Phase 1 · Ingest pipeline (M1) ─────────────────────────────
+pytest tests/unit/ingest/test_ingest_health.py #pass
+pytest tests/unit/ingest/test_id_regex_schema_parity.py #pass
+pytest tests/unit/ingest/test_strict_id_timestamp.py #pass
+pytest tests/unit/ingest/test_new_field_normalization.py #pass
+pytest tests/unit/ingest/test_optional_fields_normalization.py #pass
+pytest tests/unit/ingest/test_normalize_empty_link_arrays.py #pass
+pytest tests/unit/ingest/test_validation_bad_id.py #pass
+pytest tests/unit/ingest/test_validation_fixtures.py #pass
+pytest tests/unit/ingest/test_contract_orphans.py #pass
+pytest tests/unit/ingest/test_backlink_derivation.py #pass
+pytest tests/unit/ingest/test_edge_upsert_links.py #pass
+pytest tests/unit/ingest/test_graph_upsert_idempotent.py #pass
+pytest tests/unit/ingest/test_field_catalog_alias_learn.py #pass
+pytest tests/unit/ingest/test_tag_slugify.py #pass
+pytest tests/unit/ingest/test_snippet_enricher.py #pass
+pytest tests/unit/ingest/test_snippet_golden.py #pass
+pytest tests/unit/ingest/test_decision_snippet_validation.py #pass
+pytest tests/unit/ingest/test_relation_catalog.py #pass
+pytest tests/unit/ingest/test_snapshot_watcher.py #pass
+
+# ── Phase 2 · Memory-API (M2) ──────────────────────────────────
+pytest tests/unit/memory_api/test_memory_api_health.py #pass
+pytest tests/unit/memory_api/test_fallback_arango_unreachable.py #pass
+pytest tests/unit/memory_api/test_enrich_stubs.py #pass
+pytest tests/unit/memory_api/test_expand_anchor_with_underscore.py #pass
+pytest tests/unit/memory_api/test_expand_and_resolve_contracts.py #pass
+pytest tests/unit/memory_api/test_expand_candidates_unit.py #pass
+pytest tests/unit/memory_api/test_expand_headers.py #pass
+pytest tests/unit/memory_api/test_resolve_behaviors.py #pass
+pytest tests/unit/memory_api/test_resolve_text_vector.py #pass
+pytest tests/unit/memory_api/test_schema_http_headers.py #pass
+pytest tests/unit/memory_api/test_timeouts.py #pass
+
+# ── Phase 3 · Gateway (M3) ─────────────────────────────────────
+pytest tests/unit/gateway/test_gateway_health.py #pass
+pytest tests/unit/gateway/test_alias_normalisation.py #pass
+pytest tests/unit/gateway/test_artifact_metric_names.py #pass
+pytest tests/unit/gateway/test_gateway_metrics_names.py #pass
+pytest tests/unit/gateway/test_gateway_schema_mirror.py #pass
+pytest tests/unit/gateway/test_graph_neighbors_routing.py #pass
+pytest tests/unit/gateway/test_resolver.py #pass
+pytest tests/unit/gateway/test_resolver_slug.py #pass
+pytest tests/unit/gateway/test_router_query.py #pass
+pytest tests/unit/gateway/test_intent_router_calls.py #pass
+pytest tests/unit/gateway/test_routing_confidence.py #pass
+pytest tests/unit/gateway/test_query_meta_fields.py #pass
+pytest tests/unit/gateway/test_evidence_builder_cache.py 
+pytest tests/unit/gateway/test_neighbor_contract_shapes.py #pass
+pytest tests/unit/gateway/test_memory_contract.py #pass
+pytest tests/unit/gateway/test_match_snippet.py #pass
+pytest tests/unit/gateway/test_validator.py #pass
+pytest tests/unit/gateway/test_validator_edgecases.py #pass
+pytest tests/unit/gateway/test_selector.py #pass
+pytest tests/unit/gateway/test_selector_edge_cases.py #pass
+pytest tests/unit/gateway/test_selector_logging_fields.py #pass
+pytest tests/unit/gateway/test_llm_json_stub.py #pass
+pytest tests/unit/gateway/test_llm_invalid_json_fallback.py #pass
+pytest tests/unit/gateway/test_llm_retry_twice_fallback.py #pass
+pytest tests/unit/gateway/test_llm_stub_fallback.py #pass
+pytest tests/unit/gateway/test_response_schema.py #pass
+pytest tests/unit/gateway/test_prompt_builder_determinism.py #pass
+pytest tests/unit/gateway/test_gateway_audit_metadata.py #pass
+pytest tests/unit/gateway/test_artifact_retention_comprehensive.py #pass
+pytest tests/unit/gateway/test_back_link_derivations.py #pass
+pytest tests/unit/gateway/test_search_similar_routing.py #pass
+pytest tests/unit/gateway/test_templater_ask.py #pass
+pytest tests/unit/gateway/test_templater_golden.py #pass
+pytest tests/unit/gateway/test_sse_query_contract.py #pass
+pytest tests/unit/gateway/test_structured_logging.py #pass
+pytest tests/unit/gateway/test_selector_logging_fields.py #pass
+
+# ── Phase 4 · API-Edge (M0/M4 glue) ────────────────────────────
+pytest tests/unit/api_edge/test_api_edge_health.py
+pytest tests/unit/api_edge/test_api_edge_metrics_names.py
+pytest tests/unit/api_edge/test_auth_and_cors.py
+pytest tests/unit/api_edge/test_rate_limit.py
+pytest tests/unit/api_edge/test_sse_streaming_integration.py
+pytest tests/unit/api_edge/test_timeouts.py
+
+# ── Phase 5 · Ops & Observability ──────────────────────────────
+pytest tests/ops/test_metrics_smoke.py
+pytest tests/ops/test_vector_index_bootstrap.py
+pytest tests/ops/test_vector_index_hnsw.py
+pytest tests/observability/test_stage_span_coverage.py
+
+# ── Phase 6 · Integration suites ───────────────────────────────
+pytest tests/integration/test_evidence_truncation_limits.py
+pytest tests/integration/test_missing_coverage.py
+pytest tests/integration/test_milestone4_loadshed_and_meta.py
+pytest tests/integration/test_milestone4_router_and_meta.py
+pytest tests/golden/fixtures/test_why_decision_panasonic_plasma.py
+pytest tests/test_sse_ask_contract.py
+
+# ── Phase 7 · Performance & soak ───────────────────────────────
+pytest tests/performance/test_model_inference_speed.py
+pytest tests/performance/test_ask_latency.py
+pytest tests/performance/test_query_latency.py
+pytest tests/performance/test_fallback_rate_under_load.py
+pytest tests/performance/test_stage_timeouts.py
 ```
+
+TEST SUITE END
 
 | #       | test-file                                                      | what it verifies                     | run-command                                                          |
 | ------- | -------------------------------------------------------------- | ------------------------------------ | -------------------------------------------------------------------- |

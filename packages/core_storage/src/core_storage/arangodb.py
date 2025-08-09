@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import socket
+from urllib.parse import urlparse
 import os
 import re
 import time
-from typing import Any, Dict, List, Iterable, Sequence
+from typing import Any, Dict, List, Iterable, Sequence, Optional, Tuple
 
 import httpx
 from functools import cached_property
@@ -61,6 +63,37 @@ class ArangoStore:
             return
         if self._client is not None:
             self.db = self._client
+            return
+        # ── Fast-fail if ArangoDB is unreachable ────────────────────────────
+        # Two probes:
+        #   1. DNS lookup         → stub-mode if host *not* resolvable
+        #   2. 50 ms TCP handshake→ stub-mode if port closed / no listener
+        parsed = urlparse(self._url)
+        host   = parsed.hostname or self._url
+        port   = parsed.port or 8529
+
+        try:
+            socket.getaddrinfo(host, None)            # DNS probe
+        except socket.gaierror:
+            logger.warning("ArangoDB host '%s' not resolvable – stub-mode", host)
+            self.db = self.graph = None
+            return
+
+        try:
+            sock = socket.create_connection((host, port), timeout=0.05)
+            sock.close()
+        except OSError:
+            logger.warning("ArangoDB %s:%s unreachable – stub-mode", host, port)
+            self.db = self.graph = None
+            return
+
+        # DNS resolves *and* port accepts connections – continue with normal
+        # driver initialisation.
+        try:
+            socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            logger.warning("ArangoDB host '%s' not resolvable – stub-mode", host)
+            self.db = self.graph = None
             return
         try:
             from arango import ArangoClient
@@ -457,8 +490,15 @@ class ArangoStore:
     def expand_candidates(self, anchor_id: str, k: int = 1) -> dict:
         if self.db is None:
             self._connect()
+        # Stub-mode fallback (Arango unavailable).  Keep the new canonical key
+        # `node_id`; keep `anchor` as a temporary alias for backward-compat.
         if self.db is None:
-            return {"anchor": anchor_id, "neighbors": [], "meta": {"snapshot_etag": ""}}
+            return {
+                "node_id": anchor_id,
+                "anchor":  anchor_id,
+                "neighbors": [],
+                "meta": {"snapshot_etag": ""},
+            }
         k = 1
         cache_key = self._cache_key("expand", anchor_id, f"k{k}")
         cached = self._cache_get(cache_key)
@@ -468,8 +508,11 @@ class ArangoStore:
                     **cached,
                     "neighbors": (cached["neighbors"].get("events") or []) + (cached["neighbors"].get("transitions") or []),
                 }
-            if "anchor" not in cached:
-                cached = {**cached, "anchor": anchor_id}
+            # Milestone-4 contract normalisation
+            if "anchor" not in cached and cached.get("node_id") is not None:
+                cached = {**cached, "anchor": cached["node_id"]}
+            if "node_id" not in cached and cached.get("anchor") is not None:
+                cached = {**cached, "node_id": cached["anchor"]}
             return cached
         aql = """
         LET anchor = DOCUMENT('nodes', @anchor)
@@ -483,9 +526,13 @@ class ArangoStore:
         RETURN { anchor: anchor, neighbors: UNIQUE(APPEND(APPEND(outgoing, incoming), sup)) }
         """
         cursor = self.db.aql.execute(aql, bind_vars={"anchor": anchor_id, "graph": self._graph_name})
-        doc = next(cursor, {"anchor": None, "neighbors": []})
+        docs   = self._cursor_to_list(cursor)
+        doc    = docs[0] if docs else {"anchor": None, "neighbors": []}
+        # Canonical key is `node_id`; `anchor` retained as alias until v3.
+        anchor_doc = doc.get("anchor") or doc.get("node_id")
         result = {
-            "anchor": doc.get("anchor"),
+            "node_id": anchor_doc,
+            "anchor":  anchor_doc,
             "neighbors": [
                 {
                     "id": n["node"].get("_key"),
@@ -514,6 +561,13 @@ class ArangoStore:
         use_vector: bool = False,
         query_vector: List[float] | None = None,
     ) -> dict:
+        if self.db is None:
+            try:
+                self._connect()
+            except Exception:
+                return {"query": q, "matches": [], "vector_used": False}
+        if self.db is None:                       # still not available
+            return {"query": q, "matches": [], "vector_used": False}
         settings = get_settings()
         if settings.enable_embeddings and not use_vector:
             _embed = globals().get("embed")

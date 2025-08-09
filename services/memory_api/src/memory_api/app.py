@@ -347,26 +347,36 @@ async def expand_candidates(payload: dict, response: Response):
     # surfaced by test_expand_anchor_with_underscore.                    #
     # ------------------------------------------------------------------ #
     etag: Optional[str] = None
-    anchor = payload.get("anchor")
+    # Milestone-4 contract: `node_id` is canonical, but keep `anchor`
+    node_id = payload.get("node_id") or payload.get("anchor")
     k = int(payload.get("k", 1))
-    if not anchor:
-        raise HTTPException(status_code=400, detail="anchor is required")
+    if not node_id:
+        raise HTTPException(status_code=400, detail="node_id is required")
     def _work():
         st = store()
-        return st.expand_candidates(anchor, k=k), st.get_snapshot_etag()
+        return st.expand_candidates(node_id, k=k), st.get_snapshot_etag()
     try:
-        with trace_span("memory.expand_candidates", anchor=anchor, k=k):
+        with trace_span("memory.expand_candidates", node_id=node_id, k=k):
             doc, etag = await asyncio.wait_for(asyncio.to_thread(_work), timeout=0.25)
     except asyncio.TimeoutError:
-        log_stage(logger, "expand", "timeout",
+        # Do **not** bubble a 504; honour the v2 contract by replying 200 with a
+        # deterministic, empty payload.  The caller can inspect `meta.fallback_reason`
+        # to see that a timeout occurred.
+        log_stage(logger, "expand", "timeout_fallback",
                   request_id=payload.get("request_id"))
-        raise HTTPException(status_code=504, detail="timeout")
+        doc = {
+            "node_id": node_id,
+            "anchor":  node_id,                 # legacy alias
+            "neighbors": [],
+            "meta": {"fallback_reason": "timeout"},
+        }
+        etag = None
     except Exception as e:
         # Unit-test friendly fallback: return empty neighbors (no DB required)
         log_stage(logger, "expand", "fallback_empty", error=type(e).__name__)
         # Legacy shape for neighbours comes from older store
         # {"events": [], "transitions": []}
-        doc  = {"anchor": None,
+        doc  = {"node_id": None,
                 "neighbors": {"events": [], "transitions": []},
                 "meta": {}}
         etag = None                      # <- guarantee *etag* exists downstream
@@ -382,10 +392,12 @@ async def expand_candidates(payload: dict, response: Response):
     if not isinstance(doc, dict):
         doc = {}
 
-    # Anchor – treat explicit null as "missing" and fall back to request anchor
-    anchor_value = doc.get("anchor")
-    if anchor_value is None:
-        anchor_value = anchor
+    # Normalise ID – prefer explicit value from store, fall back to request
+    node_value = doc.get("node_id") if isinstance(doc, dict) else None
+    if node_value is None:
+        node_value = doc.get("anchor") if isinstance(doc, dict) else None
+    if node_value is None:
+        node_value = node_id
 
     # Neighbors – flatten legacy dicts into a single list
     raw_neighbors = doc.get("neighbors", [])
@@ -397,7 +409,8 @@ async def expand_candidates(payload: dict, response: Response):
         raw_neighbors = []
 
     result = {
-        "anchor":    anchor_value,
+        "node_id":  node_value,          # new canonical key
+        "anchor":   node_value,          # legacy alias (will be removed in v3)
         "neighbors": raw_neighbors,
         "meta":      doc.get("meta", {"snapshot_etag": ""})  # always present
     }

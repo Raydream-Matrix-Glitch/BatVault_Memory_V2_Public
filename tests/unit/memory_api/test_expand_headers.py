@@ -8,12 +8,12 @@ def test_expand_headers(monkeypatch):
         def get_snapshot_etag(self):
             return "etag-10"
 
-        def expand_candidates(self, anchor: str, k: int = 1):
-            return {"anchor": anchor, "neighbors": []}
+        def expand_candidates(self, node_id: str, k: int = 1):
+            return {"node_id": node_id, "neighbors": []}
 
     monkeypatch.setattr(mod, "store", lambda: DummyStore())
     client = TestClient(mod.app)
-    res = client.post("/api/graph/expand_candidates", json={"anchor": "node-x", "k": 1})
+    res = client.post("/api/graph/expand_candidates", json={"node_id": "node-x", "k": 1})
     assert res.status_code == 200
     assert res.headers["x-snapshot-etag"] == "etag-10"
 
@@ -24,9 +24,10 @@ def test_expand_flatten_neighbors(monkeypatch):
         def get_snapshot_etag(self):
             return "etag-11"
 
-        def expand_candidates(self, anchor: str, k: int = 1):
+        # Milestone-4 contract: store still receives (node_id, k)
+        def expand_candidates(self, node_id: str, k: int = 1):
             return {
-                "anchor": anchor,
+                "node_id": node_id,
                 "neighbors": {
                     "events": [{"id": "e1"}],
                     "transitions": [{"id": "t1"}],
@@ -35,7 +36,7 @@ def test_expand_flatten_neighbors(monkeypatch):
 
     monkeypatch.setattr(mod, "store", lambda: DummyStore())
     client = TestClient(mod.app)
-    res = client.post("/api/graph/expand_candidates", json={"anchor": "node-y", "k": 1})
+    res = client.post("/api/graph/expand_candidates", json={"node_id": "node-y", "k": 1})
     assert res.status_code == 200
     body = res.json()
     assert isinstance(body["neighbors"], list)

@@ -7,10 +7,10 @@ BASE = os.getenv("MEMORY_API_BASE", "http://memory_api:8000")
 def test_expand_candidates_contract():
     # Without data, should still return shape with neighbors list
     r = httpx.post(f"{BASE}/api/graph/expand_candidates",
-                   json={"anchor": "nonexistent", "k": 1}, timeout=3.0)
+                   json={"node_id": "nonexistent", "k": 1}, timeout=3.0)
     assert r.status_code == 200
     body = r.json()
-    assert "anchor" in body and "neighbors" in body
+    assert "node_id" in body and "neighbors" in body
     assert isinstance(body["neighbors"], list)
 
 def test_resolve_text_contract():

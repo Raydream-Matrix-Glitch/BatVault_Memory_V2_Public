@@ -22,7 +22,7 @@ from core_config.constants import (
     SELECTOR_MODEL_ID,
 )
 
-logger = get_logger("selector")
+logger = get_logger("gateway.selector")
 
 
 def bundle_size_bytes(ev: WhyDecisionEvidence) -> int:

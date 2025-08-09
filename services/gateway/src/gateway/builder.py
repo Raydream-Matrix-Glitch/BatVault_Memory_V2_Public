@@ -1,6 +1,6 @@
 from __future__ import annotations
 import time, uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, Tuple, Dict
 from core_logging import trace_span
 
 import orjson
@@ -17,6 +17,7 @@ from core_models.models import (
 from .selector import truncate_evidence, bundle_size_bytes
 from .prompt_envelope import build_prompt_envelope
 from .templater import deterministic_short_answer
+from . import llm_client
 import gateway.templater as templater
 from .load_shed import should_load_shed
 
@@ -66,6 +67,30 @@ async def build_why_decision_response(
     if req.evidence is not None:
         ev = req.evidence
     elif req.anchor_id:
+        # Build the evidence from the Memory‑API given an anchor ID.  The
+        # EvidenceBuilder contract should normally never return ``None``.
+        # However, tests may monkey‑patch the builder to return ``None`` or
+        # the builder could fail open if upstream dependencies are down.
+        # In those cases we degrade gracefully by constructing a minimal
+        # evidence stub.  This behaviour ensures the Gateway never throws
+        # an ``AttributeError`` when accessing ``model_dump`` on a ``None``
+        # object and aligns with the tech‑spec requirement that unknown
+        # decisions still produce a valid bundle (spec §B2/B5).
+        ev = await evidence_builder.build(req.anchor_id)
+        if ev is None:  # pragma: no cover – defensive fallback
+            # Fallback: produce an empty evidence bundle with the given
+            # anchor ID.  This stub has no events or transitions and a
+            # conservative snapshot etag.  ``allowed_ids`` will be
+            # recomputed below, so leave it empty here.
+            ev = WhyDecisionEvidence(
+                anchor=WhyDecisionAnchor(id=req.anchor_id),
+                events=[],
+                transitions=WhyDecisionTransitions(preceding=[], succeeding=[]),
+            )
+            # ``snapshot_etag`` is an optional field excluded from the
+            # default model dump.  Set it explicitly so downstream
+            # fingerprinting and caching behave deterministically.
+            ev.snapshot_etag = "unknown"
         ev = await evidence_builder.build(req.anchor_id)
     else:                       # safeguard – should be caught by AskIn validator
         ev = WhyDecisionEvidence(
@@ -81,16 +106,41 @@ async def build_why_decision_response(
     arte["evidence_post.json"] = orjson.dumps(ev.model_dump(mode="python"))
 
     # ── deterministic plan stub (needed for audit contract) ────────────
-    plan_dict = {"anchor": ev.anchor.id, "k": 1}
+    plan_dict = {"node_id": ev.anchor.id, "k": 1}
     arte["plan.json"] = orjson.dumps(plan_dict)
 
     ev.allowed_ids = _allowed_ids(ev)
 
-    # ── answer (templater + validator) ─────────────────────────
-    ans = req.answer or WhyDecisionAnswer(
-        short_answer=deterministic_short_answer(ev),
-        supporting_ids=[ev.allowed_ids[0]] if ev.allowed_ids else [],
+    # ── canonical prompt envelope + fingerprint ────────────────
+    envelope = build_prompt_envelope(
+        question=f"Why was decision {ev.anchor.id} made?",
+        evidence=ev.model_dump(mode="python"),
+        snapshot_etag=getattr(ev, "snapshot_etag", "unknown"),
+        intent=req.intent,
+        allowed_ids=ev.allowed_ids,
+        retries=getattr(ev, "_retry_count", 0),
     )
+
+    # ── answer (JSON-only LLM → fallback templater) ──────────────────────
+    try:
+        raw_json = llm_client.summarise_json(
+            envelope,
+            temperature=0.0,
+            max_tokens=envelope.get("constraints", {}).get("max_tokens", 256),
+            retries=2,
+        )
+
+        # Persist artefact for audit trail (§M5)
+        arte["llm_raw.json"] = raw_json.encode()
+
+        parsed = orjson.loads(raw_json)
+        ans = req.answer or WhyDecisionAnswer.model_validate(parsed)
+    except Exception as exc:  # pragma: no cover – defensive
+        logger.warning("LLM JSON summariser failed – using templater", exc_info=exc)
+        ans = req.answer or WhyDecisionAnswer(
+            short_answer=deterministic_short_answer(ev),
+            supporting_ids=[ev.allowed_ids[0]] if ev.allowed_ids else [],
+        )
     # ── validate ────────────────────────────────────────────────
     with trace_span.ctx("validate", anchor_id=ev.anchor.id):
         ans, changed, errs = templater.validate_and_fix(
@@ -104,15 +154,6 @@ async def build_why_decision_response(
         event_count=len(ev.events),
     )
 
-    # ── canonical prompt envelope + fingerprint ────────────────
-    envelope = build_prompt_envelope(
-        question=f"Why was decision {ev.anchor.id} made?",
-        evidence=ev.model_dump(mode="python"),
-        snapshot_etag=getattr(ev, "snapshot_etag", "unknown"),
-        intent=req.intent,
-        allowed_ids=ev.allowed_ids,
-        retries=getattr(ev, "_retry_count", 0),
-    )
     arte["envelope.json"]       = orjson.dumps(envelope)
     arte["rendered_prompt.txt"] = canonical_json(envelope)
 

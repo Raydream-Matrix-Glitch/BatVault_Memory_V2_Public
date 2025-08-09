@@ -16,9 +16,10 @@ from .reranker import rerank
 from .fallback_search import search_bm25
 from core_utils import is_slug
 from core_config import get_settings
+from core_config.constants import CACHE_TTL_RESOLVER_SEC as CACHE_TTL
 
 settings = get_settings()
-CACHE_TTL = 300  # seconds
+
 
 # ---------------------------------------------------------------------------#
 # Redis connection (optional – falls back to None when Redis is unavailable) #

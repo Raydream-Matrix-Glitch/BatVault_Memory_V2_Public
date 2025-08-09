@@ -1,5 +1,10 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from core_config.constants import (
+    TIMEOUT_SEARCH_MS,
+    TIMEOUT_EXPAND_MS,
+    TIMEOUT_ENRICH_MS,
+)
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -69,6 +74,8 @@ class Settings(BaseSettings):
     minio_region: str = Field(default="us-east-1", alias="MINIO_REGION")
     minio_retention_days: int = Field(default=14, alias="MINIO_RETENTION_DAYS")
     minio_secure: bool = Field(default=False, alias="MINIO_SECURE")
+    # non-blocking MinIO uploads (§Tech-Spec A, “performance budgets”)
+    minio_async_timeout: int = Field(default=3, alias="MINIO_ASYNC_TIMEOUT")
     memory_api_url: str = Field(
         default="http://memory_api:8000", alias="MEMORY_API_URL"
     )
@@ -82,10 +89,10 @@ class Settings(BaseSettings):
         default="100/minute", alias="API_RATE_LIMIT_DEFAULT"
     )
 
-    # ── Stage time-outs (A-2) – milliseconds ────────────────────────
-    timeout_search_ms: int = Field(default=800,  alias="TIMEOUT_SEARCH_MS")
-    timeout_expand_ms: int = Field(default=250,  alias="TIMEOUT_EXPAND_MS")
-    timeout_enrich_ms: int = Field(default=600,  alias="TIMEOUT_ENRICH_MS")
+    # ── Stage time-outs (A-2) – milliseconds ───────────────────────
+    timeout_search_ms: int = Field(default=TIMEOUT_SEARCH_MS,  alias="TIMEOUT_SEARCH_MS")
+    timeout_expand_ms: int = Field(default=TIMEOUT_EXPAND_MS,  alias="TIMEOUT_EXPAND_MS")
+    timeout_enrich_ms: int = Field(default=TIMEOUT_ENRICH_MS,  alias="TIMEOUT_ENRICH_MS")
 
 def get_settings() -> "Settings":
     return Settings()  # type: ignore

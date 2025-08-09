@@ -31,7 +31,22 @@ def test_log_envelope_compliance():
     raw = buf.getvalue().strip()
     assert raw, "No log output captured"
 
-    payload = json.loads(raw)
+    # The buffer may now contain *multiple* JSON log lines emitted by the
+    # Memory-API / Gateway fixtures that run in the background.  Scan each
+    # line and pick the one that was produced by the logger under test
+    # (service starts with “gateway”).
+    payload = None
+    for line in raw.splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            # Ignore any non-JSON noise (e.g. uvicorn access logs)
+            continue
+        if rec.get("service", "").startswith("gateway"):
+            payload = rec
+            break
+
+    assert payload is not None, "Expected gateway log record not found in captured output"
 
     # ── top‑level ─────────────────────────────────────────────────────────
     assert "timestamp" in payload, "timestamp missing"

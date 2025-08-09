@@ -15,10 +15,10 @@ class _DummyCM:
         return Response(200, json={"id": "dummy"})
 
 @pytest.mark.asyncio
-async def test_expand_candidates_uses_anchor(monkeypatch):
+async def test_expand_candidates_uses_node_id(monkeypatch):
     dummy = _DummyCM()
     monkeypatch.setattr("gateway.evidence._safe_async_client",
                         lambda **kw: dummy)
     eb = EvidenceBuilder(redis_client=None)
     await eb.get_evidence("panasonic-exit-plasma-2012")
-    assert dummy.last_json == {"anchor": "panasonic-exit-plasma-2012", "k": 1}
+    assert dummy.last_json == {"node_id": "panasonic-exit-plasma-2012", "k": 1}

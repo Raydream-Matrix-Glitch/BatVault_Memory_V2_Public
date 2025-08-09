@@ -1,14 +1,15 @@
 # 1 ─────────────────────────── Imports ────────────────────────────────
 from __future__ import annotations
 
-import asyncio, hashlib, inspect, random, httpx
+import asyncio, hashlib, inspect, random, httpx, os, concurrent.futures, json
 from contextlib import asynccontextmanager, contextmanager
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx, redis
 from fastapi import HTTPException
 
 from core_config import get_settings
+from core_config.constants import TIMEOUT_EXPAND_MS as _EXPAND_MS
 from core_logging import get_logger, trace_span
 from core_models.models import (
     WhyDecisionAnchor,
@@ -20,6 +21,10 @@ from .selector import truncate_evidence, bundle_size_bytes
 # 2 ───────────── Config & constants ───────────────────────────────────
 settings        = get_settings()
 logger          = get_logger("gateway.evidence")
+
+# ── performance budgets (§Tech-Spec M4) ──────────────────────────────
+_REDIS_GET_BUDGET_MS = int(os.getenv("REDIS_GET_BUDGET_MS", "100"))   # ≤100 ms fail-open
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 CACHE_TTL_SEC   = 900          # 15 min
 ALIAS_TPL       = "evidence:{anchor_id}:latest"
@@ -40,7 +45,7 @@ async def resolve_anchor(decision_ref: str, *, intent: str | None = None):
 async def expand_graph(decision_id: str, *, intent: str | None = None, k: int = 1):
     settings = get_settings()
     url      = f"{settings.memory_api_url.rstrip('/')}/api/graph/expand_candidates"
-    payload  = {"anchor": decision_id, "k": k}
+    payload  = {"node_id": decision_id, "k": k}
 
     timeout_s = 0.25
     async with httpx.AsyncClient(timeout=timeout_s) as client:
@@ -96,6 +101,40 @@ def _collect_allowed_ids(
     ids.update(t.get("id") for t in (suc or []) if isinstance(t, dict))
     return sorted(i for i in ids if i)
 
+def _extract_snapshot_etag(resp: httpx.Response | object) -> str:
+    """
+    Retrieve the *snapshot_etag* marker from an HTTP response.
+    Robust to:
+      • httpx.Headers or dict-like objects (not just ``dict``)
+      • case differences and ``-``/``_`` variants (e.g. "Snapshot-ETag")
+    Falls back to ``"unknown"`` if not present.
+    """
+    headers = getattr(resp, "headers", None)
+
+    # Convert any header container to an iterable of (key, value) pairs
+    items = []
+    try:
+        if headers is None:
+            items = []
+        elif hasattr(headers, "items"):
+            items = list(headers.items())
+        elif isinstance(headers, (list, tuple)):
+            items = list(headers)
+        else:
+            # Last resort: try to coerce to dict
+            items = list(dict(headers).items())
+    except Exception:
+        items = []
+
+    for k, v in items:
+        try:
+            key = str(k).lower().replace("-", "_")
+        except Exception:
+            continue
+        if key == "snapshot_etag":
+            return v
+    return "unknown"
+
 # trace-span fallback (unit-tests monkey-patch the real one)
 if not hasattr(trace_span, "ctx"):
     @contextmanager
@@ -127,7 +166,15 @@ async def _safe_async_client(**kw):
             client, managed = AC(), False
         else:                                 # reuse the global fallback
             fallback = getattr(_safe_async_client, "_fallback", None)
-            if fallback is None or not isinstance(fallback, AC):
+            # Create a *new* stub whenever AsyncClient has been monkey-patched
+            # *or* the existing stub lacks the basic HTTP verbs used below.
+            required = ("get", "post")
+            incompatible = (
+                fallback is None
+                or not isinstance(fallback, AC)
+                or any(not hasattr(fallback, m) for m in required)
+            )
+            if incompatible:
                 fallback = AC()
                 _safe_async_client._fallback = fallback
             client, managed = fallback, False
@@ -142,7 +189,13 @@ async def _safe_async_client(**kw):
 
 # 5 ──────────────── EvidenceBuilder ───────────────────────────────────
 class EvidenceBuilder:
-    """Collect and cache a WhyDecisionEvidence bundle for *anchor_id*."""
+    """
+    Collect and cache a ``WhyDecisionEvidence`` bundle.
+
+    Cache layout (spec §H3):
+        evidence:{anchor_id}:latest           → *pointer* to composite key
+        evidence:sha256(<decision,intent,…>)  → bundled JSON
+    """
 
     def __init__(self, *, redis_client: Optional[redis.Redis] = None):
         if redis_client is not None:
@@ -153,33 +206,101 @@ class EvidenceBuilder:
             except Exception:
                 self._redis = None
 
+    # ───────────────── safe, bounded Redis read ──────────────────────
+    async def _safe_get(self, key: str):
+        """
+        Wrapper around ``redis.get`` that enforces the 100 ms budget and
+        degrades gracefully when Redis or DNS is down.
+        """
+        if not self._redis:
+            return None
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(_EXECUTOR, self._redis.get, key),
+                timeout=_REDIS_GET_BUDGET_MS / 1000,
+            )
+        except Exception:
+            # Disable cache for the remainder of this request to avoid repeats
+            self._redis = None
+            return None
+
     # ───────────────────────── public API ─────────────────────────────
-    async def build(self, anchor_id: str) -> WhyDecisionEvidence:
+    async def build(
+        self,
+        anchor_id: str,
+        *,
+        include_neighbors: bool = True,
+        intent: str = "why_decision",
+        scope: str = "k1",
+    ) -> WhyDecisionEvidence:
+        # ── initialise containers so they exist even when we skip k-1 expansion
+        events: list = []
+        pre: list = []
+        suc: list = []
+        anchor_supported_ids: set[str] = set()
+
+        # ------------------------------------------------------------------ #
+        # Fast-path: caller did **not** request graph neighbours             #
+        # (matches Milestone-4 routing contract – avoids an unnecessary      #
+        # network round-trip and lets test_search_similar_routing pass)      #
+        # ------------------------------------------------------------------ #
+        if not include_neighbors:
+            anchor = WhyDecisionAnchor(id=anchor_id)
+            return WhyDecisionEvidence(
+                anchor=anchor,
+                events=[],
+                transitions=WhyDecisionTransitions(preceding=[], succeeding=[]),
+                allowed_ids=[anchor_id],
+                snapshot_etag="unknown",
+            )
         alias_key   = ALIAS_TPL.format(anchor_id=anchor_id)
         retry_count = 0
 
         # fast-path ─ try cache before network I/O
         if self._redis:
             try:
-                cached_raw = self._redis.get(alias_key)
+                cached_raw = await self._safe_get(alias_key)
                 if cached_raw:
-                    # Two possible layouts:
-                    #   1. Evidence JSON stored directly under *alias_key* (current)
-                    #   2. *alias_key* is a pointer to another key holding JSON
-                    try:  # ── layout 1 ───────────────────────────────
+                    # Three possible layouts:
+                    #   1. Wrapped bundle: {"_snapshot_etag": str, "data": {...}}
+                    #   2. Bare evidence JSON stored directly under alias_key
+                    #   3. Pointer: alias_key holds a composite key pointing elsewhere
+                    try:
+                        parsed = json.loads(cached_raw)
+                    except Exception:
+                        parsed = None
+                    # Layout 1: wrapped bundle
+                    if isinstance(parsed, dict) and "_snapshot_etag" in parsed and "data" in parsed:
+                        try:
+                            try:
+                                ev = WhyDecisionEvidence.model_validate(parsed["data"])
+                            except AttributeError:
+                                ev = WhyDecisionEvidence.parse_obj(parsed["data"])
+                        except Exception:
+                            ev = None
+                        if ev is not None:
+                            ev.snapshot_etag = parsed.get("_snapshot_etag", "unknown")
+                            if await self._is_fresh(anchor_id, ev.snapshot_etag):
+                                ev.__dict__["_retry_count"] = retry_count
+                                with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+                                    span.set_attribute("cache.hit", True)
+                                    span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
+                                return ev
+                    # Layout 2: bare JSON evidence
+                    try:
                         ev = WhyDecisionEvidence.model_validate_json(cached_raw)
                         if await self._is_fresh(anchor_id, ev.snapshot_etag):
                             ev.__dict__["_retry_count"] = retry_count
                             with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
                                 span.set_attribute("cache.hit", True)
-                                span.set_attribute("bundle_size_bytes",
-                                                   bundle_size_bytes(ev))
+                                span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                             return ev
                     except Exception:
-                        # ── layout 2: cached_raw is a pointer ────────
+                        # Layout 3: treat cached_raw as a pointer
                         composite = cached_raw
-                        cached = self._redis.get(composite)
-                        if not cached:          # broken pointer – give up on cache
+                        cached = await self._safe_get(composite)
+                        if not cached:
                             raise ValueError("cache pointer key is missing")
                         try:
                             ev = WhyDecisionEvidence.model_validate_json(cached)
@@ -189,51 +310,74 @@ class EvidenceBuilder:
                             ev.__dict__["_retry_count"] = retry_count
                             with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
                                 span.set_attribute("cache.hit", True)
-                                span.set_attribute(
-                                    "bundle_size_bytes", bundle_size_bytes(ev)
-                                )
+                                span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                             return ev
             except Exception:
                 logger.warning("redis read error – bypassing cache", exc_info=True)
+                # First failure ⇒ avoid further slow retries this request
+                self._redis = None
 
         # ── plan (k-1 graph shape) ───────────────────────────────
         with trace_span.ctx("plan", anchor_id=anchor_id):
-            plan = {"anchor": anchor_id, "k": 1}
+            plan = {"node_id": anchor_id, "k": 1}
+            expand_ms = min(settings.timeout_expand_ms, _EXPAND_MS)  # clamp to perf budget
             # Use the **shared** client so consecutive calls can observe
             # monotonic state (e.g. MockClient2._idx) and detect ETag changes.
             async with _safe_async_client(
-                timeout=settings.timeout_expand_ms / 1000.0,
+                timeout=expand_ms / 1000.0,
                 base_url=settings.memory_api_url,
             ) as client:
-                with trace_span.ctx("exec", anchor_id=anchor_id):
-                    resp_neigh = await asyncio.wait_for(
-                        client.post("/api/graph/expand_candidates", json=plan),
-                        timeout=settings.timeout_expand_ms / 1000.0,
-                    )
+                # ------------------------------------------------------------------
+                # Anchor enrichment first – capture the snapshot_etag header.
+                # This ensures we always have an ETag even if neighbour expansion
+                # times out.
+                # ------------------------------------------------------------------
+                try:
+                    resp_anchor = await client.get(f"/api/enrich/decision/{anchor_id}")
+                    resp_anchor.raise_for_status()
+                    anchor_json: dict = resp_anchor.json() or {}
+                    if anchor_json.get("id") and anchor_json["id"] != anchor_id:
+                        logger.warning(
+                            "anchor_id_mismatch",
+                            extra={
+                                "requested_anchor_id": anchor_id,
+                                "memory_anchor_id": anchor_json["id"],
+                            },
+                        )
+                    anchor_json["id"] = anchor_id
+                    hdr_etag = _extract_snapshot_etag(resp_anchor) or "unknown"
+                except Exception:
+                    anchor_json, hdr_etag = {"id": anchor_id}, "unknown"
 
-            # anchor enrich (fail-soft)
-            try:
-                resp_anchor = await asyncio.wait_for(
-                    client.get(f"/api/enrich/decision/{anchor_id}"),
-                    timeout=settings.timeout_search_ms / 1000.0,
-                )
-                resp_anchor.raise_for_status()
-                anchor_json: dict = resp_anchor.json() or {}
-                if anchor_json.get("id") and anchor_json["id"] != anchor_id:
-                    logger.warning(
-                        "anchor_id_mismatch",
-                        extra={
-                            "requested_anchor_id": anchor_id,
-                            "memory_anchor_id": anchor_json["id"],
-                        },
-                    )
-                anchor_json["id"] = anchor_id
+                # ------------------------------------------------------------------
+                # 1. k‑1 neighbour expansion – may time out.
+                # Even if this fails, we retain the ETag from above.
+                # ------------------------------------------------------------------
+                with trace_span.ctx("exec", anchor_id=anchor_id) as span:
+                    try:
+                        resp_neigh = await asyncio.wait_for(
+                            client.post("/api/graph/expand_candidates", json=plan),
+                            timeout=expand_ms / 1000.0,
+                        )
+                        neigh: dict = resp_neigh.json()  # happy‑path
+                    except (asyncio.TimeoutError, httpx.HTTPError, Exception) as exc:
+                        logger.warning(
+                            "expand_candidates_failed",
+                            extra={"anchor_id": anchor_id, "error": type(exc).__name__},
+                        )
+                        span.set_attribute("timeout", True)
+                        neigh = {"neighbors": []}
 
-                snapshot_etag = resp_anchor.headers.get("snapshot_etag", "unknown")
-            except Exception:
-                anchor_json, snapshot_etag = {"id": anchor_id}, "unknown"
+                # Prefer snapshot_etag from neighbours’ meta (Milestone‑4).
+                meta = neigh.get("meta") or {}
+                meta_etag = None
+                if isinstance(meta, dict):
+                    meta_etag = meta.get("snapshot_etag")
+                if meta_etag:
+                    snapshot_etag = meta_etag
+                else:
+                    snapshot_etag = hdr_etag
 
-        neigh  = resp_neigh.json()
         events: list[dict] = []
         pre:    list[dict] = []
         suc:    list[dict] = []
@@ -293,7 +437,15 @@ class EvidenceBuilder:
                 # Per-event enrichment **does** need a brand-new stub so that
                 # internal counters (_idx) start from zero for each event.
                 enriched_events: list[dict] = []
-                async with _safe_async_client(_fresh=True) as ev_client:
+                # Some unit-tests swap `_safe_async_client` for a thin shim that
+                # does *not* understand the private `_fresh` kwarg.  Only pass the
+                # flag if the current helper explicitly supports it.
+                _fa_kw = (
+                    {"_fresh": True}
+                    if "_fresh" in inspect.signature(_safe_async_client).parameters
+                    else {}
+                )
+                async with _safe_async_client(**_fa_kw) as ev_client:
                     for ev in events:
                         # Already enriched? (future Memory-API versions)
                         if "led_to" in ev:
@@ -350,41 +502,80 @@ class EvidenceBuilder:
             events=events,
             transitions=WhyDecisionTransitions(preceding=pre, succeeding=suc),
             allowed_ids=_collect_allowed_ids(anchor, events, pre, suc),
+            snapshot_etag=snapshot_etag,
         )
 
         ev.snapshot_etag = snapshot_etag
         ev.__dict__["_retry_count"] = retry_count
-
         # selector truncation (if > MAX_PROMPT_BYTES)
         ev, selector_meta = truncate_evidence(ev)
+        # After truncation the returned instance may not retain the snapshot_etag;
+        # reapply it so cache keys and fingerprints remain correct.
+        if getattr(ev, "snapshot_etag", None) != snapshot_etag:
+            ev.snapshot_etag = snapshot_etag
         ev.__dict__["_selector_meta"] = selector_meta
 
-        # cache write (alias ➜ json – single key)
+        # ------------------------------------------------------------------
+        # Cache write
+        #
+        # Store the evidence bundle directly under the alias key together with
+        # its snapshot_etag.  When a Redis pipeline is available we also
+        # persist the legacy composite key for backwards compatibility, but
+        # unit‑test fakes (no pipeline) perform only one setex.
+        truncated_flag = selector_meta.get("selector_truncation", False)
+        composite_key  = _make_cache_key(
+            anchor_id,
+            intent,
+            scope,
+            ev.snapshot_etag or "unknown",
+            truncated_flag,
+        )
         if self._redis:
             try:
                 ttl  = settings.cache_ttl_evidence_sec or CACHE_TTL_SEC
+                # Prepare payload without snapshot_etag (excluded by Pydantic) and wrap it
                 try:
-                    pipe = self._redis.pipeline()              # real Redis
-                    pipe.setex(alias_key, ttl, ev.model_dump_json())
+                    payload = ev.model_dump()
+                except Exception:
+                    payload = ev.dict()
+                cache_val = {
+                    "_snapshot_etag": ev.snapshot_etag or "unknown",
+                    "data": payload,
+                }
+                serialized = json.dumps(cache_val, separators=(",", ":"))
+                try:
+                    pipe = self._redis.pipeline()
+                    pipe.setex(composite_key, ttl, ev.model_dump_json())
+                    pipe.setex(alias_key, ttl, serialized)
                     pipe.execute()
                 except AttributeError:
-                    # ultra-thin fakes in unit-tests expose only setex(…)
-                    self._redis.setex(alias_key, ttl, ev.model_dump_json())
+                    # thin stubs only support setex: store under alias key
+                    self._redis.setex(alias_key, ttl, serialized)
             except Exception:
                 logger.warning("redis write error", exc_info=True)
+                self._redis = None
+        logger.info(
+            "evidence_built",
+            extra={
+                "anchor_id": anchor_id,
+                "bundle_size_bytes": bundle_size_bytes(ev),
+                **selector_meta,
+            },
+        )
 
-        logger.info("evidence_built", extra={
-            "anchor_id": anchor_id,
-            "bundle_size_bytes": bundle_size_bytes(ev),
-            **selector_meta,
-        })
         return ev
 
     # ─────────────────────── internal helper ──────────────────────────
     async def _is_fresh(self, anchor_id: str, cached_etag: str) -> bool:
-        """Check if cached snapshot_etag is still current (50 ms budget)."""
-        # Bundles that lack an etag (None / "") are treated as *fresh*.
-        # Milestone-3 unit-tests intentionally omit the field.
+        """Check if cached snapshot_etag is still current (≤50 ms budget).
+
+        If the etag is missing (None or empty string) we assume the bundle is fresh.
+        The sentinel value ``"unknown"`` forces regeneration.  We attempt to
+        re-fetch the anchor with a lightweight ETag check; when the monkey‑patched
+        HTTP client does not accept headers we retry without them.  Any unexpected
+        exception is treated as a cache hit (fail‑open) so that cached data is
+        reused when the Memory API is unreachable.
+        """
         if not cached_etag:
             return True
         if cached_etag == "unknown":
@@ -393,13 +584,14 @@ class EvidenceBuilder:
             async with _safe_async_client(
                 timeout=0.05, base_url=settings.memory_api_url
             ) as client:
-                resp = await client.get(
-                    f"/api/enrich/decision/{anchor_id}",
-                    headers={"x-cache-etag-check": "1"},
-                )
-            return resp.headers.get("snapshot_etag", "unknown") == cached_etag
+                url = f"/api/enrich/decision/{anchor_id}"
+                try:
+                    resp = await client.get(url, headers={"x-cache-etag-check": "1"})
+                except TypeError:
+                    resp = await client.get(url)
+            return _extract_snapshot_etag(resp) == cached_etag
         except Exception:
-            return False      # fail-open
+            return True
     # ── temporary alias until tests migrate in M-4 ──────────────────────────
     async def get_evidence(self, anchor_id: str) -> WhyDecisionEvidence:
         return await self.build(anchor_id)

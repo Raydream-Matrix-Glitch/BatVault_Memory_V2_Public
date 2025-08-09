@@ -3,6 +3,7 @@ from typing import List
 
 import numpy as np
 import os
+from core_config.constants import EMBEDDING_DIM as dim
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -20,6 +21,5 @@ def _model():
 def encode(texts: List[str]) -> np.ndarray:
     if SentenceTransformer is None:
         # fallback zeros with the correct dimension from ENV (default 768)
-        dim = int(os.getenv("EMBEDDING_DIM", "768"))
         return np.zeros((len(texts), dim), dtype=np.float32)
     return _model().encode(texts, normalize_embeddings=True)

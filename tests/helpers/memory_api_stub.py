@@ -40,7 +40,14 @@ def _build_transport(anchor_id: str, event_id: str):
 
 
 @contextmanager
-def patch_httpx(*, anchor_id: str, event_id: str):
+def patch_httpx(*, anchor_id: str | None = None, node_id: str | None = None, event_id: str):
+    # Accept both the new (node_id) and legacy (anchor_id) parameter names
+    if anchor_id is None:
+        if node_id is None:
+            raise TypeError("patch_httpx() missing required argument: 'anchor_id' or 'node_id'")
+        anchor_id = node_id
+    elif node_id is not None and anchor_id != node_id:
+        raise TypeError("patch_httpx() got conflicting 'anchor_id' and 'node_id'")
     """
     Context-manager that monkey-patches httpx so all new AsyncClient/Client
     instances use the in-memory Memory-API stub.

@@ -61,7 +61,7 @@ def _httpx_handler(req: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             json={
-                "anchor":    DECISION,
+                "node_id":   DECISION,
                 "neighbors": [{**event_json, "type": "event"}],
                 "meta":      {"snapshot_etag": "dummy"},
             },
@@ -87,7 +87,7 @@ def _mock_async_client(*args, **kwargs):
 # any AsyncClient pools, and keep it alive for the lifetime of the test
 # module.  ExitStack guarantees deterministic teardown when PyTest
 # reloads modules (e.g. `--lf`, xdist, etc.).
-_httpx_patch = patch_httpx(anchor_id=DECISION, event_id=EVENT)
+_httpx_patch = patch_httpx(node_id=DECISION, event_id=EVENT)
 ExitStack().enter_context(_httpx_patch)
 
 # Don’t hit MinIO in unit-tests
@@ -103,7 +103,7 @@ def test_backlink_derivation_contract():
       decision.supported_by  ↔  event.led_to
     """
     client = TestClient(app)
-    resp   = client.post("/v2/ask", json={"anchor_id": DECISION})
+    resp   = client.post("/v2/ask", json={"node_id": DECISION})
     assert resp.status_code == 200
 
     payload = resp.json()

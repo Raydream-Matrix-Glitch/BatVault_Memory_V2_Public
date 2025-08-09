@@ -7,6 +7,7 @@ pytest.importorskip("pytest_asyncio")  # clean “SKIPPED – requires pytest-as
 
 from gateway.evidence import EvidenceBuilder
 from core_models.models import WhyDecisionEvidence
+from gateway.evidence import _extract_snapshot_etag
 
 
 # ---------- fixture helpers -------------------------------------------------
@@ -35,6 +36,14 @@ class DummyResp:
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+def test__extract_snapshot_etag_variants():
+    # underscore form
+    r1 = DummyResp({}, {"snapshot_etag": "u1"})
+    assert _extract_snapshot_etag(r1) == "u1"
+    # hyphenated + case-variant
+    r2 = DummyResp({}, {"Snapshot-ETag": "h1"})
+    assert _extract_snapshot_etag(r2) == "h1"
 
 
 def load_decision(anchor_id: str) -> dict:
