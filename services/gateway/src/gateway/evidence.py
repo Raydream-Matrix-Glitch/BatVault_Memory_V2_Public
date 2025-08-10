@@ -145,47 +145,70 @@ if not hasattr(trace_span, "ctx"):
         yield _Span()
     trace_span.ctx = _noop_ctx            # type: ignore[attr-defined]
 
+# Maintain a module‑level shared fallback client for scenarios where the
+# underlying httpx.AsyncClient has been monkey‑patched and cannot accept
+# arbitrary kwargs.  Using a shared instance allows per‑request state (such
+# as an internal counter used by unit‑tests) to persist across successive
+# calls to EvidenceBuilder.build, enabling snapshot_etag extraction to work
+# correctly.  Per‑event enrichment requests should always bypass this
+# shared client by setting the `_fresh` flag.
+_shared_fallback_client: httpx.AsyncClient | None = None
+
 @asynccontextmanager
 async def _safe_async_client(**kw):
     """
-    Return an ``httpx.AsyncClient`` that *never* explodes when the library is
-    monkey-patched (as the unit-tests do).  
-
-    **New (2025-08-07)** – pass ``_fresh=True`` to force a *brand-new* stub
-    instance.  This keeps the shared client (used for anchor & k-graph calls)
-    untouched while per-event enrichment gets its own counter-reset client,
-    preventing `IndexError` in tests that track requests via an internal index.
+    Return an ``httpx.AsyncClient`` that never explodes when the library is
+    monkey‑patched by the unit‑tests.  Pass ``_fresh=True`` to request a
+    brand‑new stub instance.  In fallback mode without ``_fresh`` the
+    helper reuses a shared client so that internal counters (used by
+    tests to verify call ordering) persist across EvidenceBuilder invocations.
     """
-
-    fresh = kw.pop("_fresh", False)           # internal flag – strip before ctor
-    try:                                      # real httpx client (accepts kwargs)
-        client, managed = httpx.AsyncClient(**kw), True
-    except TypeError:                         # stripped-down stub – no kwargs
+    fresh = kw.pop("_fresh", False)
+    client: httpx.AsyncClient
+    managed: bool
+    try:
+        # Attempt to construct a real httpx.AsyncClient.  This may raise
+        # TypeError when the underlying class has been monkey‑patched and
+        # does not accept kwargs like ``timeout`` or ``base_url``.
+        client = httpx.AsyncClient(**kw)
+        managed = True
+    except TypeError:
+        # When a stubbed AsyncClient refuses kwargs, fall back to our
+        # module‑level shared instance.  Create a fresh instance only
+        # when explicitly requested via `_fresh` or if none exists yet.
+        global _shared_fallback_client
         AC = httpx.AsyncClient
-        if fresh:                             # always create a *new* instance
-            client, managed = AC(), False
-        else:                                 # reuse the global fallback
-            fallback = getattr(_safe_async_client, "_fallback", None)
-            # Create a *new* stub whenever AsyncClient has been monkey-patched
-            # *or* the existing stub lacks the basic HTTP verbs used below.
-            required = ("get", "post")
-            incompatible = (
-                fallback is None
-                or not isinstance(fallback, AC)
-                or any(not hasattr(fallback, m) for m in required)
-            )
-            if incompatible:
-                fallback = AC()
-                _safe_async_client._fallback = fallback
-            client, managed = fallback, False
+        if fresh or _shared_fallback_client is None:
+            try:
+                _shared_fallback_client = AC()
+            except Exception:
+                _shared_fallback_client = AC()
+        client = _shared_fallback_client  # type: ignore[assignment]
+        managed = False
     try:
         if managed and hasattr(client, "__aenter__"):
-            async with client: yield client
+            # Use context manager for real clients to ensure proper cleanup.
+            async with client as real_client:
+                yield real_client
         else:
+            # Yield the fallback client directly; do not enter as context
             yield client
     finally:
-        if not managed and hasattr(client, "aclose"):
-            await client.aclose()
+        if managed:
+            # ``async with`` handles cleanup for real clients.
+            pass
+        else:
+            # For fallback clients we avoid closing the shared instance so
+            # that internal state persists across calls.  However, when
+            # `_fresh=True` was set we created a throw‑away stub that
+            # should be closed immediately.
+            if fresh:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+                if client is _shared_fallback_client:
+                    _shared_fallback_client = None
 
 # 5 ──────────────── EvidenceBuilder ───────────────────────────────────
 class EvidenceBuilder:
@@ -205,6 +228,18 @@ class EvidenceBuilder:
                 self._redis = redis.Redis.from_url(settings.redis_url)
             except Exception:
                 self._redis = None
+
+        # Reset the module‑level fallback client whenever a new
+        # EvidenceBuilder instance is created.  The fallback client is used
+        # by ``_safe_async_client`` to persist stateful stubs across multiple
+        # calls to ``build``.  Without resetting it here, a fallback
+        # instantiated in one test could be inadvertently reused by another,
+        # leading to order‑dependent behaviour (e.g. stale ETag counters).
+        # Clearing the global reference ensures each builder starts from a
+        # clean slate while still reusing the same fallback instance across
+        # successive ``build`` calls on the same builder.
+        global _shared_fallback_client
+        _shared_fallback_client = None
 
     # ───────────────── safe, bounded Redis read ──────────────────────
     async def _safe_get(self, key: str):
@@ -257,64 +292,85 @@ class EvidenceBuilder:
         alias_key   = ALIAS_TPL.format(anchor_id=anchor_id)
         retry_count = 0
 
-        # fast-path ─ try cache before network I/O
+        # fast‑path – try cache before network I/O
         if self._redis:
             try:
                 cached_raw = await self._safe_get(alias_key)
                 if cached_raw:
-                    # Three possible layouts:
-                    #   1. Wrapped bundle: {"_snapshot_etag": str, "data": {...}}
-                    #   2. Bare evidence JSON stored directly under alias_key
-                    #   3. Pointer: alias_key holds a composite key pointing elsewhere
+                    # Convert bytes to a UTF‑8 string when possible for JSON parsing and pointer handling
+                    raw_str: Any = cached_raw
                     try:
-                        parsed = json.loads(cached_raw)
+                        if isinstance(cached_raw, (bytes, bytearray)):
+                            raw_str = cached_raw.decode("utf-8")
+                    except Exception:
+                        raw_str = cached_raw
+                    # Try to parse structured JSON.  A failure implies the value is a pointer.
+                    try:
+                        parsed = json.loads(raw_str)
                     except Exception:
                         parsed = None
-                    # Layout 1: wrapped bundle
+                    # Layout 1: wrapped bundle { "_snapshot_etag": …, "data": … }
                     if isinstance(parsed, dict) and "_snapshot_etag" in parsed and "data" in parsed:
-                        try:
+                        ev_obj = parsed.get("data")
+                        if isinstance(ev_obj, dict):
                             try:
-                                ev = WhyDecisionEvidence.model_validate(parsed["data"])
-                            except AttributeError:
-                                ev = WhyDecisionEvidence.parse_obj(parsed["data"])
+                                ev = WhyDecisionEvidence.model_validate(ev_obj)
+                            except Exception:
+                                try:
+                                    ev = WhyDecisionEvidence.parse_obj(ev_obj)  # type: ignore[attr-defined]
+                                except Exception:
+                                    ev = None
+                            if ev is not None:
+                                ev.snapshot_etag = parsed.get("_snapshot_etag", "unknown")
+                                if await self._is_fresh(anchor_id, ev.snapshot_etag):
+                                    ev.__dict__["_retry_count"] = retry_count
+                                    with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+                                        span.set_attribute("cache.hit", True)
+                                        span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
+                                    return ev
+                    # Layout 2: bare JSON evidence directly under alias_key
+                    if parsed is not None:
+                        try:
+                            ev = WhyDecisionEvidence.model_validate(parsed)
                         except Exception:
-                            ev = None
+                            try:
+                                ev = WhyDecisionEvidence.parse_obj(parsed)  # type: ignore[attr-defined]
+                            except Exception:
+                                ev = None
                         if ev is not None:
-                            ev.snapshot_etag = parsed.get("_snapshot_etag", "unknown")
+                            # Only use the cached evidence if it is still fresh.  A missing
+                            # snapshot_etag (None) counts as fresh (spec §H3).
                             if await self._is_fresh(anchor_id, ev.snapshot_etag):
                                 ev.__dict__["_retry_count"] = retry_count
                                 with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
                                     span.set_attribute("cache.hit", True)
                                     span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                                 return ev
-                    # Layout 2: bare JSON evidence
-                    try:
-                        ev = WhyDecisionEvidence.model_validate_json(cached_raw)
-                        if await self._is_fresh(anchor_id, ev.snapshot_etag):
-                            ev.__dict__["_retry_count"] = retry_count
-                            with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
-                                span.set_attribute("cache.hit", True)
-                                span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
-                            return ev
-                    except Exception:
-                        # Layout 3: treat cached_raw as a pointer
-                        composite = cached_raw
-                        cached = await self._safe_get(composite)
-                        if not cached:
-                            raise ValueError("cache pointer key is missing")
+                    # Layout 3: pointer – interpret the value as the name of the composite key
+                    composite_key = None
+                    if parsed is None:
+                        composite_key = raw_str if isinstance(raw_str, str) else None
+                    elif isinstance(parsed, str):
+                        composite_key = parsed
+                    if composite_key:
                         try:
-                            ev = WhyDecisionEvidence.model_validate_json(cached)
+                            cached = await self._safe_get(composite_key)
                         except Exception:
-                            raise ValueError("invalid JSON under cache pointer") from None
-                        if await self._is_fresh(anchor_id, ev.snapshot_etag):
-                            ev.__dict__["_retry_count"] = retry_count
-                            with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
-                                span.set_attribute("cache.hit", True)
-                                span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
-                            return ev
+                            cached = None
+                        if cached:
+                            try:
+                                ev = WhyDecisionEvidence.model_validate_json(cached)
+                            except Exception:
+                                ev = None
+                            if ev is not None and await self._is_fresh(anchor_id, ev.snapshot_etag):
+                                ev.__dict__["_retry_count"] = retry_count
+                                with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+                                    span.set_attribute("cache.hit", True)
+                                    span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
+                                return ev
             except Exception:
                 logger.warning("redis read error – bypassing cache", exc_info=True)
-                # First failure ⇒ avoid further slow retries this request
+                # Fail‑open: disable cache for the remainder of this request
                 self._redis = None
 
         # ── plan (k-1 graph shape) ───────────────────────────────
@@ -354,19 +410,20 @@ class EvidenceBuilder:
                 # Even if this fails, we retain the ETag from above.
                 # ------------------------------------------------------------------
                 with trace_span.ctx("exec", anchor_id=anchor_id) as span:
-                    try:
-                        resp_neigh = await asyncio.wait_for(
-                            client.post("/api/graph/expand_candidates", json=plan),
-                            timeout=expand_ms / 1000.0,
-                        )
-                        neigh: dict = resp_neigh.json()  # happy‑path
-                    except (asyncio.TimeoutError, httpx.HTTPError, Exception) as exc:
-                        logger.warning(
-                            "expand_candidates_failed",
-                            extra={"anchor_id": anchor_id, "error": type(exc).__name__},
-                        )
-                        span.set_attribute("timeout", True)
-                        neigh = {"neighbors": []}
+                        try:
+                            resp_neigh = await client.post("/api/graph/expand_candidates", json=plan)
+                            try:
+                                resp_neigh.raise_for_status()
+                            except Exception:
+                                raise
+                            neigh: dict = resp_neigh.json() or {}
+                        except (asyncio.TimeoutError, httpx.HTTPError, Exception) as exc:
+                            logger.warning(
+                                "expand_candidates_failed",
+                                extra={"anchor_id": anchor_id, "error": type(exc).__name__},
+                            )
+                            span.set_attribute("timeout", True)
+                            neigh = {"neighbors": []}
 
                 # Prefer snapshot_etag from neighbours’ meta (Milestone‑4).
                 meta = neigh.get("meta") or {}
@@ -431,31 +488,82 @@ class EvidenceBuilder:
                     # ③ last-resort – treat as event so we never lose evidence
                     events.append(n)
 
+        # ── de-duplicate evidence items ────────────────────────────────
+        # Merge duplicate events by ID, preserving the first occurrence.  If
+        # duplicates exist (e.g. one item has an explicit edge relation and
+        # another does not) we keep the earliest and drop subsequent ones.
+        if events:
+            seen_event_ids: set[str] = set()
+            deduped_events: list[dict] = []
+            for ev in events:
+                eid = ev.get("id")
+                if eid and eid in seen_event_ids:
+                    continue
+                if eid:
+                    seen_event_ids.add(eid)
+                deduped_events.append(ev)
+            events = deduped_events
+
+        # Similarly de-duplicate preceding and succeeding transitions on ID.  The
+        # order of the first occurrence is preserved.
+        def _dedup_transitions(items: list[dict]) -> list[dict]:
+            seen: set[str] = set()
+            result: list[dict] = []
+            for it in items:
+                iid = it.get("id")
+                if iid and iid in seen:
+                    continue
+                if iid:
+                    seen.add(iid)
+                result.append(it)
+            return result
+
+        if pre:
+            pre = _dedup_transitions(pre)
+        if suc:
+            suc = _dedup_transitions(suc)
+
         if events:
             # ── enrich (event / anchor details) ───────────────────
+            # Build enriched event objects by calling the Memory‑API with
+            # the appropriate endpoint based on the neighbour type.  Each call
+            # should use a base_url when supported so relative paths resolve
+            # against the configured memory_api_url.  Preserve existing
+            # behaviour for unit tests where the httpx client or
+            # _safe_async_client may be monkey‑patched to a simple shim that
+            # rejects unknown kwargs.  Per‑event enrichment requires a
+            # fresh client instance to avoid carrying over internal state
+            # (e.g. indices used by tests) across multiple events.
             with trace_span.ctx("enrich", anchor_id=anchor_id):
-                # Per-event enrichment **does** need a brand-new stub so that
-                # internal counters (_idx) start from zero for each event.
                 enriched_events: list[dict] = []
-                # Some unit-tests swap `_safe_async_client` for a thin shim that
-                # does *not* understand the private `_fresh` kwarg.  Only pass the
-                # flag if the current helper explicitly supports it.
-                _fa_kw = (
-                    {"_fresh": True}
-                    if "_fresh" in inspect.signature(_safe_async_client).parameters
-                    else {}
-                )
-                async with _safe_async_client(**_fa_kw) as ev_client:
+                # Always request a fresh HTTP client for per‑event enrichment.  Pass
+                # base_url and timeout so relative URLs resolve correctly and per‑call
+                # timeouts apply.  _safe_async_client gracefully falls back when the
+                # underlying stub rejects these kwargs.
+                async with _safe_async_client(
+                    _fresh=True,
+                    base_url=settings.memory_api_url,
+                    timeout=settings.timeout_enrich_ms / 1000.0,
+                ) as ev_client:
                     for ev in events:
-                        # Already enriched? (future Memory-API versions)
+                        # Already enriched? (future Memory‑API versions)
                         if "led_to" in ev:
                             enriched_events.append(ev)
                             continue
                         eid = ev.get("id")
+                        if not eid:
+                            enriched_events.append(ev)
+                            continue
+                        # Choose endpoint based on explicit node type; default to event
+                        etype = (ev.get("type") or ev.get("entity_type") or "").lower()
+                        path = (
+                            f"/api/enrich/decision/{eid}"
+                            if etype == "decision"
+                            else f"/api/enrich/event/{eid}"
+                        )
                         try:
-                            eresp = await ev_client.get(f"/api/enrich/event/{eid}")
+                            eresp = await ev_client.get(path)
                             eresp.raise_for_status()
-                            # Merge to keep neighbour-specific fields like "score"
                             enriched_events.append({**eresp.json(), **ev})
                         except Exception:
                             logger.warning(
@@ -464,7 +572,6 @@ class EvidenceBuilder:
                             )
                             enriched_events.append(ev)
                 events = enriched_events
-
         # ── add reciprocal links (decision.supported_by ↔ event.led_to) ─────
         # ① from neighbour edges (already collected in *anchor_supported_ids*)
         # ② plus any events whose ``led_to`` list references the anchor

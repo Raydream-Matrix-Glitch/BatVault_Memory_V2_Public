@@ -48,11 +48,6 @@ def validate_response(resp: WhyDecisionResponse) -> Tuple[bool, List[str]]:
     if not support.issubset(allowed):
         errs.append("supporting_ids ⊈ allowed_ids")
 
-    # 2. supporting_ids ⊆ allowed_ids
-    allowed = set(resp.evidence.allowed_ids)
-    if not support.issubset(allowed):
-        errs.append("supporting_ids ⊈ allowed_ids")
-
     # transitions cited
     trans_ids = [
         t.get("id")

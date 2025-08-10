@@ -222,6 +222,158 @@ async def ensure_bucket():
         r = await client.post("http://gateway:8081/ops/minio/ensure-bucket")
         return JSONResponse(status_code=r.status_code, content=r.json())
 
+# ----- Gateway pass-through routes (/v2 ask/query/schema) ---------------------
+@app.api_route("/v2/ask", methods=["POST"])
+async def proxy_v2_ask(request: Request):
+    """
+    Proxy /v2/ask to the Gateway while preserving streaming semantics.
+
+    The JSON body along with selected headers (Authorization and x-request-id)
+    are forwarded upstream. When a `?stream=true` parameter is present the
+    upstream SSE body is relayed verbatim and audit headers (x-snapshot-etag)
+    are copied into the downstream response.
+    """
+    return await _proxy_to_gateway(request, method="POST", path="/v2/ask")
+
+@app.api_route("/v2/query", methods=["POST"])
+async def proxy_v2_query(request: Request):
+    """
+    Proxy /v2/query to the Gateway while preserving streaming semantics.
+    """
+    return await _proxy_to_gateway(request, method="POST", path="/v2/query")
+
+@app.get("/v2/schema/fields")
+async def proxy_schema_fields(request: Request):
+    """
+    Proxy schema fields catalog through to the Gateway with caching.
+    """
+    return await _proxy_to_gateway(request, method="GET", path="/v2/schema/fields")
+
+@app.get("/v2/schema/rels")
+async def proxy_schema_rels(request: Request):
+    """
+    Proxy schema relations catalog through to the Gateway with caching.
+    """
+    return await _proxy_to_gateway(request, method="GET", path="/v2/schema/rels")
+
+async def _proxy_to_gateway(request: Request, *, method: str, path: str):
+    """
+    Internal helper to forward API Edge requests to the Gateway.
+
+    Builds the upstream URL from the provided path and the original query
+    string, forwards the request via httpx and returns either a JSONResponse
+    or a StreamingResponse. Only the `Authorization` and `x-request-id`
+    headers are propagated to the upstream. When the client requests
+    streaming via the `stream` query parameter the upstream SSE payload is
+    streamed directly back to the caller. Upstream `x-snapshot-etag`
+    headers are mirrored in the final response.
+    """
+    # Compose upstream URL including original query string.
+    query = request.url.query
+    upstream_url = f"http://gateway:8081{path}"
+    if query:
+        upstream_url = f"{upstream_url}?{query}"
+    # Propagate only auth and request‑id headers.
+    headers: Dict[str, str] = {}
+    auth_hdr = request.headers.get("authorization")
+    if auth_hdr:
+        headers["authorization"] = auth_hdr
+    req_id = getattr(request.state, "request_id", None)
+    if req_id:
+        headers["x-request-id"] = req_id
+    # Read body for non‑GET methods.
+    body: bytes | None = None
+    if method.upper() != "GET":
+        body = await request.body()
+    # Determine if streaming is requested.
+    stream_flag = request.query_params.get("stream")
+    is_stream = str(stream_flag).lower() in {"1", "true", "yes"}
+    # Instantiate client per request.
+    client = httpx.AsyncClient(timeout=None)
+    if is_stream:
+        # Streaming: forward and relay SSE.
+        upstream = await client.stream(method.upper(), upstream_url, content=body, headers=headers)
+        status_code = getattr(upstream, "status_code", 500)
+        etag = upstream.headers.get("x-snapshot-etag")
+        content_type = upstream.headers.get("content-type", "text/event-stream")
+        async def _stream():
+            bytes_streamed = 0
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    bytes_streamed += len(chunk)
+                    yield chunk
+            finally:
+                # Ensure upstream and client are closed.
+                try:
+                    await upstream.aclose()
+                except Exception:
+                    pass
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+                # Log stream metrics at INFO level.
+                try:
+                    logger.info(
+                        "gateway_proxy_stream",
+                        extra={
+                            "request_id": req_id,
+                            "route": path,
+                            "upstream_status": status_code,
+                            "bytes_streamed": bytes_streamed,
+                        },
+                    )
+                except Exception:
+                    pass
+        headers_out: Dict[str, str] = {"Cache-Control": "no-cache"}
+        if etag:
+            headers_out["x-snapshot-etag"] = etag
+        return StreamingResponse(
+            _stream(),
+            status_code=status_code,
+            media_type=content_type,
+            headers=headers_out,
+        )
+    # Non-streaming: simple proxy.
+    try:
+        resp = await client.request(method.upper(), upstream_url, content=body, headers=headers)
+    except Exception as exc:
+        # Upstream failure.
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+        logger.warning(
+            "gateway_proxy_error",
+            extra={
+                "request_id": req_id,
+                "route": path,
+                "error": str(exc),
+            },
+        )
+        return JSONResponse(status_code=502, content={"detail": "upstream_error"})
+    finally:
+        # Close client after non-streaming call.
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    # Propagate snapshot etag when present.
+    extra_headers: Dict[str, str] = {}
+    try:
+        etag2 = resp.headers.get("x-snapshot-etag")  # type: ignore[arg-type]
+    except Exception:
+        etag2 = None
+    if etag2:
+        extra_headers["x-snapshot-etag"] = etag2
+    # Try to decode JSON; fallback to raw content.
+    try:
+        data = resp.json()
+        return JSONResponse(status_code=resp.status_code, content=data, headers=extra_headers)
+    except Exception:
+        return Response(status_code=resp.status_code, content=resp.content, headers=extra_headers)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # 6. Dev / test-only helpers
 # ────────────────────────────────────────────────────────────────────────────

@@ -398,7 +398,31 @@ class ArangoStore:
     # ------------------------------------------------------------
 
     def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
-        return self.db.collection("nodes").get(node_id)
+        """
+        Return the raw node document from the ``nodes`` collection or
+        ``None`` when no database connection is available or the node
+        cannot be found.
+
+        In "stub‑mode" (e.g. during tests or when ArangoDB is unreachable),
+        ``self.db`` is ``None`` to signal the absence of a backing store.
+        Accessing methods on ``None`` would raise an ``AttributeError`` which
+        then bubbles up into FastAPI handlers.  This helper guards against
+        that by returning ``None`` if the underlying database connection has
+        not been established.  When connected, any errors raised by the
+        underlying driver (such as missing documents) are caught and treated
+        as a missing node.
+        """
+        # Ensure we have a database connection; in stub‑mode this will
+        # short‑circuit and return ``None``.
+        if self.db is None or not hasattr(self.db, "collection"):
+            return None
+        try:
+            return self.db.collection("nodes").get(node_id)
+        except Exception:
+            # On any lookup error (e.g. missing document), behave as
+            # though the node does not exist.  This prevents upstream
+            # callers from crashing when a node is not found.
+            return None
 
     def get_enriched_decision(self, node_id: str) -> Optional[Dict[str, Any]]:
         n = self.get_node(node_id)

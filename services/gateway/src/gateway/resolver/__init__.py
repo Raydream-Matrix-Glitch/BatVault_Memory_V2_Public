@@ -113,9 +113,19 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
 
     core_metrics.counter("cache_miss_total", 1, service="resolver")
 
-    # BM25 search with graceful degradation
+    # BM25 search with graceful degradation.  Dynamically resolve the
+    # search function at runtime so that monkey‑patches on
+    # ``gateway.resolver.fallback_search.search_bm25`` take effect.
     try:
-        candidates = await search_bm25(text, k=24)
+        import importlib, sys
+        try:
+            mod = sys.modules.get("gateway.resolver.fallback_search")
+            if mod is None:
+                mod = importlib.import_module("gateway.resolver.fallback_search")
+            search_fn = getattr(mod, "search_bm25")
+        except Exception:
+            search_fn = search_bm25
+        candidates = await search_fn(text, k=24)
     except Exception:                                # network / timeout
         core_metrics.counter("bm25_search_error_total", 1, service="resolver")
         candidates = []

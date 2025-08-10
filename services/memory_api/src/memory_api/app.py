@@ -106,20 +106,6 @@ def store() -> ArangoStore:
                        settings.arango_meta_collection,
                        lazy=True)
 
-# ----------------------------------------------------------------------
-# Helper: Best-effort cache invalidation that survives monkey-patching
-# ----------------------------------------------------------------------
-def _clear_store_cache() -> None:
-    """
-    Unit-tests swap :func:`store` with a plain lambda that lacks the
-    ``cache_clear`` attribute given by :pyfunc:`functools.lru_cache`.
-    Using *getattr* keeps production semantics (real cache cleared)
-    while preventing *AttributeError* during tests.
-    """
-    cache_clear = getattr(store, "cache_clear", None)
-    if callable(cache_clear):  # real lru-cache scenario
-        cache_clear()
-
 @app.on_event("startup")
 async def bootstrap_arango():
     # Ensure DB/collections via ArangoStore init (it handles vector index creation)
@@ -181,15 +167,35 @@ def get_relation_catalog(response: Response):
 # --------------- Enrichment -------------
 @app.get("/api/enrich/decision/{node_id}")
 async def enrich_decision(node_id: str, response: Response):
-    async def _work():
+    """
+    Return a fully enriched decision document.
+
+    The enrichment operation runs in a background thread since
+    ``ArangoStore.get_enriched_decision`` is synchronous.  Defining
+    ``_work`` as a synchronous callable is critical: ``asyncio.to_thread``
+    expects a regular function, not a coroutine.  If we accidentally
+    define `_work` as ``async def``, ``to_thread`` will return an
+    un‑awaited coroutine which breaks FastAPI's response encoding.
+    """
+
+    def _work() -> Optional[dict]:
+        # Lazily create the store inside the worker thread to avoid
+        # eager Arango connections during unit tests.  The underlying
+        # call is synchronous, so this function must not be declared
+        # ``async``.
         return store().get_enriched_decision(node_id)
+
+    # Execute the enrichment in a thread with a 0.6 s timeout as per the
+    # Milestone‑4 contract.  Timeouts surface as HTTP 504 responses.
     try:
         with trace_span("memory.enrich_decision", node_id=node_id):
             doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=0.6)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="timeout")
+    # Missing decisions must return a 404 error.
     if doc is None:
         raise HTTPException(status_code=404, detail="decision_not_found")
+    # Attach the current snapshot ETag to the response headers when present
     etag = store().get_snapshot_etag()
     if etag:
         response.headers["x-snapshot-etag"] = etag
@@ -247,6 +253,35 @@ async def resolve_text(payload: dict, response: Response):
     q = payload.get("q", "")
     use_vector = bool(payload.get("use_vector", False))
     query_vector = payload.get("query_vector")
+
+    # ------------------------------------------------------------------
+    # Embeddings integration (Milestone‑7)
+    # ------------------------------------------------------------------
+    # When the client has not explicitly opted into vector search but
+    # embeddings are enabled at the service level, compute the query
+    # embedding via the TEI client.  If the embedding is successful and
+    # matches the configured dimensionality, enable vector search and
+    # attach the vector to the payload.  Errors fall back silently to
+    # BM25-only mode.  Known slugs are not embedded.
+    if (
+        not use_vector
+        and query_vector is None
+        and q
+        and not _ID_RE.match(q)  # skip known slugs
+    ):
+        try:
+            from memory.embeddings_client import embed  # type: ignore
+            # Attempt to embed the query; returns None on failure
+            embeddings = await embed([q])
+            if embeddings:
+                query_vector = embeddings[0]
+                use_vector = True
+                # Mirror the embedding in the inbound payload for downstream
+                payload["use_vector"] = True
+                payload["query_vector"] = query_vector
+        except Exception:
+            # fallback – leave use_vector false so search remains BM25-only
+            log_stage(logger, "embeddings", "fallback_bm25", query=q)
     if not q and not (use_vector and query_vector):
         return {"matches": [], "query": q, "vector_used": False}
     # Milestone-2: known slug → short-circuit resolver (skip search)

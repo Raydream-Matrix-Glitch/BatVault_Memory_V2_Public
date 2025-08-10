@@ -29,6 +29,7 @@ def summarise_json(
     temperature: float = 0.0,
     max_tokens: int = 256,
     retries: int = 2,
+    request_id: str | None = None,
 ) -> str:
     """Return **JSON‑ONLY** string with ``short_answer`` & ``supporting_ids``.
 
@@ -57,37 +58,24 @@ def summarise_json(
             "supporting_ids": allowed_ids[:1],
         }).decode()
 
-    # Always honour stub mode first – used in CI & local dev
-    if os.getenv("OPENAI_DISABLED", "1") == "1":
+    # Honour stub/disabled mode – when OPENAI_DISABLED is not "0" we always
+    # return a deterministic stub.  A missing or empty value is treated as
+    # disabled.  This allows unit‑tests to force the real OpenAI retry path
+    # by setting OPENAI_DISABLED=0.
+    if os.getenv("OPENAI_DISABLED", "1") != "0":
         return _stub()
 
-    # ── Real OpenAI call (temperature=0, JSON‑only policy) ────────────────
-    attempt = 0
-    while attempt <= retries:
-        try:
-            import openai  # Local import keeps dep optional
-
-            openai.api_key = os.getenv("OPENAI_API_KEY")
-            resp = openai.ChatCompletion.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo-0613"),
-                temperature=temperature,
-                max_tokens=max_tokens,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "JSON-only; emit WhyDecisionAnswer schema.",
-                    },
-                    {"role": "user", "content": orjson.dumps(envelope).decode()},
-                ],
-            )
-            raw_json: str = resp.choices[0].message.content
-
-            # Minimal sanity check – must parse without error
-            orjson.loads(raw_json)
-            return raw_json
-        except Exception:
-            time.sleep(0.2 * (attempt + 1))
-            attempt += 1
-
-    # Fallback after retries exhausted
-    return _stub()
+    # ── Real LLM call via the router (JSON-only) ────────────────────────
+    try:
+        raw_json = llm_router.call_llm(
+            envelope if isinstance(envelope, dict) else {"question": prompt_txt, "allowed_ids": allowed_ids},
+            request_id=request_id,
+            headers=None,
+            retries=retries,
+        )
+        # Basic parse validation – raises ValueError on malformed JSON
+        orjson.loads(raw_json)
+        return raw_json
+    except Exception:
+        # fallback to deterministic stub
+        return _stub()

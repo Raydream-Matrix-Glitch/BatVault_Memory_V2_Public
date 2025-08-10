@@ -16,17 +16,19 @@ def ensure_bucket(client, bucket: str, retention_days: int):
         log_stage(logger, "artifacts", "minio_bucket_error", bucket=bucket, error=str(exc))
         raise
 
-    lifecycle = f"""<LifecycleConfiguration>
-  <Rule>
-    <ID>batvault-artifacts-retention</ID>
-    <Status>Enabled</Status>
-    <Expiration><Days>{retention_days}</Days></Expiration>
-  </Rule>
-</LifecycleConfiguration>"""
-
     try:
-        client.set_bucket_lifecycle(bucket, lifecycle)
+        rule = Rule(
+            rule_id="batvault-artifacts-retention",
+            status=ENABLED,
+            rule_filter=Filter(prefix=""),
+            expiration=Expiration(days=retention_days),
+        )
+        lifecycle_config = LifecycleConfig([rule])
+        client.set_bucket_lifecycle(bucket, lifecycle_config)
     except Exception as e:
+        # Log and continue; this warning means the lifecycle could not be set
+        # but the bucket still exists.  The error message will include
+        # diagnostic information from the SDK.
         log_stage(logger, "artifacts", "minio_lifecycle_warning", bucket=bucket, error=str(e))
 
     log_stage(

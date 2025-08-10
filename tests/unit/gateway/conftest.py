@@ -250,6 +250,38 @@ def _gateway_isolation(monkeypatch: pytest.MonkeyPatch):
     """
 
     # ── setup ────────────────────────────────────────────────
+
+    # ----------------------------------------------------------------------
+    # Capture and reset gateway.app globals to avoid cross‑test leakage.
+    #
+    # Many unit tests monkey‑patch attributes on ``gateway.app`` such as
+    # ``httpx.get``, ``httpx.post`` and ``minio_client``.  Because the
+    # Gateway layer re‑exports a shimmed ``httpx`` instance whose
+    # attributes live on the instance itself, assigning to these methods
+    # directly mutates the shim object.  Without explicit cleanup the
+    # patched attributes persist across tests and break unrelated
+    # assertions.  We therefore snapshot the current state of the shim
+    # and the MinIO client factory before each test and restore them on
+    # teardown.  We also clear any attributes added to the shim so that
+    # subsequent ``__getattr__`` lookups delegate back to the real
+    # ``httpx`` module.  Finally reset the fallback client used by
+    # ``gateway.evidence._safe_async_client`` so per‑test state does not
+    # accumulate.
+    try:
+        import gateway.app as _gw_app
+        # Snapshot the original minio_client callable
+        _orig_minio = getattr(_gw_app, "minio_client", None)
+        # Capture the shim instance – may already have patched attributes
+        _httpx_shim = getattr(_gw_app, "httpx", None)
+        # Reset shared fallback client used by EvidenceBuilder
+        if "gateway.evidence" in sys.modules:
+            sys.modules["gateway.evidence"]._shared_fallback_client = None  # type: ignore[attr-defined]
+    except Exception:
+        _gw_app = None
+        _orig_minio = None
+        _httpx_shim = None
+
+    # Monkey‑patch ``httpx.AsyncClient`` for the duration of the test.
     monkeypatch.setattr(httpx, "AsyncClient", _mock_async, raising=True)
 
     # Ensure already-imported Gateway modules see the override
@@ -275,4 +307,23 @@ def _gateway_isolation(monkeypatch: pytest.MonkeyPatch):
         if name in sys.modules:
             getattr(sys.modules[name], "httpx").AsyncClient = _REAL_ASYNC  # type: ignore[attr-defined]
 
+    # Restore gateway.app globals captured in setup
+    if _gw_app is not None:
+        # Remove any attributes set on the httpx shim during the test.  This
+        # effectively resets the shim to a pristine proxy that delegates
+        # attribute access back to the real httpx module.
+        if _httpx_shim is not None and hasattr(_httpx_shim, "__dict__"):
+            _httpx_shim.__dict__.clear()
+        # Restore the original minio_client factory if it was captured
+        if _orig_minio is not None:
+            try:
+                _gw_app.minio_client = _orig_minio  # type: ignore[attr-defined]
+            except Exception:
+                pass
+    # Reset shared fallback client again to guarantee fresh state for next test
+    if "gateway.evidence" in sys.modules:
+        try:
+            sys.modules["gateway.evidence"]._shared_fallback_client = None  # type: ignore[attr-defined]
+        except Exception:
+            pass
     _clear_minio_calls()
