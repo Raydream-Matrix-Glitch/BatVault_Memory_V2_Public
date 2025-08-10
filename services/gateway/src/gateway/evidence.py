@@ -144,14 +144,6 @@ if not hasattr(trace_span, "ctx"):
             def end(self): ...
         yield _Span()
     trace_span.ctx = _noop_ctx            # type: ignore[attr-defined]
-
-# Maintain a module‑level shared fallback client for scenarios where the
-# underlying httpx.AsyncClient has been monkey‑patched and cannot accept
-# arbitrary kwargs.  Using a shared instance allows per‑request state (such
-# as an internal counter used by unit‑tests) to persist across successive
-# calls to EvidenceBuilder.build, enabling snapshot_etag extraction to work
-# correctly.  Per‑event enrichment requests should always bypass this
-# shared client by setting the `_fresh` flag.
 _shared_fallback_client: httpx.AsyncClient | None = None
 
 @asynccontextmanager
@@ -164,18 +156,15 @@ async def _safe_async_client(**kw):
     tests to verify call ordering) persist across EvidenceBuilder invocations.
     """
     fresh = kw.pop("_fresh", False)
+    clean_kwargs: dict[str, Any] = {k: v for k, v in kw.items() if not k.startswith("_")}
+
     client: httpx.AsyncClient
     managed: bool
     try:
-        # Attempt to construct a real httpx.AsyncClient.  This may raise
-        # TypeError when the underlying class has been monkey‑patched and
-        # does not accept kwargs like ``timeout`` or ``base_url``.
-        client = httpx.AsyncClient(**kw)
+
+        client = httpx.AsyncClient(**clean_kwargs)
         managed = True
     except TypeError:
-        # When a stubbed AsyncClient refuses kwargs, fall back to our
-        # module‑level shared instance.  Create a fresh instance only
-        # when explicitly requested via `_fresh` or if none exists yet.
         global _shared_fallback_client
         AC = httpx.AsyncClient
         if fresh or _shared_fallback_client is None:
@@ -187,21 +176,14 @@ async def _safe_async_client(**kw):
         managed = False
     try:
         if managed and hasattr(client, "__aenter__"):
-            # Use context manager for real clients to ensure proper cleanup.
             async with client as real_client:
                 yield real_client
         else:
-            # Yield the fallback client directly; do not enter as context
             yield client
     finally:
         if managed:
-            # ``async with`` handles cleanup for real clients.
             pass
         else:
-            # For fallback clients we avoid closing the shared instance so
-            # that internal state persists across calls.  However, when
-            # `_fresh=True` was set we created a throw‑away stub that
-            # should be closed immediately.
             if fresh:
                 try:
                     await client.aclose()
@@ -228,16 +210,6 @@ class EvidenceBuilder:
                 self._redis = redis.Redis.from_url(settings.redis_url)
             except Exception:
                 self._redis = None
-
-        # Reset the module‑level fallback client whenever a new
-        # EvidenceBuilder instance is created.  The fallback client is used
-        # by ``_safe_async_client`` to persist stateful stubs across multiple
-        # calls to ``build``.  Without resetting it here, a fallback
-        # instantiated in one test could be inadvertently reused by another,
-        # leading to order‑dependent behaviour (e.g. stale ETag counters).
-        # Clearing the global reference ensures each builder starts from a
-        # clean slate while still reusing the same fallback instance across
-        # successive ``build`` calls on the same builder.
         global _shared_fallback_client
         _shared_fallback_client = None
 
@@ -524,22 +496,8 @@ class EvidenceBuilder:
             suc = _dedup_transitions(suc)
 
         if events:
-            # ── enrich (event / anchor details) ───────────────────
-            # Build enriched event objects by calling the Memory‑API with
-            # the appropriate endpoint based on the neighbour type.  Each call
-            # should use a base_url when supported so relative paths resolve
-            # against the configured memory_api_url.  Preserve existing
-            # behaviour for unit tests where the httpx client or
-            # _safe_async_client may be monkey‑patched to a simple shim that
-            # rejects unknown kwargs.  Per‑event enrichment requires a
-            # fresh client instance to avoid carrying over internal state
-            # (e.g. indices used by tests) across multiple events.
             with trace_span.ctx("enrich", anchor_id=anchor_id):
                 enriched_events: list[dict] = []
-                # Always request a fresh HTTP client for per‑event enrichment.  Pass
-                # base_url and timeout so relative URLs resolve correctly and per‑call
-                # timeouts apply.  _safe_async_client gracefully falls back when the
-                # underlying stub rejects these kwargs.
                 async with _safe_async_client(
                     _fresh=True,
                     base_url=settings.memory_api_url,
@@ -572,20 +530,11 @@ class EvidenceBuilder:
                             )
                             enriched_events.append(ev)
                 events = enriched_events
-        # ── add reciprocal links (decision.supported_by ↔ event.led_to) ─────
-        # ① from neighbour edges (already collected in *anchor_supported_ids*)
-        # ② plus any events whose ``led_to`` list references the anchor
         for ev in events:
             if anchor_id in (ev.get("led_to") or []):
                 ev_id = ev.get("id")
                 if ev_id:
                     anchor_supported_ids.add(ev_id)
-
-        # ── fallback ────────────────────────────────────────────────
-        # If the stub omits both `edge.rel=LED_TO` and `event.led_to`
-        # we treat every neighbouring *event* as supporting evidence
-        # and repair reciprocity on-the-fly.  This keeps the contract
-        # intact without changing behaviour when explicit data exists.
         if not anchor_supported_ids and events:
             for ev in events:
                 eid = ev.get("id")
