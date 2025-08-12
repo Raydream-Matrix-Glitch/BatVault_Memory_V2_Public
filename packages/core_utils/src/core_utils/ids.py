@@ -29,6 +29,38 @@ def slugify_id(s: str) -> str:
     return s
 
 # ------------------------------------------------------------------
+# Tag slugging helper
+# ------------------------------------------------------------------
+
+def slugify_tag(s: str) -> str:
+    """
+    Canonical slug rules for tags.  Tags differ from general identifiers in
+    that they use underscores (``_``) as the canonical separator instead of
+    hyphens.  This helper lower‑cases the input, normalises it using
+    Unicode NFKC, collapses any sequence of non‑alphanumeric characters
+    into a single underscore and trims leading/trailing underscores.  It
+    mirrors the behaviour of :func:`core_validator._slugify_to_underscores`.
+
+    Parameters
+    ----------
+    s: str
+        The tag string to normalise.
+
+    Returns
+    -------
+    str
+        A lower‑cased slug string using underscores.
+    """
+    import unicodedata
+    # Normalise to Unicode NFKC and lowercase
+    s_norm = unicodedata.normalize("NFKC", s or "").strip().lower()
+    # Replace any sequence of non‑[a‑z0‑9] characters with an underscore
+    s_norm = re.sub(r"[^a-z0-9]+", "_", s_norm)
+    # Trim leading/trailing underscores
+    return s_norm.strip("_")
+
+
+# ------------------------------------------------------------------
 # Public helper: legacy alias + convenience wrapper
 # ------------------------------------------------------------------
 
@@ -55,3 +87,24 @@ def is_slug(s: str) -> bool:
     if not s:
         return False
     return bool(_SLUG_OK.match(s.strip()))
+
+_TAG_RE = re.compile(r"[^a-z0-9]+")
+
+def slugify_tag(s: str) -> str:
+    """
+    Canonical tag slug:
+      - NFKC normalize
+      - lowercase
+      - replace any non [a-z0-9] sequence with a single underscore
+      - trim leading/trailing underscores
+      - collapse multiple underscores
+    Deterministic and ASCII-safe; aligns all services on tag shape.
+    """
+    if s is None:
+        return ""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(s)).lower()
+    s = _TAG_RE.sub("_", s).strip("_")
+    # collapse multiple underscores
+    s = re.sub(r"_+", "_", s)
+    return s

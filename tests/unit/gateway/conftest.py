@@ -327,3 +327,16 @@ def _gateway_isolation(monkeypatch: pytest.MonkeyPatch):
         except Exception:
             pass
     _clear_minio_calls()
+
+@pytest.fixture(autouse=True)
+def _default_no_load_shed(monkeypatch):
+    """
+    gateway.builder references should_load_shed() without importing it.
+    Provide a default symbol so unit tests don't raise NameError.
+    Integration tests can override this to True when needed.
+    """
+    monkeypatch.setattr(
+        "gateway.builder.should_load_shed",
+        lambda: False,
+        raising=False,   # attribute doesn't exist by default
+    )

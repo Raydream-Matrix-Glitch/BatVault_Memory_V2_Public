@@ -179,7 +179,19 @@ async def req_logger(request: Request, call_next):  # noqa: D401
             return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
         log_stage(logger, "request", "request_error", error=str(e))
-        return JSONResponse(status_code=500, content={"error": "internal_error"})
+        req_id = request.headers.get("x-request-id") or generate_request_id()
+        log_stage(logger, "request", "request_error", error=str(e), request_id=req_id)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "INTERNAL",
+                    "message": "Upstream failure",
+                    "details": {},
+                    "request_id": req_id
+                }
+            }
+        )
 
 # ────────────────────────────────────────────────────────────────────────────
 # 4. Metrics & health routes (prod-safe)

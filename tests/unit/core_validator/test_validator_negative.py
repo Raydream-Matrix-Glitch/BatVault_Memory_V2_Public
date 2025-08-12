@@ -1,9 +1,9 @@
-from core_validator.validator import validate_response
-from gateway.models import WhyDecisionResponse
+from core_validator import validate_response
+from core_models.models import WhyDecisionResponse
 
 
 def test_validator_detects_subset_violation() -> None:
-    """Validator should fail when supporting_ids ⊄ allowed_ids."""
+    """Validator should not fail fatally when supporting_ids ⊄ allowed_ids; it repairs by removing out-of-scope IDs and reports a structured error."""
     resp = WhyDecisionResponse(
         intent="why_decision",
         evidence={
@@ -25,10 +25,14 @@ def test_validator_detects_subset_violation() -> None:
             "prompt_id": "pid",
             "policy_id": "polid",
             "prompt_fingerprint": "pf",
-            "bundle_fingerprint": "bf",
+            "snapshot_etag": "etag",
+            "retries": 0,
+            "latency_ms": 123,
+            "fallback_used": False,
         },
     )
 
     valid, errs = validate_response(resp)
-    assert not valid
-    assert any("supporting_ids" in e for e in errs)
+    assert valid is True
+    codes = {e.get("code") for e in errs if isinstance(e, dict)}
+    assert "supporting_ids_removed_invalid" in codes

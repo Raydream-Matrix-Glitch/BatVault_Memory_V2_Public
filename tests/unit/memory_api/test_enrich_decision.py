@@ -17,9 +17,13 @@ def test_enrich_decision_happy_path(monkeypatch):
     client = TestClient(mod.app)
     resp = client.get("/api/enrich/decision/abc")
     assert resp.status_code == 200
-    # The body should match exactly what DummyStore returned
-    assert resp.json() == {"id": "abc", "option": "OK"}
-    # The snapshot ETag must be propagated to the response header
+    # Body should include original fields plus a meta block with snapshot_etag
+    body = resp.json()
+    assert body.get("id") == "abc"
+    assert body.get("option") == "OK"
+    assert isinstance(body.get("meta"), dict)
+    assert body["meta"].get("snapshot_etag") == "etag-enrich-1"
+    # The snapshot ETAG must be propagated to the response header as well
     assert resp.headers["x-snapshot-etag"] == "etag-enrich-1"
 
 

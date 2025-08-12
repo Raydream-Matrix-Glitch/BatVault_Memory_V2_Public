@@ -24,17 +24,32 @@ from typing import Iterable, List, Optional
 import httpx
 
 from core_logging import get_logger, log_stage
+import asyncio
+import random
 
 _logger = get_logger("memory_api.embeddings_client")
 _logger.propagate = True
 
 # Cache configuration at module import time
+#
+# Embedding calls are gated via the ENABLE_EMBEDDINGS flag.  These values
+# are resolved once at import time to avoid re-reading environment
+# variables on every request.  See ``embed`` for additional handling.
 _enable_embeddings = os.getenv("ENABLE_EMBEDDINGS", "false").lower() in {"1", "true", "yes"}
 _endpoint = os.getenv("EMBEDDINGS_ENDPOINT", "http://tei-embed:8085").rstrip("/")
 try:
     _dims = int(os.getenv("EMBEDDINGS_DIMS", "768"))
 except ValueError:
     _dims = 768
+
+# How many times to retry embedding calls on failure.  Retries use a
+# simple exponential backoff with jitter (capped at a small window)
+# to avoid thundering herds.  A value of 0 disables retries.
+_MAX_RETRIES = int(os.getenv("EMBEDDINGS_MAX_RETRIES", "2"))
+
+# Base delay (in seconds) for the first retry.  Subsequent retries
+# double this delay.  A small amount of random jitter is added.
+_BASE_DELAY = float(os.getenv("EMBEDDINGS_BASE_DELAY_SEC", "0.1"))
 
 
 async def embed(texts: Iterable[str]) -> Optional[List[List[float]]]:
@@ -60,44 +75,59 @@ async def embed(texts: Iterable[str]) -> Optional[List[List[float]]]:
     batch = list(texts)
     if not batch:
         return []
-    start = time.perf_counter()
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(
-                f"{_endpoint}/embeddings",
-                json={"input": batch},
-                headers={"Accept": "application/json"},
-            )
-            resp.raise_for_status()
-            j = resp.json()
-            data = j.get("data") or []
-            embeddings: List[List[float]] = [d.get("embedding") for d in data]
-            # Validate dimensions
-            if not embeddings or any(len(vec) != _dims for vec in embeddings):
+    last_exc: Exception | None = None
+    # Attempt embedding retrieval with simple retry/backoff
+    for attempt in range(_MAX_RETRIES + 1):
+        start = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(
+                    f"{_endpoint}/embeddings",
+                    json={"input": batch},
+                    headers={"Accept": "application/json"},
+                )
+                resp.raise_for_status()
+                j = resp.json()
+                data = j.get("data") or []
+                embeddings: List[List[float]] = [d.get("embedding") for d in data]
+                # Validate dimensions
+                if not embeddings or any(len(vec) != _dims for vec in embeddings):
+                    log_stage(
+                        _logger,
+                        "embeddings",
+                        "dims_mismatch",
+                        dims=_dims,
+                        dims_seen=(len(embeddings[0]) if embeddings else 0),
+                    )
+                    return None
+                dt_ms = int((time.perf_counter() - start) * 1000)
                 log_stage(
                     _logger,
                     "embeddings",
-                    "dims_mismatch",
+                    "fetched",
+                    batch_size=len(batch),
                     dims=_dims,
-                    dims_seen=(len(embeddings[0]) if embeddings else 0),
+                    latency_ms=dt_ms,
                 )
-                return None
-            dt_ms = int((time.perf_counter() - start) * 1000)
+                return embeddings
+        except Exception as exc:
+            last_exc = exc
+            # log failure for this attempt
             log_stage(
                 _logger,
                 "embeddings",
-                "fetched",
-                batch_size=len(batch),
-                dims=_dims,
-                latency_ms=dt_ms,
+                "error",
+                error=type(exc).__name__,
+                message=str(exc),
+                attempt=attempt,
             )
-            return embeddings
-    except Exception as exc:
-        log_stage(
-            _logger,
-            "embeddings",
-            "error",
-            error=type(exc).__name__,
-            message=str(exc),
-        )
-        return None
+            # on retryable error, wait before next attempt (if any)
+            if attempt < _MAX_RETRIES:
+                # exponential backoff: base * 2^attempt with jitter up to base
+                delay = _BASE_DELAY * (2 ** attempt)
+                jitter = _BASE_DELAY * random.random()
+                await asyncio.sleep(delay + jitter)
+            else:
+                break
+    # out of retries – return None
+    return None

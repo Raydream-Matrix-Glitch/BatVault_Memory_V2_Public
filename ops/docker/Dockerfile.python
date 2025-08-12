@@ -1,75 +1,74 @@
 # syntax = docker/dockerfile:1.4
 ################################################################################
-# ─── STAGE 1: BUILD HEAVY WHEELS & EDITABLE PACKAGES ──────────────────────────
+# STAGE 1 — builder: install OS build deps + Python wheels once
 ################################################################################
 FROM python:3.11-slim AS builder
+
 ARG SERVICE_NAME
 
-# 1. Install system deps needed for wheel builds
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      build-essential libffi-dev python3-dev libgmp-dev curl \
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_COLOR=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+# Only builder gets compilers; runtime stays slim.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+ && apt-get install -y --no-install-recommends build-essential libffi-dev python3-dev libgmp-dev curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# 2. Copy only requirements to cache heavy deps
+# Install external runtime deps first so they stay cached when code changes.
+# We copy just the requirements file(s) to maximize cache hits.
 COPY requirements/runtime.txt ./requirements/runtime.txt
 
-#    – mount pip cache so wheels are kept across builds
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip wheel setuptools \
- && pip install --cache-dir=/root/.cache/pip \
-      --no-deps -r ./requirements/runtime.txt
+ && pip install --cache-dir=/root/.cache/pip -r ./requirements/runtime.txt
 
-# 3. Copy shared packages and install editable (fast)
-COPY packages/ ./packages/
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-deps \
-      -e packages/core_config \
-      -e packages/core_logging \
-      -e packages/core_models \
-      -e packages/core_utils \
-      -e packages/link_utils \
-      -e packages/core_storage \
-      -e packages/core_metrics \
-      -e packages/core_validator
+# Copy source after deps so changing code doesn't trigger heavy downloads.
+COPY packages ./packages
+COPY services ./services
 
-# 4. Copy service code and install its extras if requested
-COPY services/ ./services/
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ -n "$SERVICE_NAME" ]; then \
-      pip install --no-cache-dir -e "/app/services/${SERVICE_NAME}"; \
-    fi
+# Optional: if any service truly needs console_scripts, switch to editable installs without deps:
+# RUN pip install --no-deps -e packages/core_config -e packages/core_logging -e packages/core_metrics -e packages/core_storage -e packages/shared
 
 ################################################################################
-# ─── STAGE 2: FINAL RUNTIME IMAGE ──────────────────────────────────────────────
+# STAGE 2 — runtime: small image + non-root user; copy in site-packages & code
 ################################################################################
-FROM python:3.11-slim
-ARG SERVICE_NAME
+FROM python:3.11-slim AS runtime
 
-# Runtime needs curl for the Docker HEALTHCHECK
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+# Minimal runtime OS libs only.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
+ && apt-get install -y --no-install-recommends libffi-dev libgmp-dev curl \
  && rm -rf /var/lib/apt/lists/*
 
-# Carry over the non-root user
-RUN useradd -ms /bin/bash appuser
-USER appuser
 WORKDIR /app
 
-# Copy everything from builder
-COPY --from=builder --chown=appuser:appuser /usr/local/lib/python3.11 /usr/local/lib/python3.11
-COPY --from=builder --chown=appuser:appuser /app/packages    ./packages
-COPY --from=builder --chown=appuser:appuser /app/services    ./services
+# Copy the interpreter's stdlib + site-packages with installed external deps.
+# (Keeps rebuilds fast; code changes won't re-run pip.)
+COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
+
+# Copy code (shared packages + all services) — light layers you can invalidate freely.
+COPY --from=builder /app/packages ./packages
+COPY --from=builder /app/services ./services
+
+# Create and drop to an unprivileged user after files are in place.
+RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
+# Import local modules without installing them.
+ENV PYTHONPATH="/app/packages:/app/services"
 
 # -------- metrics ----------------------------------------------------------
-# Make the OTEL SDK publish metrics via the Prometheus reader.  This is
-# harmless when a service is launched locally without the collector.
+# Prometheus reader for OTEL metrics (harmless locally without a collector)
 ENV OTEL_METRICS_EXPORTER=prometheus
 
 # Expose health-port from your ENV
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD curl -fsS http://localhost:${BATVAULT_HEALTH_PORT:-8082}/healthz || exit 1
 
-# Final entrypoint / CMD is provided per-service
+# Final entrypoint / CMD is provided per-service (compose/k8s)

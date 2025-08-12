@@ -35,6 +35,7 @@ opentelemetry-api>=1.24
 sentence-transformers>=2.7
 opentelemetry-sdk>=1.24
 opentelemetry-exporter-otlp>=1.24
+six>=1.16
 
 # ─── API-Edge runtime deps ─────────────────────────────────────────────
 slowapi>=0.1.7               # rate-limiting middleware

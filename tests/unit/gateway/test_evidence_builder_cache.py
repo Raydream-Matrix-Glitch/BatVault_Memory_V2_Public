@@ -44,6 +44,9 @@ def test__extract_snapshot_etag_variants():
     # hyphenated + case-variant
     r2 = DummyResp({}, {"Snapshot-ETag": "h1"})
     assert _extract_snapshot_etag(r2) == "h1"
+    # x-prefixed variant for header-based propagation (Memory‑API)
+    r3 = DummyResp({}, {"x-snapshot-etag": "x3"})
+    assert _extract_snapshot_etag(r3) == "x3"
 
 
 def load_decision(anchor_id: str) -> dict:

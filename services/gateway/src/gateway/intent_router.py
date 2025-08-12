@@ -59,14 +59,15 @@ async def route_query(
         # search_similar → Memory-API text resolver
         if "search_similar" in names:
             try:
+                # POST the query under the canonical `q` key per Memory‑API contract
                 resp = await client.post(
                     f"{base}/api/resolve/text",
-                    json={"text": question},
+                    json={"q": question},
                 )
                 if resp.status_code == 200:
                     results["search_similar"] = resp.json()
             except Exception:
-                # Memory-API search unavailable or timed out; skip this helper
+                # Memory‑API search unavailable or timed out; skip this helper
                 pass
             except httpx.HTTPError:
                 # timeout or connection error; skip this helper

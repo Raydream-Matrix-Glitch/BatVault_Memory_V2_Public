@@ -14,6 +14,7 @@ dependencies = [
   "core_config",
   "core_logging",
   "core_storage",
+  "shared",
 ]
 
 [tool.setuptools.packages.find]

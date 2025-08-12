@@ -14,6 +14,7 @@ def test_resolve_slug_short_circuit(monkeypatch):
     body = r.json()
     assert body["query"] == slug
     assert body["matches"][0]["id"] == slug
+    assert body["matches"][0]["title"] == "Pause PaaS rollout"
     assert body["vector_used"] is False
     assert r.headers["x-snapshot-etag"] == "etag-3"
 
@@ -30,3 +31,20 @@ def test_resolve_vector_flag(monkeypatch):
     body = r.json()
     assert body["vector_used"] is True
     assert r.headers["x-snapshot-etag"] == "etag-4"
+
+def test_resolve_slug_short_circuit_prefers_title(monkeypatch):
+    """If a node provides a title, it should be used instead of option."""
+    class DummyStore:
+        def get_snapshot_etag(self): return "etag-3b"
+        def get_node(self, node_id):
+            return {"_key": node_id, "type": "decision", "option": "OptVal", "title": "Preferred Title"}
+    monkeypatch.setattr(mod, "store", lambda: DummyStore())
+    c = TestClient(mod.app)
+    slug = "preferred-slug"
+    r = c.post("/api/resolve/text", json={"q": slug})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["matches"][0]["id"] == slug
+    # Title should prefer node['title']
+    assert body["matches"][0]["title"] == "Preferred Title"
+    assert r.headers["x-snapshot-etag"] == "etag-3b"

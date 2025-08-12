@@ -52,12 +52,14 @@ def test_invalid_llm_json_triggers_fallback(monkeypatch):
     """Gateway must set meta.fallback_used=true when it repairs
     an invalid (non-conforming) LLM JSON payload."""
 
-    # Force validate_and_fix to report 'changed'
-    def _always_change(answer, allowed_ids, anchor_id):
-        answer.supporting_ids = []          # wipe IDs to simulate bad JSON
-        return answer, True, ["forced repair – invalid JSON"]
-
-    monkeypatch.setattr(templater, "validate_and_fix", _always_change)
+    # Stub the core validator to always emit at least one error.  The
+    # boolean component of the return value is ignored by the builder; a
+    # non‑empty errors list triggers fallback_used=True.
+    monkeypatch.setattr(
+        "gateway.builder.validate_response",
+        lambda _resp: (True, [{"code": "forced_repair", "details": {"reason": "invalid JSON"}}]),
+        raising=False,   # builder doesn't export this by default
+    )
 
     client = TestClient(app)
     resp = client.post("/v2/ask", json={"anchor_id": "panasonic-exit-plasma-2012"})

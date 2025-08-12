@@ -27,6 +27,7 @@ dependencies = [
   "core_logging",
   "core_utils",
   "core_validator",
+  "shared",
 ]
 
 [tool.setuptools.packages.find]

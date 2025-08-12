@@ -91,7 +91,7 @@ def call_llm(
     model_endpoint = (
         os.getenv("CANARY_MODEL_ENDPOINT", "http://tgi-canary:8080")
         if use_canary
-        else os.getenv("CONTROL_MODEL_ENDPOINT", "http://vllm-control:8000")
+        else os.getenv("CONTROL_MODEL_ENDPOINT", "http://vllm-control:8010")
     )
     model_name = "canary" if use_canary else "control"
     # Temperature/max tokens defaults

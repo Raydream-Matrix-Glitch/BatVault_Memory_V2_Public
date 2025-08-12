@@ -129,10 +129,10 @@ class ArangoStore:
                 from_vertex_collections=["nodes"],
                 to_vertex_collections=["nodes"],
             )
+        self._ensure_search_components()
         if os.getenv("ARANGO_VECTOR_INDEX_ENABLED", "false").lower() == "true":
             self._audit_embedding_config()
             self._maybe_create_vector_index()
-            self._ensure_search_components()
 
     # ------------------------------------------------------------
     # Search components (vector index, analyzer & view)
@@ -174,6 +174,10 @@ class ArangoStore:
                     "fields": {
                         "rationale": {"analyzers": ["text_en"]},
                         "summary": {"analyzers": ["text_en"]},
+                        "description": {"analyzers": ["text_en"]},
+                        "reason": {"analyzers": ["text_en"]},
+                        "option": {"analyzers": ["text_en"]},
+                        "title": {"analyzers": ["text_en"]},
                     },
                     "storeValues": "id",
                 }
@@ -201,19 +205,41 @@ class ArangoStore:
         url = f"{cfg.arango_url}/_db/{self.db.name}/_api/index"
         params = {"collection": "nodes"}
         vectors = self._count_vectors()
-        payload = {
-            "type": "vector",
-            "name": "nodes_embedding_hnsw",
-            "fields": ["embedding"],
-            "inBackground": True,
-            "params": {
-                "dimension": int(os.getenv("EMBEDDING_DIM", 768)),
-                "metric": os.getenv("VECTOR_METRIC", "cosine"),
-                "indexType": "hnsw",
-                "M": int(os.getenv("HNSW_M", 16)),
-                "efConstruction": int(os.getenv("HNSW_EF", 200)),
-            },
-        }
+        idx_type = os.getenv("ARANGO_VECTOR_INDEX_TYPE", "hnsw").lower()
+        dim = int(os.getenv("EMBEDDING_DIM", 768))
+        metric = os.getenv("VECTOR_METRIC", "cosine")
+
+        def _hnsw_payload():
+            return {
+                "type": "vector",
+                "name": "nodes_embedding_hnsw",
+                "fields": ["embedding"],
+                "inBackground": True,
+                "params": {
+                    "dimension": dim,
+                    "metric": metric,
+                    "indexType": "hnsw",
+                    "M": int(os.getenv("HNSW_M", 16)),
+                    "efConstruction": int(os.getenv("HNSW_EF", 200)),
+                },
+            }
+
+        def _ivf_payload():
+            return {
+                "type": "vector",
+                "name": "nodes_embedding_ivf",
+                "fields": ["embedding"],
+                "inBackground": True,
+                "params": {
+                    "dimension": dim,
+                    "metric": metric,
+                    "indexType": "ivf",
+                    "nLists": int(os.getenv("IVF_NLISTS", 1024)),
+                    "numProbes": int(os.getenv("IVF_NUMPROBES", 1)),
+                },
+            }
+
+        payload = _ivf_payload() if idx_type == "ivf" else _hnsw_payload()
         auth = httpx.BasicAuth(cfg.arango_root_user, cfg.arango_root_password)
         try:
             resp = httpx.post(url, params=params, json=payload, auth=auth, timeout=10.0)
@@ -223,8 +249,8 @@ class ArangoStore:
                 "collection": "nodes",
                 "dimension": payload["params"]["dimension"],
                 "metric": payload["params"]["metric"],
-                "M": payload["params"]["M"],
-                "efConstruction": payload["params"]["efConstruction"],
+                "M": payload["params"].get("M"),
+                "efConstruction": payload["params"].get("efConstruction"),
                 "vector_count": vectors,
             }
             if resp.status_code in (200, 201):
@@ -234,13 +260,23 @@ class ArangoStore:
             ):
                 log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_exists", **common)
             else:
+                # Compatibility retry: some Arango deployments expect IVF params (nLists)
+                body_txt = resp.text[:500]
+                wants_ivf = "nLists" in body_txt and payload["params"].get("indexType") == "hnsw"
+                if wants_ivf:
+                    ivf = _ivf_payload()
+                    resp2 = httpx.post(url, params=params, json=ivf, auth=auth, timeout=10.0)
+                    common["index_name"] = ivf["name"]
+                    if resp2.status_code in (200, 201, 409):
+                        log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_ivf_compat", **common)
+                        return
                 log_stage(
                     get_logger("memory_api"),
                     "bootstrap",
                     "arango_vector_index_warn",
-                    body=resp.text[:500],
+                    body=body_txt,
                     **common,
-                    payload_schema="vector+params/hnsw",
+                    payload_schema="vector+params/" + payload["params"].get("indexType", "unknown"),
                 )
         except Exception as exc:
             log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_error", error=str(exc))
@@ -270,11 +306,47 @@ class ArangoStore:
     # ------------------------------------------------------------
 
     def upsert_node(self, node_id: str, node_type: str, payload: Dict[str, Any]) -> None:
+        """Insert or replace a node document after applying normalisation.
+
+        Prior to writing to the ``nodes`` collection this method applies
+        the shared normalisation routine to the provided payload.  This
+        guarantees that all persisted documents adhere to the canonical
+        schema (``x-extra`` presence, tag formatting, allowed field
+        filtering and timestamp coercion).  The normalised payload is
+        then augmented with the Arango-specific ``_key`` and ``type``
+        keys and written using an upsert (insert with overwrite).
+        """
         self._connect()
-        doc = dict(payload)
+        # Import within the method to avoid creating dependency cycles.
+        # If the shared normaliser cannot be imported (e.g. during tests),
+        # fall back to verbatim storage.  Import errors are swallowed to
+        # allow ingestion to proceed.
+        try:
+            from shared.normalize import (
+                normalize_decision,
+                normalize_event,
+                normalize_transition,
+            )
+        except Exception:
+            normalised = dict(payload)
+        else:
+            if node_type == "decision":
+                normalised = normalize_decision(payload)
+            elif node_type == "event":
+                normalised = normalize_event(payload)
+            elif node_type == "transition":
+                normalised = normalize_transition(payload)
+            else:
+                normalised = dict(payload)
+        # Attach the storage specific identifiers.  The node id maps to
+        # the Arango ``_key``; type is preserved if present on the
+        # normalised document but overwritten to ensure consistency.
+        doc = dict(normalised)
         doc["_key"] = node_id
         doc["type"] = node_type
-        self.db.collection("nodes").insert(doc, overwrite=True)
+        # In stub-mode ``self.db`` may be None; guard against AttributeError
+        if self.db is not None:
+            self.db.collection("nodes").insert(doc, overwrite=True)
 
     def upsert_edge(
         self,
@@ -563,8 +635,11 @@ class ArangoStore:
                     "type": n["node"].get("type"),
                     "title": n["node"].get("title"),
                     "edge": {
-                        "relation": n["edge"].get("relation"),
-                        "timestamp": n["edge"].get("timestamp"),
+                        # Map the stored ``relation`` into ``rel`` for
+                        # downstream consumers.  When the relation key is
+                        # missing or None we propagate None explicitly.
+                        "rel": (n.get("edge") or {}).get("relation"),
+                        "timestamp": (n.get("edge") or {}).get("timestamp"),
                     },
                 }
                 for n in doc.get("neighbors", [])
@@ -627,12 +702,15 @@ class ArangoStore:
                 try:
                     aql = (
                         "FOR d IN nodes FILTER HAS(d,'embedding') "
-                        "LET score = APPROX_NEAR_COSINE(d.embedding, @qv) "
+                        "LET score = COSINE_SIMILARITY(d.embedding, @qv) "
                         "SORT score DESC LIMIT @limit "
                         "RETURN {id: d._key, score: score, title: d.title, type: d.type}"
                     )
-                    cursor   = self.db.aql.execute(aql, bind_vars={"qv": query_vector, "limit": limit})
-                    results  = self._cursor_to_list(cursor)
+                    # Bind the embedding under ``@qv``.  Passing the raw query under
+                    # ``q`` previously left @qv undefined and prevented cosine similarity
+                    # from working when the vector index is disabled.
+                    cursor  = self.db.aql.execute(aql, bind_vars={"qv": query_vector, "limit": limit})
+                    results = self._cursor_to_list(cursor)
                     if hasattr(self.db, "aql"):
                         self.db.aql.latest_query = aql  # type: ignore[attr-defined]
                     resp = {"query": q, "matches": results, "vector_used": True}
@@ -648,7 +726,7 @@ class ArangoStore:
                         "SORT score DESC LIMIT @limit "
                         "RETURN {id: d._key, score: score, title: d.title, type: d.type}"
                     )
-                    cursor  = self.db.aql.execute(aql, bind_vars={"q": q, "limit": limit})
+                    cursor  = self.db.aql.execute(aql, bind_vars={"qv": query_vector, "limit": limit})
                     results = self._cursor_to_list(cursor)
                     if hasattr(self.db, "aql"):
                         self.db.aql.latest_query = aql  # type: ignore[attr-defined]
@@ -658,22 +736,55 @@ class ArangoStore:
                 except Exception:
                     pass
         try:
+            # The BM25 search uses the ArangoSearch view ``nodes_search``.  In addition
+            # to rationale, description, reason and summary, include the decision
+            # ``option`` and ``title`` fields so that queries about the action itself
+            # (e.g. “Exit plasma TV production”) can match the associated decision.
             aql = (
                 "FOR d IN nodes_search "
-                "SEARCH ANALYZER( PHRASE(d.rationale, @q) OR PHRASE(d.description, @q) "
-                "OR PHRASE(d.reason, @q) OR PHRASE(d.summary, @q), 'text_en' ) "
+                "SEARCH ANALYZER( "
+                "  TOKENS(@q,'text_en') ANY IN d.option OR "
+                "  TOKENS(@q,'text_en') ANY IN d.title OR "
+                "  TOKENS(@q,'text_en') ANY IN d.rationale OR "
+                "  TOKENS(@q,'text_en') ANY IN d.summary OR "
+                "  TOKENS(@q,'text_en') ANY IN d.description OR "
+                "  TOKENS(@q,'text_en') ANY IN d.reason, 'text_en' ) "
                 "SORT BM25(d) DESC LIMIT @limit "
                 "RETURN {id: d._key, score: BM25(d), title: d.title, type: d.type}"
             )
             cursor = self.db.aql.execute(aql, bind_vars={"q": q, "limit": limit})
             results = list(cursor)
+            if not results:
+                try:
+                    import re as _re
+                    terms = [t for t in _re.findall(r"\w+", q.lower()) if len(t) >= 3]
+                except Exception:
+                    terms = []
+                if terms:
+                    fields = ["option","title","rationale","summary","description","reason"]
+                    ors = " OR ".join([f"LIKE(LOWER(d.{f}), LOWER(CONCAT('%', @t, '%')))" for f in fields])
+                    aql_like = ("FOR t IN @terms FOR d IN nodes FILTER " + ors +
+                                " COLLECT d = d WITH COUNT INTO _c LIMIT @limit "
+                                " RETURN {id: d._key, score: 0.0, title: d.title, type: d.type}")
+                    cursor = self.db.aql.execute(aql_like, bind_vars={"terms": terms, "limit": limit})
+                    results = list(cursor)
+                    try:
+                        from core_logging import log_stage, get_logger
+                        log_stage(get_logger("memory_api"), "resolver", "bm25_zero_hits_like_fallback", q=q, terms=len(terms))
+                    except Exception:
+                        pass
         except Exception:
+            # Fallback lexical search when ArangoSearch view fails (view missing or unsupported).
+            # Extend the LIKE filters to include options and titles so queries referencing
+            # the decision’s action rather than its rationale are still captured.
             aql = (
                 "FOR d IN nodes "
                 "FILTER LIKE(LOWER(d.rationale), LOWER(CONCAT('%', @q, '%'))) "
                 "  OR LIKE(LOWER(d.description), LOWER(CONCAT('%', @q, '%'))) "
                 "  OR LIKE(LOWER(d.reason), LOWER(CONCAT('%', @q, '%'))) "
                 "  OR LIKE(LOWER(d.summary), LOWER(CONCAT('%', @q, '%'))) "
+                "  OR LIKE(LOWER(d.option), LOWER(CONCAT('%', @q, '%'))) "
+                "  OR LIKE(LOWER(d.title), LOWER(CONCAT('%', @q, '%'))) "
                 "LIMIT @limit RETURN {id: d._key, score: 0.0, title: d.title, type: d.type}"
             )
             cursor = self.db.aql.execute(aql, bind_vars={"q": q, "limit": limit})

@@ -1,26 +1,42 @@
+# syntax = docker/dockerfile:1.4
 FROM python:3.11-slim
 
-# --- system & python deps ---
-RUN apt-get update \
+# -----------------------------------------------------------------------------
+# System deps & base Python deps (cached unless this block changes)
+# -----------------------------------------------------------------------------
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_COLOR=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update \
  && apt-get install -y --no-install-recommends curl libffi-dev python3-dev libgmp-dev \
  && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir python-arango httpx==0.27.0
 
-# --- project code ---
+# External Python deps installed once and cached in this layer.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --upgrade pip wheel setuptools \
+ && pip install --no-deps --no-cache-dir python-arango httpx==0.27.0
+
+# -----------------------------------------------------------------------------
+# Project code (changes here do NOT invalidate heavy layers above)
+# -----------------------------------------------------------------------------
 WORKDIR /app
-# 1) shared packages so `core_config` resolves
-COPY packages ./packages
-# 2) install only what bootstrap needs (editable = no wheel build)
-RUN pip install \
-      -e packages/core_config \
-      -e packages/core_logging \
-      -e packages/core_metrics \
-      -e packages/core_storage
 
-# 3) copy the bootstrap script last (keeps cache hits high)
+# Keep editable installs strictly local (no dependency resolution).
+# This avoids any network access when shared packages change.
+COPY packages ./packages
+RUN pip install --no-deps -e packages/core_config \
+                 -e packages/core_logging \
+                 -e packages/core_metrics \
+                 -e packages/core_storage \
+                 -e packages/shared
+
+# Copy the bootstrap script last for better cache reuse
 COPY ops/bootstrap.py ./ops/bootstrap.py
 
-# make the source importable without pip installs in prod
+# Make local packages importable without re-installing
 ENV PYTHONPATH="/app/packages"
 
 CMD ["python", "ops/bootstrap.py"]

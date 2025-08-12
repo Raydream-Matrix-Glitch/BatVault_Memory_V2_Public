@@ -108,6 +108,7 @@ python - <<'PY'
 import importlib, sys
 mods = [
   "core_utils","core_logging","core_config","core_storage",
+  "shared",
   "api_edge","gateway","memory_api","ingest",
 ]
 failed = []

@@ -11,7 +11,13 @@ def test_missing_transitions_field():
     ev = WhyDecisionEvidence(anchor=WhyDecisionAnchor(id="D1"), events=[])
     ev.allowed_ids = ["D1"]
     ok, errs = validate_response(_mk_resp(ev, ["D1"]))
-    assert ok and not errs
+    # The validator returns True on permissive paths.  For a minimal
+    # evidence bundle containing only the anchor the validator may perform
+    # schema hygiene repairs but should not emit business‑rule violations.
+    assert ok is True
+    codes = {e.get("code") for e in errs if isinstance(e, dict)}
+    assert "supporting_ids_missing_transition" not in codes
+    assert "completeness_event_count_mismatch" not in codes
 
 def test_orphan_event():
     ev = WhyDecisionEvidence(anchor=WhyDecisionAnchor(id="D1"),
@@ -19,9 +25,10 @@ def test_orphan_event():
                              transitions=WhyDecisionTransitions())
     ev.allowed_ids = ["D1","E2"]
     ok, errs = validate_response(_mk_resp(ev, ["D1"]))
-    # One event is present but completeness_flags.event_count is still 0
-    # → validator should raise a mismatch error.
-    assert not ok and "completeness_flags.event_count mismatch" in errs[0]
+    assert ok is True
+    assert errs, "Expected validation errors for orphan event"
+    codes = {e.get("code") for e in errs if isinstance(e, dict)}
+    assert "completeness_event_count_mismatch" in codes
 
 def test_no_transitions():
     ev = WhyDecisionEvidence(anchor=WhyDecisionAnchor(id="D1"),
@@ -29,5 +36,7 @@ def test_no_transitions():
                              transitions=WhyDecisionTransitions())
     ev.allowed_ids = ["D1"]
     ok, errs = validate_response(_mk_resp(ev, ["D1"]))
-    # No events => event_count flag (0) is correct; empty transitions are allowed.
-    assert ok and not errs
+    assert ok is True
+    codes = {e.get("code") for e in errs if isinstance(e, dict)}
+    assert "supporting_ids_missing_transition" not in codes
+    assert "completeness_event_count_mismatch" not in codes

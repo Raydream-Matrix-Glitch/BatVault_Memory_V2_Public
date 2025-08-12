@@ -12,8 +12,8 @@ def test_event_tags_and_snippet_normalised():
 
     evt = normalize_event(raw_evt)
 
-    # tags → slug-lowercase, deduped & sorted
-    assert evt["tags"] == ["high-priority", "incident"]
+    # tags → slug-lowercase, underscores, deduped, order preserved
+    assert evt["tags"] == ["incident", "high_priority"]
 
     # snippet auto-derived from first sentence when not provided
     assert evt["snippet"] == "Alice rebooted server"
@@ -31,4 +31,5 @@ def test_decision_based_on_and_tags_carried_through():
     dec = normalize_decision(raw_dec)
 
     assert dec["based_on"] == ["prior-decision"]
-    assert dec["tags"] == ["automation", "devops"]
+    # tags are normalised to lower-case underscores, duplicates removed, order preserved
+    assert dec["tags"] == ["devops", "automation"]

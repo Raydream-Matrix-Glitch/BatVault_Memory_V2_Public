@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useState, useEffect } from "react";
 import Card from "./ui/Card";
 import QueryPanel from "./QueryPanel";
 import TokenStreamLine from "./ui/TokenStreamLine";
@@ -10,6 +10,7 @@ import Button from "./ui/Button";
 import TagCloud from "./TagCloud";
 import SchemaExplorer from "./SchemaExplorer";
 import GraphView from "./GraphView";
+import { motion } from "framer-motion";
 
 /**
  * Root container for the Memory page.
@@ -86,11 +87,38 @@ export default function MemoryPage() {
     return evidenceItems.filter((item) => item.tags?.includes(tagFilter));
   }, [evidenceItems, tagFilter]);
 
+  // When final data arrives, expose its request id on the window for debug logs.
+  useEffect(() => {
+    if (finalData && finalData.meta) {
+      (window as any).__lastRid = finalData?.meta?.request_id ?? null;
+    }
+  }, [finalData]);
+
   return (
     <div className="w-full max-w-4xl mx-auto p-4 space-y-6">
-      <Card>
-        <h1 className="text-2xl font-bold text-vaultred mb-2">BatVault Memory Interface</h1>
-        <p className="text-copy mb-4">
+      <Card className="relative">
+        {/* streaming progress bar */}
+        {isStreaming && (
+          <div className="absolute inset-x-0 top-0 h-[2px] bg-vaultred/70 animate-pulse" />
+        )}
+        {/* encrypted status pill */}
+        <motion.div
+          className="absolute top-4 right-4 flex items-center space-x-2"
+          aria-label="status"
+        >
+          <motion.div
+            className="w-3 h-3 rounded-full bg-green-500"
+            animate={{ opacity: [0.3, 1, 0.3] }}
+            transition={{ duration: 2, ease: "easeInOut", repeat: Infinity }}
+          />
+          <span className="text-xs font-mono text-vaultred">ENCRYPTED</span>
+        </motion.div>
+        {/* heading */}
+        <h1 className="flex items-center text-2xl font-bold text-vaultred mb-2">
+          <span className="heading-accent" />
+          BatVault Memory Interface
+        </h1>
+        <p className="text-copy/90 mb-3">
           Enter a decision reference or ask a natural question. Results will stream in
           real time.
         </p>
@@ -112,23 +140,26 @@ export default function MemoryPage() {
         {/* Evidence list */}
         {!isStreaming && finalData?.evidence && (
           <div className="mt-6">
-            <h2 className="text-lg font-semibold text-vaultred mb-2">Evidence</h2>
-            {/* Tag cloud for filtering evidence. Always render the heading; if no tags are present,
-             * inform the user. This ensures the “Filter by tag” header is visible even when the API
-             * returns no tags. */}
-            <div className="mb-4">
-              <h3 className="text-sm font-semibold text-vaultred mb-1">Filter by tag</h3>
-              {Object.keys(tagCounts).length > 0 ? (
-                <TagCloud
-                  tags={tagCounts}
-                  selected={tagFilter}
-                  onSelect={(tag) => setTagFilter(tag)}
-                />
-              ) : (
-                <p className="text-copy text-xs italic">
-                  No tags found in this evidence bundle.
-                </p>
-              )}
+            {/* Sticky subheader row containing the Evidence heading and tag cloud */}
+            <div className="sticky top-0 bg-surface/80 backdrop-blur py-2 z-10">
+              <h2 className="text-lg font-semibold text-vaultred mb-2">Evidence</h2>
+              {/* Tag cloud for filtering evidence. Always render the heading; if no tags are present,
+               * inform the user. This ensures the “Filter by tag” header is visible even when the API
+               * returns no tags. */}
+              <div className="mb-2">
+                <h3 className="text-sm font-semibold text-vaultred mb-1">Filter by tag</h3>
+                {Object.keys(tagCounts).length > 0 ? (
+                  <TagCloud
+                    tags={tagCounts}
+                    selected={tagFilter}
+                    onSelect={(tag) => setTagFilter(tag)}
+                  />
+                ) : (
+                  <p className="text-copy text-xs italic">
+                    No tags found in this evidence bundle.
+                  </p>
+                )}
+              </div>
             </div>
             {filteredEvidenceItems.length > 0 ? (
               <>

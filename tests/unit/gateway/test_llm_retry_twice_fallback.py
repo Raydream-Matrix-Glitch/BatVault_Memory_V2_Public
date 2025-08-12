@@ -66,7 +66,7 @@ def _fake_llm(monkeypatch):
     yield _FakeChatCompletion
 
 @pytest.fixture(autouse=True)
-def _force_validator_fallback(monkeypatch):
+def _stub_evidence_builder(monkeypatch):
     """Inject a pre-built evidence bundle whose `_retry_count == 2` so the
     gateway surfaces `meta.retries == 2` without hitting the Memory-API."""
     from gateway.app import _evidence_builder
@@ -85,24 +85,20 @@ def _force_validator_fallback(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _force_validator_fallback(monkeypatch):
-    """Force the validator to fail once so the templater repair path is taken
-    (sets `meta.fallback_used == True`)."""
-    # Make validate_response always return failure
-    monkeypatch.setattr(
-        gw_app,
-        "validate_response",
-        lambda _resp: (False, ["forced schema error"]),
-        raising=True,
-    )
+    """
+    Force the core validator to emit an error once so that the builder
+    marks the response as having undergone a repair (meta.fallback_used == True).
 
-    # And ensure validate_and_fix reports a change
-    import gateway.templater as templater
-
+    In the new architecture the builder invokes ``gateway.builder.validate_response``
+    directly.  We monkey‑patch this function to return a non‑empty error list
+    while still indicating overall validity.  This triggers the
+    deterministic fallback path without involving the templater.
+    """
+    # Patch the validator used in the builder to emit a forced error
     monkeypatch.setattr(
-        templater,
-        "validate_and_fix",
-        lambda a, _ids, _anchor: (a, True, ["ids fixed"]),
-        raising=True,
+        "gateway.builder.validate_response",
+        lambda _resp: (True, [{"code": "forced_schema_error", "details": {"test": True}}]),
+        raising=False,   # attribute is intentionally absent in builder
     )
 
 # ──────────────────────────

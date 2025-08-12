@@ -42,8 +42,35 @@ export default function QueryPanel({ onAsk, onQuery, isStreaming }: QueryPanelPr
   const [decisionRef, setDecisionRef] = useState<string>("");
   const [nlInput, setNlInput] = useState<string>("");
 
+  /**
+   * Switch between structured and natural query modes. Emits a debug log with
+   * the previous and next values.
+   */
+  const handleModeChange = (newMode: "ask" | "query") => {
+    if (newMode === mode) return;
+    console.debug("[ui.memory.mode_switch]", { from: mode, to: newMode });
+    setMode(newMode);
+  };
+
+  /**
+   * Update the selected intent. Emits a debug log when the value changes.
+   */
+  const handleIntentChange = (val: string) => {
+    console.debug("[ui.memory.intent_change]", { intent: val });
+    setIntent(val);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    // prepare debug payload
+    const payload = {
+      mode,
+      intent,
+      rid: (window as any).__lastRid ?? null,
+      nl_len: nlInput.trim().length,
+      decision_ref: decisionRef.trim(),
+    };
+    console.debug("[ui.memory.submit]", payload);
     if (mode === "ask") {
       if (!decisionRef.trim()) return;
       await onAsk(intent, decisionRef.trim());
@@ -55,9 +82,21 @@ export default function QueryPanel({ onAsk, onQuery, isStreaming }: QueryPanelPr
 
   return (
     <div className="space-y-4">
-      <div className="flex space-x-4 border-b border-gray-700">
-        <Tab active={mode === "ask"} onClick={() => setMode("ask")}>Structured</Tab>
-        <Tab active={mode === "query"} onClick={() => setMode("query")}>Natural</Tab>
+      <div className="inline-flex rounded-full bg-black/30 backdrop-blur px-1 border border-vaultred/20">
+        <Tab
+          active={mode === "ask"}
+          onClick={() => handleModeChange("ask")}
+          className={mode !== "ask" ? "text-copy/80" : undefined}
+        >
+          Structured
+        </Tab>
+        <Tab
+          active={mode === "query"}
+          onClick={() => handleModeChange("query")}
+          className={mode !== "query" ? "text-copy/80" : undefined}
+        >
+          Natural
+        </Tab>
       </div>
       <form onSubmit={handleSubmit} className="space-y-4">
         {mode === "ask" ? (
@@ -74,11 +113,11 @@ export default function QueryPanel({ onAsk, onQuery, isStreaming }: QueryPanelPr
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium text-copy mb-1">Intent</label>
+                <label className="block text-sm font-mono text-copy mb-1">Intent</label>
                 <select
-                  className="w-full px-3 py-2 rounded-md bg-surface text-copy border border-gray-700 focus:outline-none focus:ring-2 focus:ring-vaultred"
+                  className="w-full px-3 py-2 rounded-md bg-surface text-copy border border-gray-700 focus:outline-none focus:ring-2 focus:ring-vaultred border-l border-vaultred/50 pl-3"
                   value={intent}
-                  onChange={(e) => setIntent(e.target.value)}
+                  onChange={(e) => handleIntentChange(e.target.value)}
                 >
                   {intents.map((opt) => (
                     <option key={opt.value} value={opt.value} className="bg-darkbg text-copy">

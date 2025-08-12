@@ -1,21 +1,17 @@
-# 1 ───────────────────────────── Imports ────────────────────────────────
-import asyncio, functools, io, os, time, uuid, inspect
+# Imports
+import asyncio, functools, io, os, time, inspect
 import re
 from typing import List, Optional
 import httpx as _httpx_real, orjson, redis
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from minio import Minio
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
 import importlib.metadata as _md
 
 from core_config import get_settings
 from core_config.constants import (
-    MAX_PROMPT_BYTES,
-    RESOLVER_MODEL_ID,
-    SELECTOR_MODEL_ID,
     TTL_SCHEMA_CACHE_SEC as _SCHEMA_TTL_SEC,
 )
 from core_logging import get_logger, log_stage, trace_span
@@ -25,18 +21,19 @@ from core_metrics import (
     gauge   as metric_gauge,
 )
 from core_models.models import (
-    WhyDecisionAnchor, WhyDecisionAnswer, WhyDecisionEvidence,
-    WhyDecisionResponse, WhyDecisionTransitions, CompletenessFlags,
+    WhyDecisionAnswer, WhyDecisionEvidence,
+    WhyDecisionResponse
 )
 from core_utils.fingerprints import canonical_json
 from core_utils.health import attach_health_routes
 from core_utils.ids import generate_request_id
 from core_storage.minio_utils import ensure_bucket as ensure_minio_bucket
 from core_validator import validate_response
+# Import the public canonical helper rather than the private underscore version.
+from core_validator import canonical_allowed_ids
 
-from gateway.resolver.fallback_search import search_bm25   # offline search fallback
-from . import evidence, prom_metrics       # noqa: F401
-from .evidence import EvidenceBuilder, _safe_async_client, _collect_allowed_ids
+from . import evidence, prom_metrics
+from .evidence import EvidenceBuilder, _safe_async_client
 from .load_shed import should_load_shed
 from .match_snippet import build_match_snippet
 from .builder import build_why_decision_response
@@ -52,7 +49,6 @@ async def route_query(*args, **kwargs):  # pragma: no cover - proxy
     `gateway.app.route_query` continue to work.  Structured logging records
     proxy invocation for debugging.
     """
-    # Log that the proxy is being used – aids debugging
     try:
         log_stage(logger, "router_proxy", "invoke", function="route_query")
     except Exception:
@@ -64,20 +60,6 @@ async def route_query(*args, **kwargs):  # pragma: no cover - proxy
     func = getattr(mod, "route_query")
     return await func(*args, **kwargs)
 
-# ---------------------------------------------------------------------------#
-# Decision resolver proxy (Milestone‑4)
-#
-# Tests in Milestone‑4 dynamically monkey‑patch this attribute on the
-# ``gateway.app`` module.  Previously the module did not export a
-# ``resolve_decision_text`` symbol which caused ``AttributeError`` in
-# integration tests when attempting to override it.  To preserve the
-# existing behaviour while supporting test stubs, define a thin
-# asynchronous proxy that delegates to the canonical resolver in
-# ``gateway.resolver``.  By importing the target module inside the
-# function body we avoid binding a stale reference at module import
-# time (spec §B2; roadmap M4).  When patched, the monkey‑patched
-# coroutine will take precedence and be invoked by ``v2_query`` via
-# module attribute lookup.
 
 async def resolve_decision_text(text: str):  # pragma: no cover - proxy
     """Resolve a natural-language query or slug to a decision anchor.
@@ -98,42 +80,41 @@ async def resolve_decision_text(text: str):  # pragma: no cover - proxy
         if no match is found.
     """
     import importlib
-    # Defer import to runtime to avoid holding on to a stale reference.
     resolver_mod = importlib.import_module("gateway.resolver")
     resolver_fn = getattr(resolver_mod, "resolve_decision_text")
     return await resolver_fn(text)
 
-# ---------------------------------------------------------------------------#
-# HTTPX shim
-#
-# Tests frequently monkey‑patch ``gateway.app.httpx`` methods.  If
-# ``gateway.app.httpx`` referred to the real httpx module, those patches would
-# mutate the global state and break other components.  To isolate these
-# patches, provide a proxy object whose attributes delegate to the real
-# httpx module.  Assigning attributes on this shim affects only the proxy.
 
+
+# HTTPX shim
 class _HTTPXShim:
     def __getattr__(self, name: str):
         return getattr(_httpx_real, name)
 
-# Expose the shim as the module‑level ``httpx`` symbol.  Other modules should
-# import httpx directly if they require unpatched behaviour.
 httpx = _HTTPXShim()
 
 
-# 2 ───────────────────── Config & constants ─────────────────────────────
+
+# Configuration & constants
 settings        = get_settings()
 logger          = get_logger("gateway"); logger.propagate = True
 
 _SEARCH_MS      = TIMEOUT_SEARCH_MS
 _EXPAND_MS      = TIMEOUT_EXPAND_MS
 
-# 3 ───────────────────── Application setup ──────────────────────────────
+
+# Application & Router Setup
 app    = FastAPI(title="BatVault Gateway", version="0.1.0")
 router = APIRouter(prefix="/v2")
 
-# 4 ──────────────── Helpers & singletons ────────────────────────────────
-def minio_client() -> Minio:
+# Helper functions & singletons
+def _minio_client_or_null():
+    # Lazy import to keep tests importable without MinIO
+    try:
+        from minio import Minio  # type: ignore
+    except Exception as exc:
+        log_stage(logger, "artefacts", "minio_unavailable", error=str(exc))
+        return None
     return Minio(
         settings.minio_endpoint,
         access_key=settings.minio_access_key,
@@ -142,8 +123,18 @@ def minio_client() -> Minio:
         region=settings.minio_region,
     )
 
+def minio_client():
+    return _minio_client_or_null()
+
 def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
     client = minio_client()
+    if client is None:
+        # Deterministic no-op sink in test/dev when MinIO is unavailable.
+        log_stage(
+            logger, "artefacts", "sink_noop_enabled",
+            request_id=request_id, count=len(artefacts)
+        )
+        return
     for name, blob in artefacts.items():
         client.put_object(
             settings.minio_bucket, f"{request_id}/{name}",
@@ -151,7 +142,6 @@ def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
         )
         metric_counter("artifact_bytes_total", inc=len(blob), artefact=name)
 
-# ───────────────── asynchronous, bounded-latency wrapper ───────────────
 async def _minio_put_batch_async(
     request_id: str,
     artefacts: dict[str, bytes],
@@ -185,7 +175,8 @@ try:
 except Exception:
     _schema_cache = None   # cache-less fallback
 
-# 5 ─────────────────── Exception handlers ───────────────────────────────
+
+# Exception handlers
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     body = await request.body()
@@ -197,7 +188,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         headers={"x-snapshot-etag": "dummy-etag"},
     )
 
-# 6 ─────────────────────── Middleware ───────────────────────────────────
+
+# Middleware
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     req_id = generate_request_id(); t0 = time.perf_counter()
@@ -215,7 +207,8 @@ async def request_logging_middleware(request: Request, call_next):
     resp.headers["x-request-id"] = req_id
     return resp
 
-# 7 ──────────────── Ops & metrics endpoints ─────────────────────────────
+
+# Ops & metrics endpoints
 @app.get("/metrics", include_in_schema=False)          # pragma: no cover
 def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
@@ -227,7 +220,8 @@ def ensure_bucket():
                                bucket=settings.minio_bucket,
                                retention_days=settings.minio_retention_days)
 
-# 8 ─────────────────────── Health routes ────────────────────────────────
+
+# Health routes
 async def _readiness() -> dict[str, str]:
     return {
         "status": "ready" if await _ping_memory_api() else "degraded",
@@ -242,7 +236,8 @@ attach_health_routes(
     },
 )
 
-# 9 ──────────────────── /v2 schema mirror ───────────────────────────────
+
+# Schema mirror
 @router.get("/schema/{kind}")
 @app.get("/schema/{kind}")          # temporary back-compat
 async def schema_mirror(kind: str):
@@ -277,10 +272,10 @@ async def schema_mirror(kind: str):
     return JSONResponse(content=data,
                         headers={"x-snapshot-etag": etag} if etag else {})
 
-# 10 ─────────────────────── /v2 ask ─────────────────────────────────────
+
+# /v2 ask endpoint
 class AskIn(BaseModel):
     intent: str = Field(default="why_decision")
-    # Milestone-4 adds 'node_id' as an accepted alias for decision slugs
     anchor_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices("anchor_id", "decision_ref", "node_id"),
@@ -312,8 +307,6 @@ class AskIn(BaseModel):
         """
         if self.evidence is None and not (self.anchor_id or self.decision_ref):
             raise ValueError("Either 'evidence' or 'anchor_id' required")
-        # If evidence is supplied explicitly we trust the caller; otherwise
-        # the Gateway will build the bundle from Memory-API.
         return self
 
 @router.post("/ask", response_model=WhyDecisionResponse)
@@ -324,22 +317,9 @@ async def ask(
     include_event: bool = Query(False),
 ):
 
-    # delegate heavy lifting to builder.py
     resp, artefacts, req_id = await build_why_decision_response(
         req, _evidence_builder
     )
-
-    # ------------------------------------------------------------------
-    # Override the load‑shed flag in the response metadata.
-    #
-    # The `build_why_decision_response` helper sets `meta["load_shed"]`
-    # based on a locally imported `should_load_shed()` from
-    # `gateway.load_shed`.  However, in integration tests we monkey‑patch
-    # `gateway.app.should_load_shed` to simulate an overloaded system.
-    # To ensure that this patched function takes precedence, attempt to
-    # resolve and call it dynamically via the module registry.  If the
-    # attribute is missing or throws, fall back silently to the value
-    # already set by the builder.
     try:
         import sys
         gw_mod = sys.modules.get("gateway.app")
@@ -348,33 +328,15 @@ async def ask(
             if callable(fn):
                 resp.meta["load_shed"] = bool(fn())
     except Exception:
-        # ignore errors – preserve existing load_shed flag
         pass
 
-    # Persist artefacts to object storage.  In production this runs
-    # asynchronously via a background task to keep TTFB within budget.
-    # However, in the unit-test harness the MinIO client is replaced
-    # with an in-memory stub and the upload completes almost
-    # immediately.  To avoid cross‑test leakage from unfinished
-    # background tasks we await the upload coroutine here.  This
-    # preserves determinism in tests while preserving async behaviour
-    # in production when the operation incurs real I/O.
     try:
-        # Run the upload directly; the stub executes quickly.  Should
-        # this raise, we swallow the exception to avoid cascading
-        # failures (observed behaviour mirrors create_task()).
         await _minio_put_batch_async(req_id, artefacts)
     except Exception:
         pass
-    # NOTE: We intentionally avoid ``asyncio.create_task`` here to
-    # prevent tasks lingering across test boundaries.  The test harness
-    # replaces the MinIO client with a stub so blocking briefly has no
-    # perceptible impact on latency.
 
-    # ── NEW: Server-Sent-Events (SSE) support ────────────────────────
     if stream:
         short_answer: str = resp.answer.short_answer
-        # Build audit headers: propagate request_id and snapshot_etag
         headers = {"Cache-Control": "no-cache", "x-request-id": req_id}
         try:
             etag = resp.meta.get("snapshot_etag")
@@ -382,7 +344,6 @@ async def ask(
                 headers["x-snapshot-etag"] = etag
         except Exception:
             pass
-        # Attach model/canary headers from the last LLM invocation
         try:
             from gateway.llm_router import last_call as _last_llm_call  # type: ignore
             mdl = _last_llm_call.get("model")
@@ -399,10 +360,10 @@ async def ask(
             headers=headers,
         )
 
-    # Preserve canonical field names per Tech-Spec §M4
     return JSONResponse(content=resp.model_dump(mode="python"))
 
-# 11 ───────────────────── /v2 query (NL) ────────────────────────────────
+
+# /v2 query endpoint
 class QueryIn(BaseModel):
     text: str | None = Field(default=None, alias="text")
     q: str | None = Field(default=None, alias="q")
@@ -424,11 +385,6 @@ async def v2_query(
     if not q:
         raise HTTPException(status_code=400, detail="missing query text")
 
-    # ── intent router (Milestone-4) ──────────────────────────────────
-    # Always run the router so that `function_calls`, `routing_confidence`
-    # and `routing_model_id` appear in `meta` even when the caller did not
-    # supply an explicit *functions* array.  This avoids the classic
-    # “works-locally / fails-in-CI” scenario and honours the tech-spec §B1.
     default_functions: list[str] = ["search_similar", "get_graph_neighbors"]
     functions = req.functions if req.functions is not None else default_functions
 
@@ -438,11 +394,6 @@ async def v2_query(
         _intent_mod = importlib.import_module("gateway.intent_router")
     _route_query = getattr(_intent_mod, "route_query")
 
-    # Accept both async and sync implementations of `route_query`.
-    # Tests often monkey-patch a synchronous stub that returns a plain dict,
-    # whereas the production router is `async def`.  Unconditionally awaiting
-    # the result therefore breaks tests and creates the very “works-locally /
-    # fails-in-CI” problem the spec warns about (§B1).
     route_result = _route_query(q, functions)
     if inspect.isawaitable(route_result):
         routing_info: dict = await route_result
@@ -450,24 +401,17 @@ async def v2_query(
         routing_info: dict = route_result
     logger.info("intent_completed", extra=routing_info)
     
-    # ── SSE streaming shortcut (Milestone‑4) removed – fall through to full pipeline
 
-    # ── Resolve NL query to decision anchor ───────────────────────────
-    # ── Decision-anchor fast-path ─────────────────────────────────────
-    # If the caller *did not* request the search_similar helper we skip the
-    # heavy text resolver to avoid hitting `/api/resolve/text`.
     anchor: dict | None = None
     if routing_info:
         fcalls = routing_info.get("function_calls", []) or []
         if "search_similar" not in fcalls:
             anchor_id: str | None = None
-            # (1) explicit node_id argument
             for f in (req.functions or []):
                 if isinstance(f, dict) and f.get("name") == "get_graph_neighbors":
                     anchor_id = (f.get("arguments") or {}).get("node_id")
                     if anchor_id:
                         break
-            # (2) simple “node <slug>” pattern in the question
             if not anchor_id:
                 m = re.search(r"\bnode\s+([a-zA-Z0-9\-]+)", q)
                 if m:
@@ -475,45 +419,35 @@ async def v2_query(
             if anchor_id:
                 anchor = {"id": anchor_id}
 
-    # Fallback – still use the resolver when we really need it
     if anchor is None:
-        # ── Dynamically resolve the decision resolver (Milestone‑4) ─────
-        # The resolver may be monkey‑patched on the gateway.app module during
-        # integration tests.  Look it up via the module registry to avoid
-        # holding onto a stale reference imported at module scope.
         import importlib, sys
         _gw_mod = sys.modules.get("gateway.app")
         resolver_func = None
         if _gw_mod is not None:
             resolver_func = getattr(_gw_mod, "resolve_decision_text", None)
         if not resolver_func:
-            # Fallback to the canonical resolver from gateway.resolver
             _resolver_mod = sys.modules.get("gateway.resolver")
             if _resolver_mod is None:
                 _resolver_mod = importlib.import_module("gateway.resolver")
             resolver_func = getattr(_resolver_mod, "resolve_decision_text")
         anchor = await resolver_func(q)
         if anchor is None:
-            raise HTTPException(status_code=404, detail="No matching decision found")
-    if anchor is None:
-        # Milestone-3 compatibility: return provisional `{ "matches": [...] }`
-        matches = await search_bm25(q, k=24)
-        return JSONResponse(content={"matches": matches}, status_code=200)
+            import importlib, sys
+            _fs_mod = sys.modules.get("gateway.resolver.fallback_search")
+            if _fs_mod is None:
+                _fs_mod = importlib.import_module("gateway.resolver.fallback_search")
+            search_fn = getattr(_fs_mod, "search_bm25")
+            matches = await search_fn(q, k=24)
+            if matches:
+                anchor = {"id": matches[0].get("id")}
+            else:
+                return JSONResponse(content={"matches": matches}, status_code=200)
 
-    # ── Build evidence bundle and merge router helper results ─────────
-    # Determine whether to include graph neighbours based on the caller’s requested functions
     include_neighbors: bool = (
         "get_graph_neighbors"
         in (routing_info.get("function_calls") or functions or [])
     )
 
-    # ------------------------------------------------------------------
-    # Milestone‑4 compatibility: gracefully handle EvidenceBuilder stubs
-    # ------------------------------------------------------------------
-    # Some tests monkey‑patch `_evidence_builder` with stub classes whose
-    # `.build()` method does not accept an `include_neighbors` keyword argument.
-    # We inspect the method signature at runtime; if it accepts that
-    # parameter we pass it, otherwise we fall back to the single‑argument call.
     try:
         import inspect  # Lazy import to avoid module‑level overhead
         sig = inspect.signature(_evidence_builder.build)
@@ -525,23 +459,11 @@ async def v2_query(
         else:
             ev = await _evidence_builder.build(anchor["id"])
     except TypeError:
-        # If the stub rejects unexpected kwargs, retry without them.
         ev = await _evidence_builder.build(anchor["id"])
 
-    # ------------------------------------------------------------------
-    # Milestone-3 compatibility
-    # -------------------------
-    # The legacy `/evidence/*` shim (still used by unit-tests) **does not**
-    # invoke the Milestone-4 intent-router, therefore `routing_info`
-    # is undefined here.  Falling back to an empty dict prevents a
-    # NameError and allows the stage-timeout logic to behave as intended.
-    # When the router is introduced for this endpoint in a later
-    # milestone we can simply feed the real routing payload through.
-    # ------------------------------------------------------------------
+
     helper_payloads: dict = routing_info.get("results", {}) if routing_info else {}
     neighbours: List[dict] = []
-    # Graph neighbours may be returned under ``neighbors`` (preferred) or
-    # ``matches`` (legacy).  Only merge when the helper payload is a dict.
     if isinstance(helper_payloads.get("get_graph_neighbors"), dict):
         payload = helper_payloads.get("get_graph_neighbors") or {}
         neighbours += (
@@ -549,24 +471,117 @@ async def v2_query(
             or payload.get("matches")
             or []
         )
-    # `search_similar` results are expected to be a list of identifiers (or dicts).
-    if isinstance(helper_payloads.get("search_similar"), list):
-        neighbours += helper_payloads.get("search_similar")
+    search_results = helper_payloads.get("search_similar")
+    if isinstance(search_results, list):
+        neighbours += search_results
+    elif isinstance(search_results, dict):
+        matches = search_results.get("matches")
+        if isinstance(matches, list):
+            for m in matches:
+                if isinstance(m, dict):
+                    mid = m.get("id")
+                    if mid:
+                        neighbours.append({"id": mid})
+                else:
+                    neighbours.append(m)
 
-    seen = {e.get("id") for e in ev.events}
+    added_events: int = 0
+    added_trans_pre: int = 0
+    added_trans_suc: int = 0
+    event_ids: set[str] = {e.get("id") for e in ev.events if isinstance(e, dict) and e.get("id")}
+    pre_ids: set[str] = {t.get("id") for t in ev.transitions.preceding if isinstance(t, dict) and t.get("id")}
+    suc_ids: set[str] = {t.get("id") for t in ev.transitions.succeeding if isinstance(t, dict) and t.get("id")}
+
     for n in neighbours:
-        nid = n.get("id") if isinstance(n, dict) else n
-        if nid and nid not in seen and nid != ev.anchor.id:
-            ev.events.append({"id": nid})
-            seen.add(nid)
+        if isinstance(n, dict):
+            n_id: str | None = n.get("id")
+            raw_type = n.get("type") or n.get("entity_type")
+            n_type: str | None = str(raw_type).lower() if raw_type else None
+        else:
+            n_id = n  # primitive identifiers default to events
+            n_type = None
+        if not n_id or n_id == ev.anchor.id:
+            continue
+        if n_type == "transition":
+            tid = n_id
+            orient: str | None = None
+            if isinstance(n, dict):
+                to_id = n.get("to") or n.get("to_id")
+                from_id = n.get("from") or n.get("from_id")
+                try:
+                    if to_id and to_id == ev.anchor.id:
+                        orient = "preceding"
+                    elif from_id and from_id == ev.anchor.id:
+                        orient = "succeeding"
+                except Exception:
+                    orient = None
+                if orient is None:
+                    edge = n.get("edge") or {}
+                    rel = edge.get("rel") or edge.get("relation")
+                    if rel in ("preceding", "succeeding"):
+                        orient = rel
+            if orient == "succeeding":
+                if tid not in pre_ids and tid not in suc_ids:
+                    ev.transitions.succeeding.append(n)
+                    suc_ids.add(tid)
+                    added_trans_suc += 1
+            else:
+                if tid not in pre_ids and tid not in suc_ids:
+                    ev.transitions.preceding.append(n)
+                    pre_ids.add(tid)
+                    added_trans_pre += 1
+            continue
+        if n_id not in event_ids:
+            if isinstance(n, dict):
+                ev.events.append(n)
+            else:
+                ev.events.append({"id": n_id})
+            event_ids.add(n_id)
+            added_events += 1
 
-    # Refresh allowed_ids so validator stays happy
-    ev.allowed_ids = _collect_allowed_ids(
-        ev.anchor,
-        ev.events,
-        ev.transitions.preceding,
-        ev.transitions.succeeding,
-    )
+    # Recompute allowed_ids using the canonical helper.  Convert events
+    # and transitions to plain dictionaries as needed.  The canonical
+    # function ensures the anchor appears first, followed by events in
+    # ascending timestamp order and then transitions.  Duplicate IDs are
+    # removed.
+    try:
+        _evs: list[dict] = []
+        for _e in ev.events or []:
+            if isinstance(_e, dict):
+                _evs.append(_e)
+            else:
+                try:
+                    _evs.append(_e.model_dump(mode="python"))
+                except Exception:
+                    _evs.append(dict(_e))
+        _trs: list[dict] = []
+        for _t in list(ev.transitions.preceding or []) + list(ev.transitions.succeeding or []):
+            if isinstance(_t, dict):
+                _trs.append(_t)
+            else:
+                try:
+                    _trs.append(_t.model_dump(mode="python"))
+                except Exception:
+                    _trs.append(dict(_t))
+        ev.allowed_ids = canonical_allowed_ids(
+            getattr(ev.anchor, "id", None) or "",
+            _evs,
+            _trs,
+        )
+    except Exception:
+        # Fallback to existing allowed_ids if canonical computation fails
+        ev.allowed_ids = list(getattr(ev, "allowed_ids", []) or [])
+    try:
+        logger.info(
+            "neighbor_merge_summary",
+            extra={
+                "added_events": added_events,
+                "added_transitions_pre": added_trans_pre,
+                "added_transitions_suc": added_trans_suc,
+            },
+        )
+    except Exception:
+        pass
 
     ask_payload = AskIn(
         intent="why_decision",
@@ -578,18 +593,34 @@ async def v2_query(
         ask_payload, _evidence_builder
     )
     
-    # Upload artefacts synchronously so that tests can observe all artefacts
-    # immediately after the request returns.  Although the upload still
-    # happens via run_in_executor (background thread), awaiting here
-    # preserves deterministic behaviour without materially impacting
-    # performance budgets (spec §10.3, §H3).  When the MinIO client is
-    # monkey‑patched to a stub in tests the upload completes virtually
-    # instantaneously.
     await _minio_put_batch_async(req_id, artefacts)
 
-    # ── SSE support ---------------------------------------------------
+    # Apply final validation on the assembled response.  This ensures that
+    # post-routing modifications still conform to the Why-Decision contract.
+    try:
+        ok, v_errors = validate_response(resp)
+        if v_errors:
+            try:
+                existing = resp.meta.get("validator_errors") or []
+                resp.meta["validator_errors"] = existing + v_errors
+            except Exception:
+                pass
+        try:
+            log_stage(
+                logger,
+                "gateway.validation",
+                "applied",
+                errors_count=len(v_errors) if isinstance(v_errors, list) else 0,
+                corrected_fields=[e.get("code") for e in v_errors] if isinstance(v_errors, list) else [],
+                request_id=req_id,
+                prompt_fingerprint=resp.meta.get("prompt_fingerprint"),
+            )
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     if stream:
-        # Propagate request_id and snapshot_etag in headers for audit compliance
         headers = {"Cache-Control": "no-cache", "x-request-id": req_id}
         try:
             etag = resp.meta.get("snapshot_etag")
@@ -597,7 +628,6 @@ async def v2_query(
                 headers["x-snapshot-etag"] = etag
         except Exception:
             pass
-        # Attach model/canary headers from last LLM call (if any)
         try:
             from gateway.llm_router import last_call as _last_llm_call  # type: ignore
             mdl = _last_llm_call.get("model")
@@ -614,7 +644,6 @@ async def v2_query(
             headers=headers,
         )
 
-    # Surface routing metadata in the final response
     if routing_info:
         resp.meta.update(
             {
@@ -626,7 +655,8 @@ async def v2_query(
 
     return JSONResponse(content=resp.model_dump())
 
-# 12 ─────────── Legacy /evidence shim (still used in tests) ─────────────
+
+# Legacy evidence endpoint
 @app.get("/evidence/{decision_ref}")
 async def evidence_endpoint(
     decision_ref: str,
@@ -649,7 +679,6 @@ async def evidence_endpoint(
         raise HTTPException(status_code=504,
                             detail=f"expand stage timeout >{_EXPAND_MS}ms")
 
-    # ── Merge router helper payloads into evidence ────────────────────
     ev = await _evidence_builder.build(anchor["id"])
     helper_payloads: dict = {}
 
@@ -667,11 +696,36 @@ async def evidence_endpoint(
             ev.events.append({"id": nid})
             seen.add(nid)
 
-    # refresh allowed_ids so validator stays happy
-    ev.allowed_ids = _collect_allowed_ids(
-        ev.anchor, ev.events,
-        ev.transitions.preceding, ev.transitions.succeeding
-    )
+    # After merging neighbour IDs into events, recompute allowed_ids using
+    # the canonical helper.  Convert events and transitions to plain
+    # dictionaries as needed.  The helper returns the anchor ID first,
+    # followed by events in ascending timestamp order and then transitions.
+    try:
+        _evs: list[dict] = []
+        for _e in ev.events or []:
+            if isinstance(_e, dict):
+                _evs.append(_e)
+            else:
+                try:
+                    _evs.append(_e.model_dump(mode="python"))
+                except Exception:
+                    _evs.append(dict(_e))
+        _trs: list[dict] = []
+        for _t in list(ev.transitions.preceding or []) + list(ev.transitions.succeeding or []):
+            if isinstance(_t, dict):
+                _trs.append(_t)
+            else:
+                try:
+                    _trs.append(_t.model_dump(mode="python"))
+                except Exception:
+                    _trs.append(dict(_t))
+        ev.allowed_ids = canonical_allowed_ids(
+            getattr(ev.anchor, "id", None) or "",
+            _evs,
+            _trs,
+        )
+    except Exception:
+        ev.allowed_ids = list(getattr(ev, "allowed_ids", []) or [])
 
     ask_payload = AskIn(
         intent="why_decision",
@@ -682,10 +736,6 @@ async def evidence_endpoint(
         ask_payload, _evidence_builder
     )
 
-    # ── Server-Sent Events (SSE) support ───────────────────────────────
-    # When the caller passes `?stream=true` we slice the validated
-    # *short_answer* into token-sized chunks and emit them as a proper
-    # `text/event-stream` (tech-spec §G).
     if stream:
         short_answer: str = resp_obj.answer.short_answer
         return StreamingResponse(
@@ -694,12 +744,12 @@ async def evidence_endpoint(
             headers={"Cache-Control": "no-cache"},
         )
 
-    # Fallback – regular JSON body (non-streaming)
     return JSONResponse(
         status_code=200,
         content=resp_obj.model_dump(),
         headers={"x-snapshot-etag": "dummy-etag"},
     )
 
-# 13 ────────────────────────── Final wiring ─────────────────────────────
+
+# Final wiring
 app.include_router(router)

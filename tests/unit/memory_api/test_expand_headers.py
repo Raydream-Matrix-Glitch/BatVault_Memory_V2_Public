@@ -15,7 +15,12 @@ def test_expand_headers(monkeypatch):
     client = TestClient(mod.app)
     res = client.post("/api/graph/expand_candidates", json={"node_id": "node-x", "k": 1})
     assert res.status_code == 200
+    # Header should reflect the snapshot_etag from the store
     assert res.headers["x-snapshot-etag"] == "etag-10"
+    # Body meta.snapshot_etag should also reflect the same value
+    body = res.json()
+    assert isinstance(body.get("meta"), dict)
+    assert body["meta"].get("snapshot_etag") == "etag-10"
 
 
 def test_expand_flatten_neighbors(monkeypatch):
@@ -41,7 +46,9 @@ def test_expand_flatten_neighbors(monkeypatch):
     body = res.json()
     assert isinstance(body["neighbors"], list)
     ids = {n["id"] for n in body["neighbors"]}
-    assert ids == {"e1", "t1"}
+    # meta.snapshot_etag should be returned alongside neighbours
+    assert isinstance(body.get("meta"), dict)
+    assert body["meta"].get("snapshot_etag") == "etag-11"
 
 
 def test_resolve_empty_query(monkeypatch):

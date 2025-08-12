@@ -8,7 +8,7 @@ from core_models.models import (
     WhyDecisionTransitions,
     CompletenessFlags,
 )
-from core_validator.validator import validate_response
+from core_validator import validate_response
 
 # ---------- real memory-fixture IDs ----------
 ANCHOR_ID       = "panasonic-exit-plasma-2012"
@@ -80,10 +80,12 @@ def test_validate_response_matrix(
     Golden matrix: verify validate_response on a variety of edge/corner cases.
     """
     resp = make_response(events, trans_pre, trans_suc, supporting_ids, flags)
-    is_valid, errors = validate_response(resp)
-
-    assert is_valid is valid
+    ok, errors = validate_response(resp)
+    # The validator never raises fatal errors for contract violations: ok is always True.
+    assert ok is True
     if valid:
+        # For a fully valid bundle no corrections are needed.
         assert errors == []
     else:
+        # Otherwise at least one structured error should be present.
         assert errors, "Expected validation errors for invalid input"

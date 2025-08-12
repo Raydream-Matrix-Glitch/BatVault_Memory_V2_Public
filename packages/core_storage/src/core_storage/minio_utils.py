@@ -1,7 +1,17 @@
 from datetime import datetime
 
 from core_logging import get_logger, log_stage
-from minio.error import S3Error
+try:
+    from minio.error import S3Error
+except Exception:  # pragma: no cover – test stubs may not install minio
+    class S3Error(Exception):  # minimal stand-in so tests can run
+        pass
+try:
+    # needed for lifecycle policy; tests use a stub client but these names must exist
+    from minio.lifecycle import LifecycleConfig, Rule, Expiration, Filter, ENABLED
+except Exception:  # pragma: no cover
+    LifecycleConfig = Rule = Expiration = Filter = None
+    ENABLED = "Enabled"
 
 logger = get_logger("minio_utils")
 
@@ -17,6 +27,7 @@ def ensure_bucket(client, bucket: str, retention_days: int):
         raise
 
     try:
+        log_stage(logger, "artifacts", "minio_lifecycle_config_begin", bucket=bucket, retention_days=retention_days)
         rule = Rule(
             rule_id="batvault-artifacts-retention",
             status=ENABLED,
@@ -25,6 +36,7 @@ def ensure_bucket(client, bucket: str, retention_days: int):
         )
         lifecycle_config = LifecycleConfig([rule])
         client.set_bucket_lifecycle(bucket, lifecycle_config)
+        log_stage(logger, "artifacts", "minio_lifecycle_config_applied", bucket=bucket)
     except Exception as e:
         # Log and continue; this warning means the lifecycle could not be set
         # but the bucket still exists.  The error message will include

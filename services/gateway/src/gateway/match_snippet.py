@@ -3,6 +3,7 @@ import html
 import hashlib
 from typing import Iterable, Optional, Dict, Any
 from core_logging import get_logger, log_stage
+from shared.content import primary_text
 
 logger = get_logger("gateway-snippet")
 
@@ -16,19 +17,8 @@ def _norm_ws(s: Optional[str]) -> Optional[str]:
     return re.sub(r"\s+", " ", s.strip())
 
 def _best_source(m: Dict[str, Any]) -> Optional[str]:
-    for key in (
-        "content",
-        "text",
-        "body",
-        "summary",
-        "snippet",
-        "title",
-        "option",
-    ):
-        v = m.get(key)
-        if isinstance(v, str) and v.strip():
-            return v
-    return None
+    txt = primary_text(m)
+    return txt or None
 
 def _terms(query: str) -> Iterable[str]:
     q = _norm_ws(query) or ""

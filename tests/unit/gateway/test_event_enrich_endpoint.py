@@ -78,14 +78,17 @@ async def test_enrich_decision_neighbors_use_decision_endpoint(monkeypatch) -> N
     builder = EvidenceBuilder(redis_client=None)
     ev = await builder.build(anchor_id)
 
-    # Evidence should include the decision neighbour
-    assert any(item.get("id") == decision_id for item in ev.events)
+    # Decision neighbours must NOT enter events or allowed_ids
+    assert all(item.get("type") == "event" for item in ev.events), "non-event leaked into events"
+    assert all(item.get("id") != decision_id for item in ev.events), "decision present in events"
+    assert decision_id not in (ev.allowed_ids or []), "decision present in allowed_ids"
 
-    # The enrichment call should use the decision endpoint for the neighbour
-    assert any(
-        path.startswith(f"/api/enrich/decision/{decision_id}") for path in calls
-    ), f"Decision neighbour was not enriched via decision endpoint: {calls}"
-    # The event endpoint must not be used for decision neighbours
+    # And we must NOT call the event enrichment endpoint for a decision id
+    assert not any(u.startswith(f"/api/enrich/event/{decision_id}") for u in calls)
+
+    # Decision neighbours are recognised and DROPPED from the build context
+    assert all(item.get("id") != decision_id for item in ev.events), "decision leaked into events"
+    # And no enrichment calls should be made for a dropped decision id
     assert not any(
-        path.startswith(f"/api/enrich/event/{decision_id}") for path in calls
-    ), f"Event endpoint wrongly used for decision neighbour: {calls}"
+        path.endswith(f"/{decision_id}") for path in calls
+    ), f"Unexpected enrichment call for dropped decision: {calls}"

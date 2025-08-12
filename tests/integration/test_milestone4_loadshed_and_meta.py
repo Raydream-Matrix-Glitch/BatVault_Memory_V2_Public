@@ -20,6 +20,7 @@ builder and summariser ensure that only the meta logic is exercised.
 """
 
 import pytest
+import orjson
 from fastapi.testclient import TestClient
 
 import gateway.app as gw_app
@@ -30,9 +31,10 @@ class StubEvidenceBuilder:
     """Return a trivial evidence bundle for load‑shed and meta tests."""
     async def build(self, anchor_id: str):
         from core_models.models import WhyDecisionEvidence, WhyDecisionAnchor, WhyDecisionTransitions
+
         ev = WhyDecisionEvidence(
             anchor=WhyDecisionAnchor(id=anchor_id),
-            events=[{"id": "ev0"}],
+            events=[{"id": "ev0", "type": "event", "x-extra": {}}],
             transitions=WhyDecisionTransitions(preceding=[], succeeding=[]),
             allowed_ids=[anchor_id, "ev0"],
         )
@@ -41,8 +43,25 @@ class StubEvidenceBuilder:
 
 
 def stub_llm_json(*args, **kwargs) -> str:
-    """Return a valid JSON answer for the LLM stub."""
-    return '{"short_answer": "All good", "supporting_ids": ["ev0"]}'
+    """
+    Return a valid JSON answer for the LLM stub.
+
+    The first positional argument is expected to be the prompt envelope
+    dictionary.  We inspect its ``allowed_ids`` to extract the anchor
+    identifier (the first element after the builder’s deterministic
+    ordering), and we return it as the sole supporting_id.  This avoids
+    triggering validator repairs for missing anchors.
+    """
+    anchor_id: str | None = None
+    if args:
+        env = args[0]
+        if isinstance(env, dict):
+            allowed_ids = env.get("allowed_ids") or []
+            if allowed_ids:
+                anchor_id = allowed_ids[0]
+    if anchor_id is None:
+        anchor_id = "unknown"
+    return orjson.dumps({"short_answer": "All good", "supporting_ids": [anchor_id]}).decode()
 
 
 def stub_validate_and_fix(ans, allowed_ids, anchor_id):
@@ -55,6 +74,7 @@ async def test_load_shed_flag(monkeypatch):
 
     # Force the system into a load‑shed state by patching should_load_shed
     monkeypatch.setattr(gw_app, "should_load_shed", lambda: True)
+    monkeypatch.setattr("gateway.builder.should_load_shed", lambda: True, raising=False)
     # Replace expensive components with stubs
     monkeypatch.setattr(gw_app, "_evidence_builder", StubEvidenceBuilder())
     monkeypatch.setattr("gateway.builder.llm_client.summarise_json", stub_llm_json)
@@ -82,6 +102,7 @@ async def test_meta_fields_complete(monkeypatch):
 
     # Do not load shed for this test
     monkeypatch.setattr(gw_app, "should_load_shed", lambda: False)
+    monkeypatch.setattr("gateway.builder.should_load_shed", lambda: False, raising=False)
     monkeypatch.setattr(gw_app, "_evidence_builder", StubEvidenceBuilder())
     monkeypatch.setattr("gateway.builder.llm_client.summarise_json", stub_llm_json)
     monkeypatch.setattr("gateway.builder.templater.validate_and_fix", stub_validate_and_fix)

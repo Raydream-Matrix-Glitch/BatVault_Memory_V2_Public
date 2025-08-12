@@ -1,4 +1,5 @@
 from pydantic import BaseModel, Field, field_validator, ConfigDict
+from core_utils import slugify_tag
 from typing import Any, Dict, List, Optional
 import re
 
@@ -51,11 +52,6 @@ class CompletenessFlags(BaseModel):
 _ID_RE = re.compile(r'^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$')
 
 
-def _slugify(tag: str) -> str:
-    """lower-case, collapse non-alphanumerics to ‘-’, trim dashes"""
-    return re.sub(r'[^a-z0-9]+', '-', tag.lower()).strip('-')
-
-
 class EventModel(BaseModel):
     """Standalone Event schema used by unit-tests."""
 
@@ -89,7 +85,7 @@ class EventModel(BaseModel):
             v = [v]
         out, seen = [], set()
         for raw in v:
-            s = _slugify(str(raw))
+            s = slugify_tag(str(raw))
             if s and s not in seen:
                 out.append(s)
                 seen.add(s)

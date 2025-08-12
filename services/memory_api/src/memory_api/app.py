@@ -5,7 +5,7 @@ from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span
 from core_storage import ArangoStore
 from core_utils.health import attach_health_routes
-from core_utils.ids import generate_request_id
+from core_utils.ids import generate_request_id, is_slug
 from typing import Dict, List, Tuple, Optional
 from functools import lru_cache
 import httpx, inspect
@@ -128,6 +128,39 @@ def _json_response_with_etag(payload: dict, etag: Optional[str] = None) -> JSONR
         resp.headers["x-snapshot-etag"] = etag
     return resp
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Normalization helpers (API-level, resilient to monkey-patched stores)
+# Ensures consistent shape even when tests provide a DummyStore that skips
+# ArangoStore-side normalization.
+# ──────────────────────────────────────────────────────────────────────────────
+def _normalize_node_payload(doc: dict, node_type: str) -> dict:
+    """Normalise a node payload using the shared normaliser.
+
+    This helper delegates unconditionally to the shared normaliser functions
+    exposed in the ``shared.normalize`` package.  The previous
+    implementation contained a fallback that attempted to normalise and
+    sanitise payloads when the shared normaliser could not be imported.
+    That fallback logic has been removed to ensure a single source of
+    truth for normalisation.  If the shared module cannot be imported
+    during testing, tests should monkey‑patch the import or use the
+    shared normaliser directly rather than relying on this API to
+    provide a degraded path.
+    """
+    from shared.normalize import (
+        normalize_decision,
+        normalize_event,
+        normalize_transition,
+    )
+    # Dispatch on the node type; unknown types are returned as plain dicts
+    if node_type == "decision":
+        return normalize_decision(doc)
+    if node_type == "event":
+        return normalize_event(doc)
+    if node_type == "transition":
+        return normalize_transition(doc)
+    # Unknown node type – return a shallow copy
+    return dict(doc or {})
+
 
 # ------------------ Catalog helpers (shared) ------------------
 def _compute_field_catalog() -> Tuple[Dict[str, List[str]], Optional[str]]:
@@ -195,11 +228,17 @@ async def enrich_decision(node_id: str, response: Response):
     # Missing decisions must return a 404 error.
     if doc is None:
         raise HTTPException(status_code=404, detail="decision_not_found")
-    # Attach the current snapshot ETag to the response headers when present
-    etag = store().get_snapshot_etag()
-    if etag:
-        response.headers["x-snapshot-etag"] = etag
-    return doc
+    try:
+        etag = store().get_snapshot_etag()
+    except Exception:
+        etag = None
+    safe_etag = etag or "unknown"
+    if isinstance(doc, dict):
+        doc = _normalize_node_payload(doc, "decision")
+        meta_obj = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+        meta_obj["snapshot_etag"] = safe_etag
+        doc["meta"] = meta_obj
+    return _json_response_with_etag(doc, safe_etag)
 
 @app.get("/api/enrich/event/{node_id}")
 def enrich_event(node_id: str, response: Response):
@@ -208,10 +247,17 @@ def enrich_event(node_id: str, response: Response):
         doc = st.get_enriched_event(node_id)
         if doc is None:
             raise HTTPException(status_code=404, detail="event_not_found")
-        etag = st.get_snapshot_etag()
-        if etag:
-            response.headers["x-snapshot-etag"] = etag
-        return doc
+        try:
+            etag = st.get_snapshot_etag()
+        except Exception:
+            etag = None
+        safe_etag = etag or "unknown"
+        if isinstance(doc, dict):
+            doc = _normalize_node_payload(doc, "event")
+            meta_obj = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+            meta_obj["snapshot_etag"] = safe_etag
+            doc["meta"] = meta_obj
+        return _json_response_with_etag(doc, safe_etag)
 
 @app.get("/api/enrich/transition/{node_id}")
 def enrich_transition(node_id: str, response: Response):
@@ -219,10 +265,17 @@ def enrich_transition(node_id: str, response: Response):
     doc = st.get_enriched_transition(node_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="transition_not_found")
-    etag = st.get_snapshot_etag()
-    if etag:
-        response.headers["x-snapshot-etag"] = etag
-    return doc
+    try:
+        etag = st.get_snapshot_etag()
+    except Exception:
+        etag = None
+    safe_etag = etag or "unknown"
+    if isinstance(doc, dict):
+        doc = _normalize_node_payload(doc, "transition")
+        meta_obj = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+        meta_obj["snapshot_etag"] = safe_etag
+        doc["meta"] = meta_obj
+    return _json_response_with_etag(doc, safe_etag)
 
 # ------------------ Catalogs (module-level callables for tests) ------------------
 def field_catalog(request):
@@ -245,13 +298,14 @@ def relation_catalog(request):
 
 
 # ------------------ Resolver ------------------
-_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
 @app.post("/api/resolve/text")
 async def resolve_text(payload: dict, response: Response):
     # Tests monkey-patch `store` – clear cache so the patch is honoured
     _clear_store_cache()
     q = payload.get("q", "")
-    use_vector = bool(payload.get("use_vector", False))
+    # Distinguish *omitted* from *explicit False* so we can honour False strictly.
+    _use_vector_raw = payload.get("use_vector", None)
+    use_vector = bool(_use_vector_raw)
     query_vector = payload.get("query_vector")
 
     # ------------------------------------------------------------------
@@ -264,10 +318,10 @@ async def resolve_text(payload: dict, response: Response):
     # attach the vector to the payload.  Errors fall back silently to
     # BM25-only mode.  Known slugs are not embedded.
     if (
-        not use_vector
+        _use_vector_raw is None            # only auto-embed when caller did not specify
         and query_vector is None
         and q
-        and not _ID_RE.match(q)  # skip known slugs
+        and not is_slug(q)          # skip known slugs
     ):
         try:
             from memory.embeddings_client import embed  # type: ignore
@@ -282,10 +336,12 @@ async def resolve_text(payload: dict, response: Response):
         except Exception:
             # fallback – leave use_vector false so search remains BM25-only
             log_stage(logger, "embeddings", "fallback_bm25", query=q)
+    elif _use_vector_raw is False:
+        # Explicit False from the caller – document that we honoured it.
+        log_stage(logger, "embeddings", "honour_use_vector_false", query=q)
     if not q and not (use_vector and query_vector):
         return {"matches": [], "query": q, "vector_used": False}
-    # Milestone-2: known slug → short-circuit resolver (skip search)
-    if q and _ID_RE.match(q):
+    if q and is_slug(q):
         try:
             node = store().get_node(q)
         except Exception:
@@ -297,7 +353,7 @@ async def resolve_text(payload: dict, response: Response):
                     {
                         "id": q,
                         "score": 1.0,
-                        "title": node.get("option") or node.get("title"),
+                        "title": node.get("title") or node.get("option"),
                         "type": node.get("type"),
                     }
                 ],
@@ -309,17 +365,16 @@ async def resolve_text(payload: dict, response: Response):
                 etag = store().get_snapshot_etag()
             except Exception:
                 etag = None
-            if etag:
-                response.headers["x-snapshot-etag"] = etag
+            safe_etag = etag or "unknown"
             log_stage(
                 logger,
                 "resolver",
                 "slug_short_circuit",
-                snapshot_etag=etag,
+                snapshot_etag=safe_etag,
                 match_count=1,
                 vector_used=False,
             )
-            return _json_response_with_etag(doc, etag)
+            return _json_response_with_etag(doc, safe_etag)
     # IMPORTANT: to_thread expects a *sync* callable
     def _work():
         # create store inside the worker to avoid eager connection
@@ -443,15 +498,40 @@ async def expand_candidates(payload: dict, response: Response):
     if not isinstance(raw_neighbors, list):
         raw_neighbors = []
 
+    # Extract any existing meta information from the document.  Per the
+    # contract, meta must always be a dictionary (optionally empty).
+    # If the store returned a non-dict or missing meta value we normalise
+    # it to an empty dict.  Defining this object up front avoids
+    # NameError when building the response.
+    meta_obj: dict = {}
+    if isinstance(doc, dict):
+        maybe_meta = doc.get("meta")
+        if isinstance(maybe_meta, dict):
+            meta_obj = maybe_meta
+
+    # Assemble the canonical result payload.  We always include
+    # node_id/anchor, a flattened neighbours list and a meta object.
     result = {
-        "node_id":  node_value,          # new canonical key
-        "anchor":   node_value,          # legacy alias (will be removed in v3)
+        "node_id":  node_value,
+        "anchor":   node_value,
         "neighbors": raw_neighbors,
-        "meta":      doc.get("meta", {"snapshot_etag": ""})  # always present
+        "meta":      meta_obj,
     }
+    # Determine the effective snapshot_etag: prefer the one returned from the store;
+    # otherwise fall back to any existing meta.snapshot_etag; default to "unknown".
     if etag:
-        response.headers["x-snapshot-etag"] = etag
-    return _json_response_with_etag(result, etag)
+        safe_etag = etag
+    else:
+        # Derive the ETag from any existing snapshot_etag in the meta
+        # object; fall back to "unknown" when absent.  meta_obj is always
+        # a dict after the normalisation above.
+        safe_etag = meta_obj.get("snapshot_etag") if isinstance(meta_obj, dict) else None
+        if not safe_etag:
+            safe_etag = "unknown"
+    if not isinstance(result["meta"], dict):
+        result["meta"] = {}
+    result["meta"]["snapshot_etag"] = safe_etag
+    return _json_response_with_etag(result, safe_etag)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Trailing-slash aliases kept for legacy contract tests                      │

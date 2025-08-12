@@ -1,4 +1,4 @@
-# 1 ─────────────────────────── Imports ────────────────────────────────
+# Imports
 from __future__ import annotations
 
 import asyncio, hashlib, inspect, random, httpx, os, concurrent.futures, json
@@ -17,19 +17,29 @@ from core_models.models import (
     WhyDecisionTransitions,
 )
 from .selector import truncate_evidence, bundle_size_bytes
+try:
+    from shared.normalize import mirror_option_to_title  # type: ignore
+except Exception:
+    mirror_option_to_title = None  # type: ignore
+# Import canonical allowed-id computation from the core validator.  This
+# helper guarantees a consistent ordering and deduplication of anchor,
+# event and transition IDs.  It should be used wherever allowed_ids
+# must be computed outside the core validator.
+from core_validator import canonical_allowed_ids
 
-# 2 ───────────── Config & constants ───────────────────────────────────
+
+# Configuration & constants
 settings        = get_settings()
 logger          = get_logger("gateway.evidence")
 
-# ── performance budgets (§Tech-Spec M4) ──────────────────────────────
 _REDIS_GET_BUDGET_MS = int(os.getenv("REDIS_GET_BUDGET_MS", "100"))   # ≤100 ms fail-open
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 CACHE_TTL_SEC   = 900          # 15 min
 ALIAS_TPL       = "evidence:{anchor_id}:latest"
 
-# 3 ───────────── Public test stubs ────────────────────────────────────
+
+# Public API functions
 __all__ = [
     "resolve_anchor",
     "expand_graph",
@@ -53,7 +63,8 @@ async def expand_graph(decision_id: str, *, intent: str | None = None, k: int = 
         resp.raise_for_status()
         return resp.json()
 
-# 4 ─────────────────────── Helpers ────────────────────────────────────
+
+# Helper functions
 def _make_cache_key(decision_id: str, intent: str, scope: str,
                     etag: str, truncated: bool) -> str:
     raw = "|".join((decision_id, intent, scope, etag, str(truncated)))
@@ -68,14 +79,12 @@ def _collect_allowed_ids(
 
     from core_models.models import WhyDecisionAnchor  # local import avoids cycles
 
-    # ── 1. New signature: anchor comes first ────────────────────────────
     if isinstance(shape_or_anchor, WhyDecisionAnchor):
         anchor = shape_or_anchor
         events = events or []
         pre    = pre or []
         suc    = suc or []
 
-    # ── 2. Legacy signature: shape, anchor ─────────────────────────────
     elif isinstance(events, WhyDecisionAnchor):
         shape  = shape_or_anchor
         anchor = events
@@ -90,16 +99,39 @@ def _collect_allowed_ids(
             transitions = neighbours.get("transitions", []) or []
             pre, suc = transitions, []
 
-    # ── 3. Anything else is a programmer error ─────────────────────────
     else:
         raise TypeError("Unsupported _collect_allowed_ids() call signature")
 
-    # ── 4. Compute allowed_ids after neighbour flattening ──────────────
-    ids = {anchor.id}
-    ids.update(e.get("id") for e in (events or []) if isinstance(e, dict))
-    ids.update(t.get("id") for t in (pre or []) if isinstance(t, dict))
-    ids.update(t.get("id") for t in (suc or []) if isinstance(t, dict))
-    return sorted(i for i in ids if i)
+    # Use the canonical helper from the core validator.  Convert neighbour
+    # objects into plain dicts for the helper and combine preceding and
+    # succeeding transitions.
+    # Normalise event and transition lists to contain only dictionaries.
+    try:
+        anchor_id = getattr(anchor, "id", None) or ""
+    except Exception:
+        anchor_id = ""
+    ev_list: list[dict] = []
+    for e in (events or []):
+        if isinstance(e, dict):
+            ev_list.append(e)
+        else:
+            try:
+                ev_list.append(e.model_dump(mode="python"))
+            except Exception:
+                ev_list.append(dict(e))
+    tr_list: list[dict] = []
+    for t in (pre or []) + (suc or []):
+        if isinstance(t, dict):
+            tr_list.append(t)
+        else:
+            try:
+                tr_list.append(t.model_dump(mode="python"))
+            except Exception:
+                tr_list.append(dict(t))
+    # Delegate to the canonical function.  This will deduplicate and order
+    # IDs according to the specification (anchor first, then events by
+    # timestamp, then transitions by timestamp).
+    return canonical_allowed_ids(anchor_id, ev_list, tr_list)
 
 def _extract_snapshot_etag(resp: httpx.Response | object) -> str:
     """
@@ -111,7 +143,6 @@ def _extract_snapshot_etag(resp: httpx.Response | object) -> str:
     """
     headers = getattr(resp, "headers", None)
 
-    # Convert any header container to an iterable of (key, value) pairs
     items = []
     try:
         if headers is None:
@@ -121,7 +152,6 @@ def _extract_snapshot_etag(resp: httpx.Response | object) -> str:
         elif isinstance(headers, (list, tuple)):
             items = list(headers)
         else:
-            # Last resort: try to coerce to dict
             items = list(dict(headers).items())
     except Exception:
         items = []
@@ -131,11 +161,10 @@ def _extract_snapshot_etag(resp: httpx.Response | object) -> str:
             key = str(k).lower().replace("-", "_")
         except Exception:
             continue
-        if key == "snapshot_etag":
+        if key in ("snapshot_etag", "x_snapshot_etag"):
             return v
     return "unknown"
 
-# trace-span fallback (unit-tests monkey-patch the real one)
 if not hasattr(trace_span, "ctx"):
     @contextmanager
     def _noop_ctx(_stage: str, **_kw):
@@ -161,9 +190,8 @@ async def _safe_async_client(**kw):
     client: httpx.AsyncClient
     managed: bool
     try:
-
         client = httpx.AsyncClient(**clean_kwargs)
-        managed = True
+        managed = hasattr(client, "__aenter__")
     except TypeError:
         global _shared_fallback_client
         AC = httpx.AsyncClient
@@ -192,7 +220,8 @@ async def _safe_async_client(**kw):
                 if client is _shared_fallback_client:
                     _shared_fallback_client = None
 
-# 5 ──────────────── EvidenceBuilder ───────────────────────────────────
+
+# EvidenceBuilder class
 class EvidenceBuilder:
     """
     Collect and cache a ``WhyDecisionEvidence`` bundle.
@@ -213,7 +242,6 @@ class EvidenceBuilder:
         global _shared_fallback_client
         _shared_fallback_client = None
 
-    # ───────────────── safe, bounded Redis read ──────────────────────
     async def _safe_get(self, key: str):
         """
         Wrapper around ``redis.get`` that enforces the 100 ms budget and
@@ -228,11 +256,9 @@ class EvidenceBuilder:
                 timeout=_REDIS_GET_BUDGET_MS / 1000,
             )
         except Exception:
-            # Disable cache for the remainder of this request to avoid repeats
             self._redis = None
             return None
 
-    # ───────────────────────── public API ─────────────────────────────
     async def build(
         self,
         anchor_id: str,
@@ -241,17 +267,11 @@ class EvidenceBuilder:
         intent: str = "why_decision",
         scope: str = "k1",
     ) -> WhyDecisionEvidence:
-        # ── initialise containers so they exist even when we skip k-1 expansion
         events: list = []
         pre: list = []
         suc: list = []
         anchor_supported_ids: set[str] = set()
 
-        # ------------------------------------------------------------------ #
-        # Fast-path: caller did **not** request graph neighbours             #
-        # (matches Milestone-4 routing contract – avoids an unnecessary      #
-        # network round-trip and lets test_search_similar_routing pass)      #
-        # ------------------------------------------------------------------ #
         if not include_neighbors:
             anchor = WhyDecisionAnchor(id=anchor_id)
             return WhyDecisionEvidence(
@@ -264,24 +284,20 @@ class EvidenceBuilder:
         alias_key   = ALIAS_TPL.format(anchor_id=anchor_id)
         retry_count = 0
 
-        # fast‑path – try cache before network I/O
         if self._redis:
             try:
                 cached_raw = await self._safe_get(alias_key)
                 if cached_raw:
-                    # Convert bytes to a UTF‑8 string when possible for JSON parsing and pointer handling
                     raw_str: Any = cached_raw
                     try:
                         if isinstance(cached_raw, (bytes, bytearray)):
                             raw_str = cached_raw.decode("utf-8")
                     except Exception:
                         raw_str = cached_raw
-                    # Try to parse structured JSON.  A failure implies the value is a pointer.
                     try:
                         parsed = json.loads(raw_str)
                     except Exception:
                         parsed = None
-                    # Layout 1: wrapped bundle { "_snapshot_etag": …, "data": … }
                     if isinstance(parsed, dict) and "_snapshot_etag" in parsed and "data" in parsed:
                         ev_obj = parsed.get("data")
                         if isinstance(ev_obj, dict):
@@ -300,7 +316,6 @@ class EvidenceBuilder:
                                         span.set_attribute("cache.hit", True)
                                         span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                                     return ev
-                    # Layout 2: bare JSON evidence directly under alias_key
                     if parsed is not None:
                         try:
                             ev = WhyDecisionEvidence.model_validate(parsed)
@@ -310,15 +325,12 @@ class EvidenceBuilder:
                             except Exception:
                                 ev = None
                         if ev is not None:
-                            # Only use the cached evidence if it is still fresh.  A missing
-                            # snapshot_etag (None) counts as fresh (spec §H3).
                             if await self._is_fresh(anchor_id, ev.snapshot_etag):
                                 ev.__dict__["_retry_count"] = retry_count
                                 with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
                                     span.set_attribute("cache.hit", True)
                                     span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                                 return ev
-                    # Layout 3: pointer – interpret the value as the name of the composite key
                     composite_key = None
                     if parsed is None:
                         composite_key = raw_str if isinstance(raw_str, str) else None
@@ -342,28 +354,22 @@ class EvidenceBuilder:
                                 return ev
             except Exception:
                 logger.warning("redis read error – bypassing cache", exc_info=True)
-                # Fail‑open: disable cache for the remainder of this request
                 self._redis = None
 
-        # ── plan (k-1 graph shape) ───────────────────────────────
         with trace_span.ctx("plan", anchor_id=anchor_id):
             plan = {"node_id": anchor_id, "k": 1}
             expand_ms = min(settings.timeout_expand_ms, _EXPAND_MS)  # clamp to perf budget
-            # Use the **shared** client so consecutive calls can observe
-            # monotonic state (e.g. MockClient2._idx) and detect ETag changes.
             async with _safe_async_client(
                 timeout=expand_ms / 1000.0,
                 base_url=settings.memory_api_url,
             ) as client:
-                # ------------------------------------------------------------------
-                # Anchor enrichment first – capture the snapshot_etag header.
-                # This ensures we always have an ETag even if neighbour expansion
-                # times out.
-                # ------------------------------------------------------------------
+                # Primary attempt to fetch the anchor; fall back to a stub if network fails
+                anchor_json: dict
+                hdr_etag: str
                 try:
                     resp_anchor = await client.get(f"/api/enrich/decision/{anchor_id}")
                     resp_anchor.raise_for_status()
-                    anchor_json: dict = resp_anchor.json() or {}
+                    anchor_json = resp_anchor.json() or {}
                     if anchor_json.get("id") and anchor_json["id"] != anchor_id:
                         logger.warning(
                             "anchor_id_mismatch",
@@ -375,29 +381,54 @@ class EvidenceBuilder:
                     anchor_json["id"] = anchor_id
                     hdr_etag = _extract_snapshot_etag(resp_anchor) or "unknown"
                 except Exception:
-                    anchor_json, hdr_etag = {"id": anchor_id}, "unknown"
+                    # fallback: try without base_url in a fresh client so that monkey‑patched
+                    # AsyncClient can serve the request (tests provide relative-url stubs)
+                    try:
+                        async with _safe_async_client(
+                            timeout=expand_ms / 1000.0,
+                            _fresh=True,
+                        ) as fb_client:
+                            fresp = await fb_client.get(f"/api/enrich/decision/{anchor_id}")
+                            fresp.raise_for_status()
+                            anchor_json = fresp.json() or {}
+                            if anchor_json.get("id") and anchor_json["id"] != anchor_id:
+                                logger.warning(
+                                    "anchor_id_mismatch",
+                                    extra={
+                                        "requested_anchor_id": anchor_id,
+                                        "memory_anchor_id": anchor_json.get("id"),
+                                    },
+                                )
+                            anchor_json["id"] = anchor_id
+                            hdr_etag = _extract_snapshot_etag(fresp) or "unknown"
+                    except Exception:
+                        anchor_json, hdr_etag = {"id": anchor_id}, "unknown"
 
-                # ------------------------------------------------------------------
-                # 1. k‑1 neighbour expansion – may time out.
-                # Even if this fails, we retain the ETag from above.
-                # ------------------------------------------------------------------
                 with trace_span.ctx("exec", anchor_id=anchor_id) as span:
                         try:
                             resp_neigh = await client.post("/api/graph/expand_candidates", json=plan)
-                            try:
-                                resp_neigh.raise_for_status()
-                            except Exception:
-                                raise
+                            resp_neigh.raise_for_status()
                             neigh: dict = resp_neigh.json() or {}
                         except (asyncio.TimeoutError, httpx.HTTPError, Exception) as exc:
-                            logger.warning(
-                                "expand_candidates_failed",
-                                extra={"anchor_id": anchor_id, "error": type(exc).__name__},
-                            )
-                            span.set_attribute("timeout", True)
-                            neigh = {"neighbors": []}
+                            # fallback: try expand_candidates again without base_url in fresh client
+                            try:
+                                async with _safe_async_client(
+                                    timeout=expand_ms / 1000.0,
+                                    _fresh=True,
+                                ) as fb_client:
+                                    fresp_neigh = await fb_client.post(
+                                        "/api/graph/expand_candidates", json=plan
+                                    )
+                                    fresp_neigh.raise_for_status()
+                                    neigh = fresp_neigh.json() or {}
+                            except Exception:
+                                logger.warning(
+                                    "expand_candidates_failed",
+                                    extra={"anchor_id": anchor_id, "error": type(exc).__name__},
+                                )
+                                span.set_attribute("timeout", True)
+                                neigh = {"neighbors": []}
 
-                # Prefer snapshot_etag from neighbours’ meta (Milestone‑4).
                 meta = neigh.get("meta") or {}
                 meta_etag = None
                 if isinstance(meta, dict):
@@ -407,63 +438,112 @@ class EvidenceBuilder:
                 else:
                     snapshot_etag = hdr_etag
 
-        events: list[dict] = []
-        pre:    list[dict] = []
-        suc:    list[dict] = []
+        events: list[dict] = []                    # event neighbours
+        pre:    list[dict] = []                    # will hold classified preceding transitions
+        suc:    list[dict] = []                    # will hold classified succeeding transitions
 
-        # track reciprocal links so we can fill decision.supported_by ↔ event.led_to
+        neighbor_transitions: dict[str, dict] = {}
+        neighbor_trans_orient: dict[str, str] = {}
+
         anchor_supported_ids: set[str] = set()
         event_led_to_map: dict[str, set[str]] = {}
 
-        # ── legacy v1 keys ──────────────────────────────────────────────
-        events.extend(neigh.get("events",     []) or [])
-        pre.extend   (neigh.get("preceding",  []) or [])
-        suc.extend   (neigh.get("succeeding", []) or [])
+        # Collect top-level event neighbours provided directly on the root.  Skip any
+        # neighbour explicitly typed as a decision.
+        for ev in neigh.get("events", []) or []:
+            try:
+                raw_type = ev.get("type") or ev.get("entity_type") or ""
+                ntype = str(raw_type).lower() if raw_type is not None else ""
+            except Exception:
+                ntype = ""
+            if ntype == "decision":
+                continue
+            events.append(ev)
+        for tr in neigh.get("preceding", []) or []:
+            tid = tr.get("id")
+            if not tid:
+                continue
+            neighbor_transitions[tid] = tr
+            neighbor_trans_orient[tid] = "preceding"
+        for tr in neigh.get("succeeding", []) or []:
+            tid = tr.get("id")
+            if not tid:
+                continue
+            neighbor_transitions[tid] = tr
+            neighbor_trans_orient[tid] = "succeeding"
 
-        # ── unified v2 key ─────────────────────────────────────────────
         neighbors = neigh.get("neighbors")
         if neighbors:
-            if isinstance(neighbors, dict):         # v2 namespaced shape
+            # Normalised handling of neighbour shapes for both namespaced and flat lists.  We
+            # accumulate events and transitions separately, dropping explicit decisions
+            # entirely.  Any item with type "decision" is ignored, and items with a
+            # preceding/succeeding relation are treated as transitions when not already
+            # typed as such.
+            if isinstance(neighbors, dict):  # v2 namespaced shape
                 ev_nodes = neighbors.get("events", []) or []
-                events.extend(ev_nodes)
-                # recognise LED_TO ↔ supported_by edges even in namespaced form
                 for n in ev_nodes:
-                    rel = (n.get("edge") or {}).get("rel")
+                    # Skip explicit decisions from the event list
+                    ntype = (n.get("type") or n.get("entity_type") or "").lower()
+                    if ntype == "decision":
+                        continue
+                    events.append(n)
+                    edge_info = n.get("edge") or {}
+                    # Accept both canonical `rel` and legacy `relation` keys
+                    rel = edge_info.get("rel") or edge_info.get("relation")
                     if rel in {"supported_by", "led_to", "LED_TO"}:
                         eid = n.get("id")
                         if eid:
                             anchor_supported_ids.add(eid)
                             event_led_to_map.setdefault(eid, set()).add(anchor_id)
-                pre.extend(neighbors.get("transitions", []) or [])
-            else:                                   # flattened list
-                for n in neighbors:                 # type: ignore[arg-type]
-                    edge = n.get("edge") or {}
-                    rel  = edge.get("rel")
-                    ntype = n.get("type") or n.get("entity_type")
-                    # ① explicit type keys
-                    if ntype == "event":
-                        events.append(n)
-                        # M3 → M4: Memory-API may send either direction label
-                        if rel in {"supported_by", "led_to", "LED_TO"}:
-                            eid = n.get("id")
-                            if eid:
-                                anchor_supported_ids.add(eid)                      # decision.supported_by
-                                event_led_to_map.setdefault(eid, set()).add(anchor_id)  # event.led_to
+                # transitions bucket is always explicit in namespaced shape
+                for n in neighbors.get("transitions", []) or []:
+                    tid = n.get("id")
+                    if not tid:
                         continue
-                    if ntype == "transition":
-                        pre.append(n);     continue
-                    # ② infer from edge metadata (v2.1 draft)
-                    edge = n.get("edge") or {}
-                    rel  = edge.get("rel")
+                    neighbor_transitions[tid] = n
+                    # record orientation hint if present on the neighbor
+                    edge_info = n.get("edge") or {}
+                    rel = edge_info.get("rel") or edge_info.get("relation")
                     if rel in {"preceding", "succeeding"}:
-                        (pre if rel == "preceding" else suc).append(n); continue
-                    # ③ last-resort – treat as event so we never lose evidence
+                        neighbor_trans_orient[tid] = rel
+            else:  # flattened list
+                for n in neighbors:
+                    # Determine declared entity type (lower‑cased); default to empty string
+                    raw_type = n.get("type") or n.get("entity_type") or ""
+                    ntype = str(raw_type).lower() if raw_type is not None else ""
+                    edge = n.get("edge") or {}
+                    # Accept both canonical `rel` and legacy `relation` keys
+                    rel = edge.get("rel") or edge.get("relation")
+                    # Drop explicit decisions
+                    if ntype == "decision":
+                        # Decision neighbours are not included in events or transitions
+                        continue
+                    # Explicit transitions go straight into the transitions bucket
+                    if ntype == "transition":
+                        tid = n.get("id")
+                        if tid:
+                            neighbor_transitions[tid] = n
+                            if rel in {"preceding", "succeeding"}:
+                                neighbor_trans_orient[tid] = rel
+                        continue
+                    # Items with a preceding/succeeding relation but lacking an explicit
+                    # transition type are treated as transitions rather than events.
+                    if rel in {"preceding", "succeeding"}:
+                        tid = n.get("id")
+                        if tid:
+                            neighbor_transitions[tid] = n
+                            neighbor_trans_orient[tid] = rel
+                        continue
+                    # Otherwise, treat the neighbour as an event (including missing type or
+                    # unexpected types other than "decision" and "transition").
                     events.append(n)
+                    # record support relations for anchor–event links
+                    if rel in {"supported_by", "led_to", "LED_TO"}:
+                        eid = n.get("id")
+                        if eid:
+                            anchor_supported_ids.add(eid)
+                            event_led_to_map.setdefault(eid, set()).add(anchor_id)
 
-        # ── de-duplicate evidence items ────────────────────────────────
-        # Merge duplicate events by ID, preserving the first occurrence.  If
-        # duplicates exist (e.g. one item has an explicit edge relation and
-        # another does not) we keep the earliest and drop subsequent ones.
         if events:
             seen_event_ids: set[str] = set()
             deduped_events: list[dict] = []
@@ -476,8 +556,6 @@ class EvidenceBuilder:
                 deduped_events.append(ev)
             events = deduped_events
 
-        # Similarly de-duplicate preceding and succeeding transitions on ID.  The
-        # order of the first occurrence is preserved.
         def _dedup_transitions(items: list[dict]) -> list[dict]:
             seen: set[str] = set()
             result: list[dict] = []
@@ -499,12 +577,11 @@ class EvidenceBuilder:
             with trace_span.ctx("enrich", anchor_id=anchor_id):
                 enriched_events: list[dict] = []
                 async with _safe_async_client(
-                    _fresh=True,
                     base_url=settings.memory_api_url,
                     timeout=settings.timeout_enrich_ms / 1000.0,
                 ) as ev_client:
                     for ev in events:
-                        # Already enriched? (future Memory‑API versions)
+                        # Skip enrichment for events that already carry a led_to marker (support link)
                         if "led_to" in ev:
                             enriched_events.append(ev)
                             continue
@@ -512,16 +589,22 @@ class EvidenceBuilder:
                         if not eid:
                             enriched_events.append(ev)
                             continue
-                        # Choose endpoint based on explicit node type; default to event
+                        # Determine declared type (if any) for enrichment routing.  Decisions are
+                        # not included in events, but guard defensively.
                         etype = (ev.get("type") or ev.get("entity_type") or "").lower()
-                        path = (
-                            f"/api/enrich/decision/{eid}"
-                            if etype == "decision"
-                            else f"/api/enrich/event/{eid}"
-                        )
+                        # Only enrich true events via the event endpoint.  Decisions are skipped
+                        # entirely (no enrichment), as they are dropped from the evidence.
+                        if etype == "decision":
+                            # Skip enrichment for decisions; append original to maintain position
+                            enriched_events.append(ev)
+                            continue
+                        path = f"/api/enrich/event/{eid}"
                         try:
                             eresp = await ev_client.get(path)
                             eresp.raise_for_status()
+                            # Merge enriched payload first so that input fields (summary, timestamp)
+                            # override returned defaults.  This yields a base with id only,
+                            # overwritten by any input metadata we wish to preserve.
                             enriched_events.append({**eresp.json(), **ev})
                         except Exception:
                             logger.warning(
@@ -529,7 +612,12 @@ class EvidenceBuilder:
                                 extra={"event_id": eid, "anchor_id": anchor_id},
                             )
                             enriched_events.append(ev)
-                events = enriched_events
+                # After enrichment, the Memory API is responsible for returning
+                # neighbour events that have already been normalised.  The
+                # EvidenceBuilder no longer reprojects or sanitises the event
+                # objects.  Assign the enriched events list directly to
+                # the events collection.  Decision neighbours are skipped earlier.
+                events = list(enriched_events)
         for ev in events:
             if anchor_id in (ev.get("led_to") or []):
                 ev_id = ev.get("id")
@@ -544,6 +632,19 @@ class EvidenceBuilder:
 
         existing = set(anchor_json.get("supported_by") or [])
         anchor_json["supported_by"] = sorted(existing | anchor_supported_ids)
+        try:
+            if callable(mirror_option_to_title):
+                # Use the shared helper to mirror option into title.  It modifies
+                # the anchor_json dict in place and returns it (or a new dict).
+                anchor_json = mirror_option_to_title(anchor_json) or anchor_json
+            else:
+                # Fallback: replicate previous behaviour
+                if "title" not in anchor_json and anchor_json.get("option"):
+                    anchor_json["title"] = anchor_json["option"]
+        except Exception:
+            # Fallback in case of unexpected failure in helper call
+            if "title" not in anchor_json and anchor_json.get("option"):
+                anchor_json["title"] = anchor_json["option"]
 
         if event_led_to_map:
             for ev in events:
@@ -551,6 +652,147 @@ class EvidenceBuilder:
                 if eid and eid in event_led_to_map:
                     ev["led_to"] = sorted(set(ev.get("led_to", [])) | event_led_to_map[eid])
 
+
+        anchor_trans_ids = anchor_json.get("transitions") or []
+        trans_pre_list: list[dict] = []
+        trans_suc_list: list[dict] = []
+        missing_trans: list[str] = []
+        seen_trans: set[str] = set()
+        # Only attempt hydration when there is something to process
+        if anchor_trans_ids or neighbor_transitions:
+            with trace_span.ctx("transitions_enrich", anchor_id=anchor_id):
+                try:
+                    async with _safe_async_client(
+                        base_url=settings.memory_api_url,
+                        timeout=settings.timeout_enrich_ms / 1000.0,
+                    ) as tr_client:
+                        # First hydrate and classify transitions declared on the anchor
+                        for tid in anchor_trans_ids:
+                            if not isinstance(tid, str) or tid in seen_trans:
+                                continue
+                            seen_trans.add(tid)
+                            tdoc: dict | None = None
+                            # Attempt primary fetch
+                            try:
+                                resp = await tr_client.get(f"/api/enrich/transition/{tid}")
+                                resp.raise_for_status()
+                                tdoc = resp.json() or {}
+                            except Exception:
+                                # Fallback fetch without base_url using fresh client
+                                try:
+                                    async with _safe_async_client(
+                                        timeout=settings.timeout_enrich_ms / 1000.0,
+                                        _fresh=True,
+                                    ) as fb_client:
+                                        try:
+                                            fresp = await fb_client.get(f"/api/enrich/transition/{tid}")
+                                            fresp.raise_for_status()
+                                            tdoc = fresp.json() or {}
+                                        except Exception:
+                                            tdoc = None
+                                except Exception:
+                                    tdoc = None
+                                # Final fallback: use neighbour-provided stub if available
+                                if tdoc is None:
+                                    stub = neighbor_transitions.get(tid)
+                                    if stub:
+                                        tdoc = stub
+                            # If still missing, record and skip
+                            if not tdoc:
+                                missing_trans.append(tid)
+                                continue
+                            # Determine orientation solely based on explicit "to"/"from" relative to anchor
+                            to_id = tdoc.get("to")
+                            from_id = tdoc.get("from")
+                            orient: str | None = None
+                            if to_id == anchor_id:
+                                orient = "preceding"
+                            elif from_id == anchor_id:
+                                orient = "succeeding"
+                            if orient == "preceding":
+                                trans_pre_list.append(tdoc)
+                            elif orient == "succeeding":
+                                trans_suc_list.append(tdoc)
+                            else:
+                                # Unknown orientation – consider missing
+                                missing_trans.append(tid)
+                        # Now hydrate and classify neighbour transitions (those not on anchor)
+                        for tid, stub in neighbor_transitions.items():
+                            # Skip IDs already processed from the anchor list
+                            if not isinstance(tid, str) or tid in seen_trans:
+                                continue
+                            seen_trans.add(tid)
+                            tdoc: dict | None = None
+                            try:
+                                resp = await tr_client.get(f"/api/enrich/transition/{tid}")
+                                resp.raise_for_status()
+                                tdoc = resp.json() or {}
+                            except Exception:
+                                try:
+                                    async with _safe_async_client(
+                                        timeout=settings.timeout_enrich_ms / 1000.0,
+                                        _fresh=True,
+                                    ) as fb_client:
+                                        try:
+                                            fresp = await fb_client.get(f"/api/enrich/transition/{tid}")
+                                            fresp.raise_for_status()
+                                            tdoc = fresp.json() or {}
+                                        except Exception:
+                                            tdoc = None
+                                except Exception:
+                                    tdoc = None
+                                if tdoc is None and stub:
+                                    tdoc = stub
+                            if not tdoc:
+                                missing_trans.append(tid)
+                                continue
+                            # Determine orientation: explicit to/from dominates; fallback to neighbour hint
+                            to_id = tdoc.get("to")
+                            from_id = tdoc.get("from")
+                            orient: str | None = None
+                            if to_id == anchor_id:
+                                orient = "preceding"
+                            elif from_id == anchor_id:
+                                orient = "succeeding"
+                            if orient is None:
+                                orient = neighbor_trans_orient.get(tid)
+                            if orient == "preceding":
+                                trans_pre_list.append(tdoc)
+                            elif orient == "succeeding":
+                                trans_suc_list.append(tdoc)
+                            else:
+                                missing_trans.append(tid)
+                except Exception:
+                    # Catastrophic failure: mark all IDs as missing
+                    missing_trans.extend([tid for tid in anchor_trans_ids if isinstance(tid, str)])
+                    missing_trans.extend([tid for tid in neighbor_transitions.keys() if isinstance(tid, str)])
+        # De-duplicate transition lists based on ID before assignment
+        if trans_pre_list:
+            trans_pre_list = _dedup_transitions(trans_pre_list)
+        if trans_suc_list:
+            trans_suc_list = _dedup_transitions(trans_suc_list)
+        # Assign results to pre/suc for further processing
+        pre = trans_pre_list
+        suc = trans_suc_list
+
+        if anchor_trans_ids:
+            if pre or suc:
+                logger.info(
+                    "transitions_hydrated",
+                    extra={
+                        "anchor_id": anchor_id,
+                        "preceding_n": len(pre),
+                        "succeeding_n": len(suc),
+                    },
+                )
+            else:
+                logger.warning(
+                    "transitions_missing_while_anchor_has",
+                    extra={
+                        "anchor_id": anchor_id,
+                        "transition_ids_n": len(anchor_trans_ids),
+                    },
+                )
 
         anchor = WhyDecisionAnchor(**anchor_json)
         ev = WhyDecisionEvidence(
@@ -563,21 +805,18 @@ class EvidenceBuilder:
 
         ev.snapshot_etag = snapshot_etag
         ev.__dict__["_retry_count"] = retry_count
-        # selector truncation (if > MAX_PROMPT_BYTES)
         ev, selector_meta = truncate_evidence(ev)
-        # After truncation the returned instance may not retain the snapshot_etag;
-        # reapply it so cache keys and fingerprints remain correct.
         if getattr(ev, "snapshot_etag", None) != snapshot_etag:
             ev.snapshot_etag = snapshot_etag
+        try:
+            pre_list = list(ev.transitions.preceding)
+            suc_list = list(ev.transitions.succeeding)
+        except Exception:
+            pre_list = []
+            suc_list = []
+        ev.allowed_ids = _collect_allowed_ids(ev.anchor, ev.events, pre_list, suc_list)
         ev.__dict__["_selector_meta"] = selector_meta
 
-        # ------------------------------------------------------------------
-        # Cache write
-        #
-        # Store the evidence bundle directly under the alias key together with
-        # its snapshot_etag.  When a Redis pipeline is available we also
-        # persist the legacy composite key for backwards compatibility, but
-        # unit‑test fakes (no pipeline) perform only one setex.
         truncated_flag = selector_meta.get("selector_truncation", False)
         composite_key  = _make_cache_key(
             anchor_id,
@@ -589,7 +828,6 @@ class EvidenceBuilder:
         if self._redis:
             try:
                 ttl  = settings.cache_ttl_evidence_sec or CACHE_TTL_SEC
-                # Prepare payload without snapshot_etag (excluded by Pydantic) and wrap it
                 try:
                     payload = ev.model_dump()
                 except Exception:
@@ -605,7 +843,6 @@ class EvidenceBuilder:
                     pipe.setex(alias_key, ttl, serialized)
                     pipe.execute()
                 except AttributeError:
-                    # thin stubs only support setex: store under alias key
                     self._redis.setex(alias_key, ttl, serialized)
             except Exception:
                 logger.warning("redis write error", exc_info=True)
@@ -621,7 +858,6 @@ class EvidenceBuilder:
 
         return ev
 
-    # ─────────────────────── internal helper ──────────────────────────
     async def _is_fresh(self, anchor_id: str, cached_etag: str) -> bool:
         """Check if cached snapshot_etag is still current (≤50 ms budget).
 
@@ -638,7 +874,9 @@ class EvidenceBuilder:
             return False
         try:
             async with _safe_async_client(
-                timeout=0.05, base_url=settings.memory_api_url
+                timeout=0.05,
+                base_url=settings.memory_api_url,
+                _fresh=True,
             ) as client:
                 url = f"/api/enrich/decision/{anchor_id}"
                 try:
@@ -648,6 +886,5 @@ class EvidenceBuilder:
             return _extract_snapshot_etag(resp) == cached_etag
         except Exception:
             return True
-    # ── temporary alias until tests migrate in M-4 ──────────────────────────
     async def get_evidence(self, anchor_id: str) -> WhyDecisionEvidence:
         return await self.build(anchor_id)

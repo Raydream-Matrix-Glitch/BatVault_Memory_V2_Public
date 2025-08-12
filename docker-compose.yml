@@ -192,7 +192,17 @@ services:
 
   # -------------------------------------------------------------------
   # Open-source LLM & Embeddings services (optional via profile: llm)
-  # These are reachable on the Docker network; published ports are for local dev only.
+  #
+  # These services provide text summarisation and embedding inference for the
+  # Gateway and Memory API.  They are disabled by default and only started
+  # when you explicitly select the ``llm`` profile.  To enable them, run:
+  #
+  #     docker compose --profile llm up
+  #
+  # The HuggingFace model weights are cached under the ``models-cache``
+  # named volume so that downloads persist across container restarts.
+  # Each service exposes its own healthcheck to allow the Gateway and
+  # Memory API to wait until the models are ready.
   vllm-control:
     profiles: [llm]
     image: vllm/vllm-openai:latest
@@ -205,10 +215,12 @@ services:
       - vllm.entrypoints.openai.api_server
       - --model
       - "${VLLM_MODEL_NAME:-mistral-7b-instruct}"
+      - --port
+      - "8010"
     ports:
-      - "8000:8000"
+      - "8010:8010"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fs http://localhost:8010/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5

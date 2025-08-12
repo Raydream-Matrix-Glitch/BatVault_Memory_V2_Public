@@ -16,9 +16,10 @@
     {
       "name": "Operating Loss (TV)",
       "value": 913,
-      "unit": "million USD",
+      "unit": "million",
       "timestamp": "2013-10-09T00:00:00Z"
     }
-  ]
+  ],
+  "source_currency": "USD"
   }
 }

@@ -14,7 +14,8 @@ const Card: React.FC<CardProps> = ({ className, children }) => {
   return (
     <div
       className={clsx(
-        "bg-surface border border-vaultred/20 rounded-md p-4 shadow-neon-red",
+        // glassy backdrop with subtle red border and neon glow
+        "bg-surface border border-vaultred/30 rounded-md p-4 shadow-neon-red backdrop-blur-md",
         className
       )}
     >

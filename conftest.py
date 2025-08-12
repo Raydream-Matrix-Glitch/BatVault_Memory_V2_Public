@@ -22,14 +22,17 @@ _mem_port = os.getenv("MEMORY_API_TEST_PORT")
 if _mem_port:
     os.environ.setdefault("MEMORY_API_URL", f"http://memory_api:{_mem_port}")
 
-# ── 1 · add all source roots to PYTHONPATH ─────────────────────────────────
+# ── 1 · add all source roots to PYTHONPATH (prepend so we win over site-packages) ─
 ROOT = Path(__file__).parent.resolve()
-
-sys.path.extend(
+_paths = (
     [str(ROOT)]                                           # project root
     + [str(p) for p in (ROOT / "packages").glob("*/src")] # packages/*/src
     + [str(p) for p in (ROOT / "services").glob("*/src")] # services/*/src
 )
+# Preserve order but ensure local paths take precedence
+for _p in reversed(_paths):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 def _try_import(pm, name: str):
     try:
