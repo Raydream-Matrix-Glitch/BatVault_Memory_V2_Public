@@ -1,5 +1,5 @@
 import re
-from core_utils.ids import slugify_id
+from core_utils.ids import slugify_tag
 class ValidationError(ValueError): ...
 
 def validate_snippet(val: str) -> None:
@@ -8,24 +8,15 @@ def validate_snippet(val: str) -> None:
 
 def validate_tags(tags: list[str]) -> list[str]:
     """
-    Normalise a list of tag values by converting each entry to a lower‑case
-    identifier and replacing any sequence of non‑alphanumeric characters
-    with a single underscore.  Leading and trailing underscores are
-    removed.  Order is preserved and duplicate values are retained.
-
-    This helper aligns the tag convention with the shared normaliser
-    which uses underscores instead of hyphens for slugs.  It performs
-    only basic transformation and does not attempt to deduplicate or
-    coerce values that are not strings.
+    Normalise tag values to the shared slug shape and deduplicate while
+    preserving order. Uses core_utils.slugify_tag for consistency across
+    services.
     """
-    import re
-    normalised: list[str] = []
-    for tag in tags:
-        try:
-            s = str(tag).lower()
-        except Exception:
-            s = f"{tag}".lower()
-        s = re.sub(r"[^a-z0-9]+", "_", s)
-        s = s.strip("_")
-        normalised.append(s)
-    return normalised
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tags:
+        s = slugify_tag(t)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out

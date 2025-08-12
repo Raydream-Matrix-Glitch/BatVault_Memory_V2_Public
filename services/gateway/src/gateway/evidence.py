@@ -17,10 +17,6 @@ from core_models.models import (
     WhyDecisionTransitions,
 )
 from .selector import truncate_evidence, bundle_size_bytes
-try:
-    from shared.normalize import mirror_option_to_title  # type: ignore
-except Exception:
-    mirror_option_to_title = None  # type: ignore
 # Import canonical allowed-id computation from the core validator.  This
 # helper guarantees a consistent ordering and deduplication of anchor,
 # event and transition IDs.  It should be used wherever allowed_ids
@@ -403,6 +399,12 @@ class EvidenceBuilder:
                             hdr_etag = _extract_snapshot_etag(fresp) or "unknown"
                     except Exception:
                         anchor_json, hdr_etag = {"id": anchor_id}, "unknown"
+                # Mirror option to title if title is missing (supports stubbed Memory API)
+                try:
+                    if anchor_json.get("option") and not anchor_json.get("title"):
+                        anchor_json["title"] = anchor_json.get("option")
+                except Exception:
+                    pass
 
                 with trace_span.ctx("exec", anchor_id=anchor_id) as span:
                         try:
@@ -632,20 +634,6 @@ class EvidenceBuilder:
 
         existing = set(anchor_json.get("supported_by") or [])
         anchor_json["supported_by"] = sorted(existing | anchor_supported_ids)
-        try:
-            if callable(mirror_option_to_title):
-                # Use the shared helper to mirror option into title.  It modifies
-                # the anchor_json dict in place and returns it (or a new dict).
-                anchor_json = mirror_option_to_title(anchor_json) or anchor_json
-            else:
-                # Fallback: replicate previous behaviour
-                if "title" not in anchor_json and anchor_json.get("option"):
-                    anchor_json["title"] = anchor_json["option"]
-        except Exception:
-            # Fallback in case of unexpected failure in helper call
-            if "title" not in anchor_json and anchor_json.get("option"):
-                anchor_json["title"] = anchor_json["option"]
-
         if event_led_to_map:
             for ev in events:
                 eid = ev.get("id")

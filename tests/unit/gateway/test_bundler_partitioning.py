@@ -23,11 +23,15 @@ class DummyResp:
 @pytest.mark.asyncio
 async def test_bundler_keeps_events_only_and_whitelists(monkeypatch) -> None:
     """
-    EvidenceBuilder must include only event nodes in the ``events`` array and
-    project each event onto the minimal field set.  Decision neighbours are
-    classified as decisions and **dropped** entirely (not events, not transitions).  Extra
-    fields such as ``edge``, ``title`` or arbitrary metadata must be
-    stripped, and tags should be normalised to lower‑case underscores.
+    EvidenceBuilder must include only event nodes in the ``events`` array.  Decision
+    neighbours are classified as decisions and **dropped** entirely (they do not
+    appear in events or transitions).  In the revised architecture the builder
+    delegates normalisation and whitelisting to the Shared Normaliser and the
+    Memory‑API.  As such it preserves whatever fields the upstream service
+    returns.  Tags are kept verbatim rather than being normalised.  The test
+    asserts that extra metadata such as ``edge`` or ``extra_field`` is retained
+    on the event stub.  This confirms that the builder does not re‑project
+    events onto a minimal field set.
     """
 
     anchor_id = "test-anchor"

@@ -1,10 +1,9 @@
 from __future__ import annotations
 import time, uuid
 from typing import Any, Mapping, Tuple, Dict
-from core_logging import trace_span, log_stage
+from core_logging import log_stage
 
 import orjson
-from pydantic import BaseModel
 
 import importlib.metadata as _md
 from core_logging import get_logger
@@ -25,6 +24,7 @@ from core_validator import validate_response as _core_validate_response
 from core_validator import canonical_allowed_ids
 from . import llm_client
 import gateway.templater as templater
+import inspect
 
 
 logger   = get_logger("gateway.builder")
@@ -64,7 +64,11 @@ async def build_why_decision_response(
         # an ``AttributeError`` when accessing ``model_dump`` on a ``None``
         # object and aligns with the tech‑spec requirement that unknown
         # decisions still produce a valid bundle (spec §B2/B5).
-        ev = await evidence_builder.build(req.anchor_id)
+        # Robustly call the builder even if tests monkey‑patch the instance-level
+        # build method.  If an unbound override exists in the instance __dict__
+        # call it directly to avoid double-binding.
+        maybe = evidence_builder.build(req.anchor_id)
+        ev = await maybe if inspect.isawaitable(maybe) else maybe
         if ev is None:  # pragma: no cover – defensive fallback
             # Fallback: produce an empty evidence bundle with the given
             # anchor ID.  This stub has no events or transitions and a

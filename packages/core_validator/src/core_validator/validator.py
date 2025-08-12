@@ -110,28 +110,52 @@ def _strip_unknown_keys(obj: Dict[str, Any], allowed_keys: List[str]) -> Tuple[D
 
 
 def _normalise_event(event: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Normalise a single event dictionary."""
     """
-    Events may omit the ``type`` field; such items are assumed to be of type
-    ``event`` rather than treated as non-event.  Only when a type is
-    explicitly provided and it is not ``"event"`` will the item be
-    discarded with an ``events_contains_non_event`` error.  When type
-    is missing but the item carries content fields (summary, description,
-    timestamp, snippet or led_to) we drop it and record the same error,
-    since such objects should declare their type.
+    Normalise a single event dictionary.
+
+    Only atomic events are allowed in the ``evidence.events`` array.  An atomic
+    event must declare its ``type`` as ``"event"``.  Items explicitly
+    declaring another ``type`` are discarded and recorded with an
+    ``events_contains_non_event`` error.  When the ``type`` is absent the
+    validator differentiates between bare identifiers and untyped objects
+    containing content fields.  Untyped objects that include any of the event
+    content fields (summary, description, timestamp, snippet or led_to) are
+    considered non‑events, removed from the bundle and flagged with the same
+    error.  Bare identifiers (objects with only an ``id``) are assumed to be
+    events and are normalised accordingly.
+
+    Unknown keys on valid events are stripped; missing or mismatched
+    ``type`` values are coerced to ``"event"`` silently.  Tags are
+    slugified (lower‑case ASCII with underscores) and deduplicated while
+    preserving order.  An ``x-extra`` mapping is always created when
+    absent.  Timestamps are normalised to canonical ISO‑8601 Z format when
+    possible; timestamp repairs do not emit errors.
+
+    Returns ``(None, errors)`` when the input is discarded, otherwise a
+    cleaned event and any emitted errors.
     """
     errors: List[Dict[str, Any]] = []
     declared_type: str = ""
     if isinstance(event, dict):
         raw_type = event.get("type") or event.get("entity_type") or ""
         declared_type = str(raw_type).lower()
-    # Drop explicit non-event types only when declared as something other than 'event'.
-    # When type is missing we assume the item is an event and allow it to be cleaned.
+    # Explicitly declared non‑events → drop
     if declared_type:
         if declared_type != "event":
             eid = event.get("id") if isinstance(event, dict) else None
             errors.append({"code": "events_contains_non_event", "details": {"id": eid}})
             return None, errors
+    else:
+        # No type provided.  If any content field is present this is treated
+        # as a non‑event and removed.
+        if isinstance(event, dict):
+            content_keys = {"summary", "description", "timestamp", "snippet", "led_to"}
+            for k in content_keys:
+                if k in event and event.get(k) is not None:
+                    eid = event.get("id")
+                    errors.append({"code": "events_contains_non_event", "details": {"id": eid}})
+                    return None, errors
+    # From here on we treat the object as an event and normalise it
     allowed_keys = [
         "id",
         "summary",
@@ -146,13 +170,13 @@ def _normalise_event(event: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], L
     cleaned, removed_keys = _strip_unknown_keys(event, allowed_keys)
     if removed_keys:
         errors.append({"code": "unknown_event_keys_stripped", "details": {"id": event.get("id"), "removed_keys": removed_keys}})
-    # Coerce missing or mismatched type to "event" silently
+    # Coerce missing or mismatched type to 'event'
     if cleaned.get("type") != "event":
         cleaned["type"] = "event"
-    # Guarantee an x-extra field exists; absence is benign and does not generate an error
+    # Ensure x-extra exists
     if "x-extra" not in cleaned or cleaned.get("x-extra") is None:
         cleaned["x-extra"] = {}
-        # x-extra missing is considered benign and does not generate an error
+    # Normalise tags
     raw_tags = cleaned.get("tags")
     if raw_tags is None:
         raw_tags_list: List[str] = []
@@ -170,20 +194,27 @@ def _normalise_event(event: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], L
         if norm and norm not in seen_tags:
             normalised_tags.append(norm)
             seen_tags.add(norm)
-    # Normalise tags to lower case underscores; do not report normalisation as an error
     if cleaned.get("tags") != normalised_tags:
         cleaned["tags"] = normalised_tags
+    # Normalise timestamp
     ts = cleaned.get("timestamp")
     if ts:
         norm_ts, changed = _ensure_iso(ts)
         if changed:
             cleaned["timestamp"] = norm_ts
-            # Timestamp normalisation is silent and does not produce an error
     return cleaned, errors
 
-
 def _normalise_transition(tr: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Normalise a single transition dictionary (preceding/succeeding decision)."""
+    """Normalise a single transition dictionary (preceding/succeeding decision).
+
+    Transitions are not permitted to carry arbitrary keys and must always
+    represent a decision.  This helper strips unknown attributes, coerces
+    the ``type`` to ``"decision"``, ensures an ``x-extra`` mapping exists
+    and normalises the ``timestamp`` to ISO‑8601 Z format.  Any unknown keys
+    that are removed and any timestamp repairs are reported via the
+    structured error list.  The returned tuple contains the cleaned
+    transition and any emitted errors.
+    """
     errors: List[Dict[str, Any]] = []
     allowed_keys = [
         "id",
@@ -395,7 +426,6 @@ def validate_response(resp: Any) -> Tuple[bool, List[Dict[str, Any]]]:
         supp_ids = list(model_resp.answer.supporting_ids or [])
     except Exception:
         supp_ids = []
-    changed_support = False
     if anchor_id:
         if anchor_id not in supp_ids:
             errors.append({"code": "supporting_ids_missing_anchor", "details": {"anchor_id": anchor_id}})
@@ -403,33 +433,36 @@ def validate_response(resp: Any) -> Tuple[bool, List[Dict[str, Any]]]:
             if anchor_id in supp_ids:
                 supp_ids = [x for x in supp_ids if x != anchor_id]
             supp_ids.insert(0, anchor_id)
-            changed_support = True
     transition_ids = [tr.get("id") for tr in (new_preceding + new_succeeding) if tr.get("id")]
     missing_transitions = [tid for tid in transition_ids if tid not in supp_ids]
     if missing_transitions:
         for tid in transition_ids:
             if tid not in supp_ids:
                 supp_ids.append(tid)
-        changed_support = True
         errors.append({"code": "supporting_ids_missing_transition", "details": {"missing": missing_transitions}})
     filtered_supp = []
     allowed_set = set(model_resp.evidence.allowed_ids or [])
-    removed_support = []
+    removed_support: List[str] = []
+    # Remove duplicates and filter out ids not in allowed_set.  Collect removed ids
     for sid in supp_ids:
         if sid in allowed_set and sid not in filtered_supp:
             filtered_supp.append(sid)
         elif sid not in allowed_set:
             removed_support.append(sid)
-    if removed_support:
-        errors.append({"code": "supporting_ids_removed_invalid", "details": {"removed": removed_support}})
-        changed_support = True
-    supp_ids = filtered_supp
+    # Determine whether CITE_ALL_IDS is enabled up front
     cite_all_env = os.getenv("CITE_ALL_IDS")
-    if _is_truthy(cite_all_env):
+    cite_all = _is_truthy(cite_all_env)
+    # Emit removed-invalid error only when not citing all ids
+    if removed_support and not cite_all:
+        errors.append({"code": "supporting_ids_removed_invalid", "details": {"removed": removed_support}})
+    # Update supporting_ids to the filtered list
+    supp_ids = filtered_supp
+    if cite_all:
+        # In cite-all mode supporting_ids must match allowed_ids exactly.  Only emit
+        # an error when the existing order deviates from the canonical allowed_ids.
         if supp_ids != model_resp.evidence.allowed_ids:
             errors.append({"code": "supporting_ids_enforced_cite_all_ids", "details": {"before": supp_ids, "after": model_resp.evidence.allowed_ids}})
         supp_ids = list(model_resp.evidence.allowed_ids)
-        changed_support = True
     model_resp.answer.supporting_ids = supp_ids
 
     flags = model_resp.completeness_flags

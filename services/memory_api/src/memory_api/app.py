@@ -325,6 +325,7 @@ async def resolve_text(payload: dict, response: Response):
     ):
         try:
             from memory.embeddings_client import embed  # type: ignore
+            logger.warning("DEPRECATION: import path 'memory.embeddings_client' will be removed; use 'memory_api.embeddings_client'", extra={"service":"memory_api"})
             # Attempt to embed the query; returns None on failure
             embeddings = await embed([q])
             if embeddings:

@@ -7,4 +7,4 @@ def test_invalid_snippet_too_long():
 
 def test_tag_slugified():
     ev = cm.EventModel(id="ev-1", summary="s", tags=["New-Tag"], timestamp="2024-01-01T00:00:00Z")
-    assert ev.tags == ["new-tag"]
+    assert ev.tags == ["new_tag"]

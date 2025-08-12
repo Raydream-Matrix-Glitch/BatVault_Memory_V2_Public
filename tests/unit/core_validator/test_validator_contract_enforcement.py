@@ -58,8 +58,8 @@ def test_validator_canonicalises_and_cites_all(monkeypatch):
     assert "supporting_ids_missing_anchor" in codes
     # Missing transition in supporting_ids
     assert "supporting_ids_missing_transition" in codes
-    # Removed invalid support id
-    assert "supporting_ids_removed_invalid" in codes
+    # In CITE_ALL_IDS mode we enforce full citation. Correction is reported via
+    # 'supporting_ids_enforced_cite_all_ids' above; no separate 'supporting_ids_removed_invalid' is required.
     # Event count updated
     assert "completeness_event_count_mismatch" in codes
     # Because CITE_ALL_IDS is set, supporting_ids must match allowed_ids

@@ -3,7 +3,7 @@ from core_models.models import WhyDecisionResponse
 
 
 def test_validator_detects_subset_violation() -> None:
-    """Validator should not fail fatally when supporting_ids ⊄ allowed_ids; it repairs by removing out-of-scope IDs and reports a structured error."""
+    """Validator should mark the bundle invalid (trigger fallback) when supporting_ids ⊄ allowed_ids is the only citation issue; it removes out-of-scope IDs and reports a structured error."""
     resp = WhyDecisionResponse(
         intent="why_decision",
         evidence={
@@ -33,6 +33,6 @@ def test_validator_detects_subset_violation() -> None:
     )
 
     valid, errs = validate_response(resp)
-    assert valid is True
+    assert valid is False
     codes = {e.get("code") for e in errs if isinstance(e, dict)}
     assert "supporting_ids_removed_invalid" in codes
