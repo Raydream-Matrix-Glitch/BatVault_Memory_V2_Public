@@ -1,0 +1,16 @@
+{
+  "name": "why_decision_panasonic_plasma",
+  "input": {
+    "intent": "why_decision",
+    "decision_ref": "panasonic-exit-plasma-2012"
+  },
+  "expected_short_answer_contains": [
+    "declining demand",
+    "heavy losses",
+    "focus resources"
+  ],
+  "mandatory_ids": [
+    "pan-e2",
+    "trans-pan-2010-2012"
+  ]
+}

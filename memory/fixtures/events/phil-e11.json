@@ -1,0 +1,10 @@
+{
+  "id": "phil-e11",
+  "summary": "European AI Act passes, requiring model audits",
+  "description": "The EU Parliament adopted the AI Act on 14 June 2025, mandating transparency audits for large generative models. Philips’ compliance team opened an internal project but no decision has been filed yet.",
+  "timestamp": "2025-06-14T10:00:00Z",
+  "tags": ["regulation", "ai_compliance"],
+  "led_to": [],
+  "snippet": "EU AI Act mandates transparency audits for generative models.",
+  "x-extra": {}
+}

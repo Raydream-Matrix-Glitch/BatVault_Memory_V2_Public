@@ -1,0 +1,18 @@
+[project]
+name            = "core_validator"
+version         = "0.1.0"
+description     = "Validator helpers for BatVault"
+requires-python = ">=3.11"
+dependencies    = [
+    "core_models",
+    "jsonschema>=4.22",
+    "core_logging",
+]
+
+[build-system]
+requires        = ["setuptools>=68", "wheel"]
+build-backend   = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where  = ["src"]
+include = ["core_validator*"]

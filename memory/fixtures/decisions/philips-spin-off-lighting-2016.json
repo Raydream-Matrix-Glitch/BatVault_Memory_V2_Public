@@ -1,0 +1,23 @@
+{
+  "id": "philips-spin-off-lighting-2016",
+  "option": "Spin off lighting division as Signify",
+  "rationale": "Separating lighting assets unlocked shareholder value and enabled dedicated capital allocation for health-tech.",
+  "timestamp": "2016-06-28T14:00:00Z",
+  "decision_maker": "Frans van Houten",
+  "tags": [
+    "corporate_restructuring",
+    "shareholder_value"
+  ],
+  "supported_by": [
+    "phil-e5",
+    "phil-e6"
+  ],
+  "based_on": [
+    "philips-lighting-split-2014"
+  ],
+  "transitions": [
+    "trans-phil-2014-2016",
+    "trans-phil-2016-2018"
+  ],
+  "x-extra": {}
+}

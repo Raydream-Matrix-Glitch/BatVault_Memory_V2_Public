@@ -1,0 +1,108 @@
+{
+  "title": "BatVault Core Metrics",
+  "uid": "batvault-core",
+  "schemaVersion": 36,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["5s","10s","30s","1m","5m"] },
+  "panels": [
+    {                          
+      "type": "timeseries",
+      "title": "P95 TTFB (/v2/query)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(gateway_ttfb_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 seconds"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list" }, "exemplars": true }
+    },
+    {                            
+      "type": "timeseries",
+      "title": "Fallback Rate (%)",
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(gateway_fallback_total[5m])) / sum(rate(gateway_http_requests_total[5m])) * 100",
+          "legendFormat": "fallback %"
+        }
+      ],
+      "options": { "exemplars": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "Selector Truncations (/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "rate(gateway_selector_truncation_total[1m])", "legendFormat": "trunc/sec" }
+      ],
+      "options": { "exemplars": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "Resolver Cache Hit Ratio (%)",
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(resolver_cache_hit_total[5m])) / (sum(rate(resolver_cache_hit_total[5m])) + sum(rate(resolver_cache_miss_total[5m]))) * 100",
+          "legendFormat": "hit %"
+        }
+      ],
+      "options": { "exemplars": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "Evidence Cache Hit Ratio (%)",
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(evidence_cache_hit_total[5m])) / (sum(rate(evidence_cache_hit_total[5m])) + sum(rate(evidence_cache_miss_total[5m]))) * 100",
+          "legendFormat": "hit %"
+        }
+      ],
+      "options": { "exemplars": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "LLM JSON Cache Hit Ratio (%)",
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_cache_hit_total[5m])) / (sum(rate(llm_cache_hit_total[5m])) + sum(rate(llm_cache_miss_total[5m]))) * 100",
+          "legendFormat": "hit %"
+        }
+      ],
+      "options": { "exemplars": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "AQL Query Latency P95 (ms)",
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(arangodb_query_latency_ms_bucket[5m])) by (le))",
+          "legendFormat": "P95 ms"
+        }
+      ],
+      "options": { "exemplars": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "Evidence Bundle Size vs MAX_PROMPT_BYTES",
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+      "targets": [
+        { "expr": "avg_over_time(bundle_size_bytes[1m])", "legendFormat": "bundle bytes" },
+        { "expr": "max_over_time(max_prompt_bytes[1m])", "legendFormat": "max prompt bytes" }
+      ],
+      "options": { "legend": { "displayMode": "table" }, "exemplars": true }
+    }
+  ]
+}

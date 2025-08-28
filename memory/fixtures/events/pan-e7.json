@@ -1,0 +1,15 @@
+{
+  "id": "pan-e7",
+  "summary": "Panasonic board approves $500\u202fm battery capex",
+  "description": "In May\u202f2017, Panasonic earmarked $500\u202fm for new EV cell production capacity.",
+  "timestamp": "2017-05-10T15:00:00Z",
+  "tags": [
+    "capex",
+    "production_scale"
+  ],
+  "led_to": [
+    "panasonic-ev-battery-gigafactory-2017"
+  ],
+  "snippet": "$500\u202fm for new cell lines.",
+  "x-extra": {}
+}

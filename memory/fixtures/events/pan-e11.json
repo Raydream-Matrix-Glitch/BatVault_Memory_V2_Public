@@ -1,0 +1,18 @@
+{
+  "id": "pan-e11",
+  "summary": "Samsung posts 20% YoY LCD TV growth",
+  "description": "In November 2011, Samsung Electronics reported a 20% year-on-year increase in LCD TV shipments, underscoring the shift away from plasma technology.",
+  "timestamp": "2011-11-15T08:00:00Z",
+  "tags": [
+    "market_context",
+    "competitor_insight"
+  ],
+  "led_to": [
+    "panasonic-exit-plasma-2012"
+  ],
+  "snippet": "Samsung’s LCD volumes jump 20% YoY, outpacing plasma.",
+  "x-extra": {
+    "source_url": "https://www.samsung.com/global/earnings/2011-q4/",
+    "region": "Global"
+  }
+}

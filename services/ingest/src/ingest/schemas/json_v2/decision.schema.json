@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Decision@v2",
+  "type": "object",
+  "required": ["id", "option", "timestamp"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$" },
+    "option": { "type": "string", "minLength": 1 },
+    "rationale": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "decision_maker": { "type": "string" },
+    "tags": { "type": "array", "items": {"type":"string"} },
+    "supported_by": { "type": "array", "items": { "type":"string" } },
+    "based_on": { "type": "array", "items": { "type":"string" } },
+    "transitions": { "type": "array", "items": { "type":"string" } },
+    "x-extra": { "type": "object", "additionalProperties": true },
+    "snippet": { "not": {} }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,43 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+exporters:
+  logging:
+    loglevel: info
+  otlp:                          # ⟵ *new* exporter that forwards to Jaeger’s OTLP receiver
+    endpoint: "jaeger:4317"
+    tls:
+      insecure: true
+
+processors:
+  batch:
+  resourcedetection:
+    detectors: [system]
+    override: false
+  resource/add_attributes:
+    attributes:
+      - key: service.namespace
+        value: batvault
+        action: upsert
+
+extensions:
+  health_check: {}
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resourcedetection, resource/add_attributes, batch]
+      exporters: [otlp, logging]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [logging]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [logging]

@@ -1,0 +1,15 @@
+{
+  "id": "phil-e6",
+  "summary": "Equity analysts highlight conglomerate discount",
+  "description": "Investment banks issued reports valuing Philips higher on a sum\u2011of\u2011the\u2011parts basis if lighting were separated.",
+  "timestamp": "2014-08-15T13:20:00Z",
+  "tags": [
+    "equity_analyst",
+    "valuation"
+  ],
+  "led_to": [
+    "philips-lighting-split-2014"
+  ],
+  "snippet": "Analysts see sum\u2011of\u2011parts upside.",
+  "x-extra": {}
+}

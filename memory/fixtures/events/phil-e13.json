@@ -1,0 +1,12 @@
+{
+  "id": "phil-e13",
+  "summary": "Analysts forecast 8% CAGR for spin-off following IPO",
+  "description": "In the week after its May 3, 2016 IPO, leading equity analysts published reports forecasting an 8% compound annual growth rate for Philips Lighting over the next five years, driven by smart-city and IoT lighting demand. Several firms raised their price targets above €22, citing the spin-off’s focused R&D and streamlined go-to-market organization as key catalysts.",
+  "timestamp": "2016-05-10T12:00:00Z",
+  "tags": ["analyst_reports", "growth_forecast", "iot"],
+  "led_to": ["philips-spin-off-lighting-2016"],
+  "snippet": "Post-IPO analyst reports project 8% CAGR on smart-lighting demand.",
+  "x-extra": {
+    "source": ["Goldman Sachs", "Morgan Stanley", "Credit Suisse"]
+  }
+}

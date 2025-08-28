@@ -1,0 +1,37 @@
+.env.local
+services/gateway/.env.local
+services/memory_api/src/memory/.env.local
+
+.env.local.*
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv*/
+.env
+*.log
+.pytest_cache/
+build/
+
+# Node
+node_modules/
+.next/
+dist/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+*.local.yml
+docker-data/
+
+# Windows ADS noise
+*:Zone.Identifier
+*Zone.Identifier

@@ -1,0 +1,23 @@
+{
+  "id": "philips-invest-mri-2020",
+  "option": "Invest in next-generation MRI technology",
+  "rationale": "Breakthrough magnet research and demographic trends justified a \u20ac500 M R&D program for ultra-high-field MRI systems.",
+  "timestamp": "2020-02-10T08:00:00Z",
+  "decision_maker": "Roy Jakobs",
+  "tags": [
+    "rd_investment",
+    "health_tech"
+  ],
+  "supported_by": [
+    "phil-e8",
+    "phil-e9",
+    "phil-e10"
+  ],
+  "based_on": [
+    "philips-healthtech-focus-2018"
+  ],
+  "transitions": [
+    "trans-phil-2018-2020"
+  ],
+  "x-extra": {}
+}

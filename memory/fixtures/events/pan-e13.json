@@ -1,0 +1,16 @@
+{
+  "id": "pan-e13",
+  "summary": "AI SCM platform hits $50 M subscription revenue",
+  "description": "By July 15, 2020, Panasonic’s AI supply-chain platform achieved $50 million in first-year subscription revenue, meeting its internal targets.",
+  "timestamp": "2020-07-15T08:00:00Z",
+  "tags": [
+    "outcome",
+    "financial_performance"
+  ],
+  "led_to": [],
+  "snippet": "Subscription revenue reaches $50 M in Q2 2020.",
+  "x-extra": {
+    "quarter": "Q2 2020",
+    "metric": "subscription_revenue"
+  }
+}

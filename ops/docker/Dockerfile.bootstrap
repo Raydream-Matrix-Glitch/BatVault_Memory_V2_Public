@@ -1,0 +1,27 @@
+FROM python:3.11-slim
+
+# --- system & python deps ---
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl libffi-dev python3-dev libgmp-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir python-arango httpx==0.27.0
+
+# --- project code ---
+WORKDIR /app
+# 1) shared packages so `core_config` resolves
+COPY packages ./packages
+# 2) install only what bootstrap needs (editable = no wheel build)
+RUN pip install \
+      -e packages/core_config \
+      -e packages/core_logging \
+      -e packages/core_metrics \
+      -e packages/core_storage \
+      -e packages/shared
+
+# 3) copy the bootstrap script last (keeps cache hits high)
+COPY ops/bootstrap.py ./ops/bootstrap.py
+
+# make the source importable without pip installs in prod
+ENV PYTHONPATH="/app/packages"
+
+CMD ["python", "ops/bootstrap.py"]

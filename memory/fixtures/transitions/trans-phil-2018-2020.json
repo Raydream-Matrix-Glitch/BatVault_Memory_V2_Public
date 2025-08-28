@@ -1,0 +1,9 @@
+{
+  "id": "trans-phil-2018-2020",
+  "from": "philips-healthtech-focus-2018",
+  "to": "philips-invest-mri-2020",
+  "relation": "causal",
+  "reason": "HealthTech focus drove major R&D investment",
+  "timestamp": "2020-01-15T14:00:00Z",
+  "x-extra": {}
+}

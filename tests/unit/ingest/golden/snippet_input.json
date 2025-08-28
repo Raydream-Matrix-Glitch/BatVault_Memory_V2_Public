@@ -1,0 +1,9 @@
+[
+  {
+    "id": "evt-demo-snippet",
+    "summary": "Demo event with snippet",
+    "description": "A demo event used to satisfy the golden snippet fixture.",
+    "timestamp": "2024-01-01T00:00:00Z",
+    "snippet": "Demo event with snippet."
+  }
+]

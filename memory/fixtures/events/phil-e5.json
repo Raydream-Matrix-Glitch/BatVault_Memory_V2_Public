@@ -1,0 +1,30 @@
+{
+  "id": "phil-e5",
+  "summary": "Lighting sales slip 1\u202f% YoY; EBITA margin 9.7\u202f%",
+  "description": "Q3\u202f2014 results showed Lighting comparable sales \u22121\u202f% YoY despite LED +28\u202f%; adjusted EBITA margin hit 9.7\u202f%.",
+  "timestamp": "2014-07-31T13:39:00Z",
+  "tags": [
+    "revenue_trend",
+    "competitive_pressure"
+  ],
+  "led_to": [
+    "philips-lighting-split-2014"
+  ],
+  "snippet": "Lighting \u22121\u202f% YoY; LED +28\u202f%. EBITA 9.7\u202f%.",
+  "x-extra": {
+      "kpis": [
+    {
+      "name": "Comparable Sales Growth",
+      "value": -1,
+      "unit": "%",
+      "timestamp": "2014-10-31T13:39:00Z"
+    },
+    {
+      "name": "Adjusted EBITA Margin",
+      "value": 9.7,
+      "unit": "%",
+      "timestamp": "2014-10-31T13:39:00Z"
+    }
+  ]
+  }
+}

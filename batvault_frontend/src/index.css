@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+/* Smooth input + button interaction */
+input, button {
+  transition: all 0.2s ease-in-out;
+}
+
+/* ——— heading accent dot ——— */
+.heading-accent::before {
+  content: "";
+  display: inline-block;
+  width: 0.5rem;   /* 8 px */
+  height: 0.5rem;
+  margin-right: 0.5rem;
+  vertical-align: middle;
+  @apply bg-cyan-400 rounded-full;
+}

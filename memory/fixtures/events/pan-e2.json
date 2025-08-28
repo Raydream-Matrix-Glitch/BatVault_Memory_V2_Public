@@ -1,0 +1,19 @@
+{
+  "id": "pan-e2",
+  "summary": "¥913 m operating loss in plasma division",
+  "description": "On October 9, 2011, Panasonic reported a ¥913 million operating loss in its plasma TV unit, as LCD rivals gained share.",
+  "timestamp": "2011-10-09T05:30:00Z",
+  "tags": [
+    "financial_loss",
+    "competitive_pressure"
+  ],
+  "led_to": [
+    "panasonic-exit-plasma-2012"
+  ],
+  "snippet": "Plasma unit swung to a ¥913 m loss amid rising LCD competition.",
+  "x-extra": {
+    "quarter": "Q3 2011",
+    "report_type": "earnings_release",
+    "source_currency": "JPY"
+  }
+}

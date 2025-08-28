@@ -1,0 +1,13 @@
+{
+  "id": "phil-e12",
+  "summary": "Philips Lighting prices IPO at €19.25 per share",
+  "description": "On May 2, 2016, Philips Lighting N.V. (the newly independent Lighting business) set its initial public offering price at €19.25, valuing the company at approximately €3.5 billion. Investor demand was strong, with the order book oversubscribed 2.3×. The pricing reflected confidence in the spin-off’s growth strategy around connected lighting systems and LED innovation.",
+  "timestamp": "2016-05-02T08:30:00Z",
+  "tags": ["ipo", "capital_markets", "lighting"],
+  "led_to": ["philips-spin-off-lighting-2016"],
+  "snippet": "Lighting IPO priced at €19.25 amid 2.3× oversubscription.",
+  "x-extra": {
+    "exchange": "Euronext Amsterdam",
+    "shares_offered_million": 181.7
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "why_v1": {
+    "policy_id": "why_v1",
+    "prompt_id": "why_v1.0",
+    "policy_block": "Answer strictly in JSON matching WhyDecisionAnswer@1. Include the anchor id, key event ids, and present transition ids in supporting_ids (never cite ids not found in allowed_ids).",
+    "explanations": [],
+    "json_mode": true,
+    "temperature": 0.0,
+    "retries": 2,
+    "max_tokens": 256
+  }
+}

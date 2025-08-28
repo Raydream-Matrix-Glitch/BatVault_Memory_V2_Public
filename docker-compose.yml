@@ -1,0 +1,409 @@
+services:
+
+  # ---- Monitoring Stack ---------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle"]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+    networks: [batnet]
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    restart: unless-stopped
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_LOG_FILTERS=authn.service:info
+    volumes:
+      - ./ops/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./ops/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    networks: [batnet]
+
+  arangodb:
+    image: arangodb:3.12.4
+    restart: always
+    environment:
+      - ARANGO_ROOT_PASSWORD=${ARANGO_ROOT_PASSWORD:-batvault}
+    command: >
+      arangod
+      --server.endpoint=tcp://0.0.0.0:8529
+      --server.authentication=false
+      --experimental-vector-index
+    ports:
+      - "8529:8529"
+    volumes:
+      - ./docker-data/arangodb:/var/lib/arangodb3
+    networks: [batnet]
+
+  bootstrap:
+    build:
+      context: .
+      dockerfile: ops/docker/Dockerfile.bootstrap
+      args:
+        SERVICE_NAME:
+    depends_on:
+      arangodb:
+        condition: service_started
+    volumes:
+      - ./:/app
+    working_dir: /app
+    entrypoint: ["python", "ops/bootstrap.py"]
+    restart: "no"
+    networks: [batnet]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [batnet]
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./docker-data/minio:/data
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -s http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      disable: false
+    networks: [batnet]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.103.1
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./ops/otel/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+    networks: [batnet]
+
+  api_edge:
+    build:
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: api_edge
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=api_edge
+      - BATVAULT_HEALTH_PORT=8080
+    env_file:
+      - .env
+      - .env.local
+      - services/api_edge/.env.local
+    command: ["python", "-m", "api_edge.__main__"]
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      gateway:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [batnet]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: gateway
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=gateway
+      - BATVAULT_HEALTH_PORT=8081
+      - CITE_ALL_IDS=true
+    env_file:
+      - .env
+      - .env.local
+      - services/gateway/.env.local
+    command: ["python", "-m", "gateway.__main__"]
+    ports: ["8081:8081"]
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      memory_api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [batnet]
+
+  memory_api:
+    build:
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: memory_api
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=memory-api
+      - ARANGO_VECTOR_INDEX_ENABLED=true
+      - BATVAULT_HEALTH_PORT=8000
+    env_file:
+      - .env
+      - .env.local
+      - services/memory_api/.env.local
+    command: ["python", "-m", "memory_api.__main__"]
+    # Expose container:8000 to host:8082 (internal still 8000)
+    ports: ["8082:8000"]
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      interval: 10s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [batnet]
+
+  # -------------------------------------------------------------------
+  # Open-source LLM & Embeddings services (optional via profile: llm)
+  #
+  # These services provide text summarisation and embedding inference for the
+  # Gateway and Memory API.  They are disabled by default and only started
+  # when you explicitly select the ``llm`` profile.  To enable them, run:
+  #
+  #     docker compose --profile llm up
+  #
+  # The HuggingFace model weights are cached under the ``models-cache``
+  # named volume so that downloads persist across container restarts.
+  # Each service exposes its own healthcheck to allow the Gateway and
+  # Memory API to wait until the models are ready.
+  vllm-control:
+    profiles: [llm]
+    image: vllm/vllm-openai:latest
+    # Hard cap the container RAM so the host doesn't get eaten.
+    mem_limit: "16g"
+    mem_reservation: "8g"
+    shm_size: "1g"
+    gpus: "all"
+    environment:
+      - VLLM_MODEL_NAME=${VLLM_MODEL_NAME:-Qwen/Qwen2-7B-Instruct-AWQ}
+      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      - HF_HOME=/data/hf
+      - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtbbmalloc.so.2
+      # Allow vLLM to page KV cache into host RAM if needed.
+      - VLLM_SWAP_GB=${VLLM_SWAP_GB:-4}
+      # GPU VRAM target fraction. 0.86 leaves ~1.7 GiB headroom on 12 GiB GPUs.
+      - VLLM_GPU_UTIL=${VLLM_GPU_UTIL:-0.86}
+      # Concurrency & context – keep reasonable defaults; override via .env as needed.
+      - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-2048}
+      - VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-2}
+      - VLLM_MAX_BATCHED_TOKENS=${VLLM_MAX_BATCHED_TOKENS:-2048}
+      - VLLM_QUANTIZATION=${VLLM_QUANTIZATION:-awq}
+    command:
+      - --host
+      - "0.0.0.0"
+      - --model
+      - "${VLLM_MODEL_NAME:-Qwen/Qwen2-7B-Instruct-AWQ}"
+      - --port
+      - "8010"
+      - --download-dir
+      - "/data/hf"
+      # Carve KV cache as a fraction of device VRAM
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_UTIL:-0.86}"
+      # Load quantized weights
+      - --quantization
+      - "${VLLM_QUANTIZATION:-awq}"
+      # Bound KV cache by limiting effective context and concurrent sequences
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-2048}"
+      - --max-num-seqs
+      - "${VLLM_MAX_NUM_SEQS:-2}"
+      - --max-num-batched-tokens
+      - "${VLLM_MAX_BATCHED_TOKENS:-2048}"
+      - --dtype
+      - "float16"
+      # Page part of KV cache to host RAM when spikes occur
+      - --swap-space
+      - "${VLLM_SWAP_GB:-4}"
+      - --disable-frontend-multiprocessing
+      - --multi-step-stream-outputs
+    ports:
+      - "8010:8010"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8010/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - models-cache:/data/hf
+    networks: [batnet]
+
+  tgi-canary:
+    # run docker compose --profile canary up
+    profiles: [canary]
+    image: ghcr.io/huggingface/text-generation-inference:latest
+    mem_limit: "8g"
+    mem_reservation: "6g"
+    environment:
+      # Keep TGI small so it can't spike host RAM.
+      - MAX_BATCH_SIZE=${TGI_MAX_BATCH_SIZE:-1}
+      - MAX_INPUT_LENGTH=${TGI_MAX_INPUT_LEN:-2048}
+      - MAX_TOTAL_TOKENS=${TGI_MAX_TOTAL_TOKENS:-2048}
+      - MAX_BATCH_PREFILL_TOKENS=${TGI_MAX_PREFILL_TOKENS:-2048}
+      - MAX_CONCURRENT_REQUESTS=${TGI_MAX_CONCURRENT_REQUESTS:-4}
+      - CUDA_MEMORY_FRACTION=${TGI_CUDA_FRACTION:-0.60}
+      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      - HF_HOME=/data/hf
+      - NUM_PROMPT_TOKENS=1024
+      - NUM_RESPONSE_TOKENS=1024
+      - HF_HOME=/data/hf
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    command:
+      - --model-id
+      - "${TGI_CANARY_MODEL_ID:?err}"
+      - --port
+      - "8090"
+      # be explicit on single-GPU boxes
+      - --num-shard
+      - "1"
+    gpus: "all"
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8090/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - models-cache:/data/hf
+    networks: [batnet]
+
+  tei-embed:
+    profiles: [llm]
+    image: ghcr.io/huggingface/text-embeddings-inference:latest
+    gpus: "all"
+    environment:
+      - HF_HOME=/data/hf
+    command:
+      - --model-id
+      - "${TEI_MODEL_NAME:?err}"
+      - --port
+      - "8085"
+      - --pooling
+      - "mean"
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8085/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - models-cache:/data/hf
+    networks: [batnet]
+
+  ingest:
+    build:
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: ingest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_SERVICE_NAME=ingest
+      - ARANGO_VECTOR_INDEX_ENABLED=true
+      - BATVAULT_HEALTH_PORT=8083
+    env_file:
+      - .env
+      - .env.local
+      - services/ingest/.env.local
+    command: ["python", "-m", "ingest.__main__"]
+    ports: ["8083:8083"]
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    depends_on:
+      - memory_api
+      - minio
+      - otel-collector
+    restart: unless-stopped
+    volumes:
+      - ./memory/fixtures:/app/memory/fixtures:ro
+    networks: [batnet]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    restart: unless-stopped
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+      - "14250:14250"
+      - "14268:14268"
+    networks: [batnet]
+
+  frontend:
+    build:
+      context: ./batvault_frontend
+      dockerfile: dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      api_edge:
+        condition: service_healthy
+    networks: [batnet]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  models-cache:
+
+networks:
+  batnet:
+    driver: bridge

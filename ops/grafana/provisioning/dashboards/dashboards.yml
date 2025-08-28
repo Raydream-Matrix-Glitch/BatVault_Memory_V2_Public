@@ -1,0 +1,12 @@
+apiVersion: 1
+providers:
+  - name: BatVault
+    orgId: 1
+    folder: BatVault
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30          # hot-reload every 30 s
+    options:
+      path: /etc/grafana/provisioning/dashboards  # ⬅ matches the mounted folder
+      foldersFromFilesStructure: true

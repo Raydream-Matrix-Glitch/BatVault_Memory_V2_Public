@@ -1,0 +1,9 @@
+{
+  "id": "trans-phil-2014-2016",
+  "from": "philips-lighting-split-2014",
+  "to": "philips-spin-off-lighting-2016",
+  "relation": "causal",
+  "reason": "Spin-off IPO executed to unlock value",
+  "timestamp": "2016-05-03T00:00:00Z",
+  "x-extra": {}
+}

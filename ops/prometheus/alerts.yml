@@ -1,0 +1,158 @@
+groups:
+  - name: batvault.slo.recording
+    rules:
+      # P95 latency percentiles across multiple windows (5m, 30m, 1h, 6h).
+      - record: slo:p95_ttfb_seconds:5m
+        expr: |
+          histogram_quantile(0.95, sum(rate(({__name__=~".*_ttfb_seconds_bucket"})[5m])) by (le))
+      - record: slo:p95_ttfb_seconds:30m
+        expr: |
+          histogram_quantile(0.95, sum(rate(({__name__=~".*_ttfb_seconds_bucket"})[30m])) by (le))
+      - record: slo:p95_ttfb_seconds:1h
+        expr: |
+          histogram_quantile(0.95, sum(rate(({__name__=~".*_ttfb_seconds_bucket"})[1h])) by (le))
+      - record: slo:p95_ttfb_seconds:6h
+        expr: |
+          histogram_quantile(0.95, sum(rate(({__name__=~".*_ttfb_seconds_bucket"})[6h])) by (le))
+      # Error rates for each service across multiple windows.  These series
+      # represent the fraction of HTTP requests returning 5xx status codes.
+      - record: slo:api_edge_error_rate:5m
+        expr: rate(api_edge_http_5xx_total[5m]) / rate(api_edge_http_requests_total[5m])
+      - record: slo:api_edge_error_rate:30m
+        expr: rate(api_edge_http_5xx_total[30m]) / rate(api_edge_http_requests_total[30m])
+      - record: slo:api_edge_error_rate:1h
+        expr: rate(api_edge_http_5xx_total[1h]) / rate(api_edge_http_requests_total[1h])
+      - record: slo:api_edge_error_rate:6h
+        expr: rate(api_edge_http_5xx_total[6h]) / rate(api_edge_http_requests_total[6h])
+      - record: slo:gateway_error_rate:5m
+        expr: rate(gateway_http_5xx_total[5m]) / rate(gateway_http_requests_total[5m])
+      - record: slo:gateway_error_rate:30m
+        expr: rate(gateway_http_5xx_total[30m]) / rate(gateway_http_requests_total[30m])
+      - record: slo:gateway_error_rate:1h
+        expr: rate(gateway_http_5xx_total[1h]) / rate(gateway_http_requests_total[1h])
+      - record: slo:gateway_error_rate:6h
+        expr: rate(gateway_http_5xx_total[6h]) / rate(gateway_http_requests_total[6h])
+      - record: slo:memory_api_error_rate:5m
+        expr: rate(memory_api_http_5xx_total[5m]) / rate(memory_api_http_requests_total[5m])
+      - record: slo:memory_api_error_rate:30m
+        expr: rate(memory_api_http_5xx_total[30m]) / rate(memory_api_http_requests_total[30m])
+      - record: slo:memory_api_error_rate:1h
+        expr: rate(memory_api_http_5xx_total[1h]) / rate(memory_api_http_requests_total[1h])
+      - record: slo:memory_api_error_rate:6h
+        expr: rate(memory_api_http_5xx_total[6h]) / rate(memory_api_http_requests_total[6h])
+      - record: slo:ingest_error_rate:5m
+        expr: rate(ingest_http_5xx_total[5m]) / rate(ingest_http_requests_total[5m])
+      - record: slo:ingest_error_rate:30m
+        expr: rate(ingest_http_5xx_total[30m]) / rate(ingest_http_requests_total[30m])
+      - record: slo:ingest_error_rate:1h
+        expr: rate(ingest_http_5xx_total[1h]) / rate(ingest_http_requests_total[1h])
+      - record: slo:ingest_error_rate:6h
+        expr: rate(ingest_http_5xx_total[6h]) / rate(ingest_http_requests_total[6h])
+  - name: batvault.slo.alerts
+    rules:
+      # Latency SLO burn alerts: short (5m/30m) and long (1h/6h) windows.
+      - alert: HighP95LatencyShort
+        expr: slo:p95_ttfb_seconds:5m > 3 and slo:p95_ttfb_seconds:30m > 3
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "High p95 latency (short window)"
+          description: "p95 latency above 3s in both 5m and 30m windows."
+      - alert: HighP95LatencyLong
+        expr: slo:p95_ttfb_seconds:1h > 3 and slo:p95_ttfb_seconds:6h > 3
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "High p95 latency (long window)"
+          description: "p95 latency above 3s in both 1h and 6h windows."
+      # Error-budget burn alerts per service.  Short alerts fire when both the
+      # 5m and 30m error rates exceed 1%; long alerts fire when the 1h error
+      # rate exceeds 0.5% and the 6h error rate exceeds 0.1%.
+      - alert: SLOErrorBudgetBurnAPIEdgeShort
+        expr: slo:api_edge_error_rate:5m > 0.01 and slo:api_edge_error_rate:30m > 0.01
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "API Edge error-budget burn (short)"
+          description: "API Edge error rate above 1% in 5m and 30m windows."
+      - alert: SLOErrorBudgetBurnAPIEdgeLong
+        expr: slo:api_edge_error_rate:1h > 0.005 and slo:api_edge_error_rate:6h > 0.001
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "API Edge error-budget burn (long)"
+          description: "API Edge error rate above 0.5% in 1h and 0.1% in 6h windows."
+      - alert: SLOErrorBudgetBurnGatewayShort
+        expr: slo:gateway_error_rate:5m > 0.01 and slo:gateway_error_rate:30m > 0.01
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Gateway error-budget burn (short)"
+          description: "Gateway error rate above 1% in 5m and 30m windows."
+      - alert: SLOErrorBudgetBurnGatewayLong
+        expr: slo:gateway_error_rate:1h > 0.005 and slo:gateway_error_rate:6h > 0.001
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "Gateway error-budget burn (long)"
+          description: "Gateway error rate above 0.5% in 1h and 0.1% in 6h windows."
+      - alert: SLOErrorBudgetBurnMemoryAPIShort
+        expr: slo:memory_api_error_rate:5m > 0.01 and slo:memory_api_error_rate:30m > 0.01
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Memory API error-budget burn (short)"
+          description: "Memory API error rate above 1% in 5m and 30m windows."
+      - alert: SLOErrorBudgetBurnMemoryAPILong
+        expr: slo:memory_api_error_rate:1h > 0.005 and slo:memory_api_error_rate:6h > 0.001
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "Memory API error-budget burn (long)"
+          description: "Memory API error rate above 0.5% in 1h and 0.1% in 6h windows."
+      - alert: SLOErrorBudgetBurnIngestShort
+        expr: slo:ingest_error_rate:5m > 0.01 and slo:ingest_error_rate:30m > 0.01
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Ingest error-budget burn (short)"
+          description: "Ingest error rate above 1% in 5m and 30m windows."
+      - alert: SLOErrorBudgetBurnIngestLong
+        expr: slo:ingest_error_rate:1h > 0.005 and slo:ingest_error_rate:6h > 0.001
+        for: 30m
+        labels:
+          severity: page
+        annotations:
+          summary: "Ingest error-budget burn (long)"
+          description: "Ingest error rate above 0.5% in 1h and 0.1% in 6h windows."
+
+      # Multi-window error budget burn alerts for gateway
+      - alert: SLOErrorBudgetBurnGateway
+        expr: |
+          (slo:gateway_error_rate:5m > 0.01) and (slo:gateway_error_rate:1h > 0.001)
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Gateway error-budget burn"
+          description: "5m error rate >1% AND 1h >0.1% for gateway."
+
+      # Multi-window error budget burn alerts for memory API
+      - alert: SLOErrorBudgetBurnMemoryAPI
+        expr: |
+          (slo:memory_api_error_rate:5m > 0.01) and (slo:memory_api_error_rate:1h > 0.001)
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Memory API error-budget burn"
+          description: "5m error rate >1% AND 1h >0.1% for memory_api."

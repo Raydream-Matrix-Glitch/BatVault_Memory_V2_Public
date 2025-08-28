@@ -1,0 +1,9 @@
+{
+  "id": "trans-pan-2010-2012",
+  "from": "panasonic-tesla-battery-partnership-2010",
+  "to": "panasonic-exit-plasma-2012",
+  "relation": "causal",
+  "reason": "Strategic focus shifted to EV batteries from plasma TVs",
+  "timestamp": "2012-04-30T09:00:00Z",
+  "x-extra": {}
+}
