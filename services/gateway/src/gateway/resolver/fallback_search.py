@@ -7,6 +7,8 @@ from core_logging import get_logger, trace_span, log_stage
 from core_observability.otel import inject_trace_context
 from core_config import get_settings
 
+from gateway.http import get_http_client
+
 logger = get_logger("gateway")
 settings = get_settings()
 
@@ -54,14 +56,15 @@ async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
     payload = {"q": text, "limit": k, "use_vector": False}
     matches: List[Dict[str, Any]] = []
     try:
-        async with httpx.AsyncClient(timeout=0.8) as client:
-            # wrap the Memory‑API call in its own span and propagate OTEL headers
-            with trace_span("gateway.bm25_search", q=text, limit=k):
-                resp = await client.post(
-                    f"{settings.memory_api_url}/api/resolve/text",
-                    json=payload,
-                    headers=inject_trace_context({}),
-                )
+        client = get_http_client()
+        # wrap the Memory‑API call in its own span and propagate OTEL headers
+        with trace_span("gateway.bm25_search", q=text, limit=k):
+            resp = await client.post(
+                f"{settings.memory_api_url}/api/resolve/text",
+                json=payload,
+                headers=inject_trace_context({}),
+                timeout=0.8,
+            )
         if resp.status_code == 200:
             doc = resp.json()
             matches = doc.get("matches", [])

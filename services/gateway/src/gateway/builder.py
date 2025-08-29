@@ -1,20 +1,28 @@
 from __future__ import annotations
 import time, uuid, os, re
 from typing import Any, Mapping, Tuple, Dict, List
-from core_logging import log_stage
 
 import orjson
+from core_config import get_settings
 
 import importlib.metadata as _md
 from core_logging import log_stage, get_logger
 from core_utils.fingerprints import canonical_json
 from core_models.models import (
-    WhyDecisionAnchor, WhyDecisionAnswer, WhyDecisionEvidence,
-    WhyDecisionResponse, WhyDecisionTransitions, CompletenessFlags,
+    WhyDecisionAnchor,
+    WhyDecisionAnswer,
+    WhyDecisionEvidence,
+    WhyDecisionResponse,
+    WhyDecisionTransitions,
+    CompletenessFlags,
+    MetaInfo,
 )
+from core_models.meta_inputs import MetaInputs
 
 from gateway.budget_gate import run_gate
-from gateway.llm_router import last_call as _llm_last_call
+from shared.normalize import normalise_event_amount as _normalise_event_amount  # promoted helper
+from gateway import selector as _selector
+from gateway.inference_router import last_call as _llm_last_call
 from .prompt_envelope import build_prompt_envelope
 from .templater import deterministic_short_answer
 from .templater import finalise_short_answer
@@ -23,12 +31,183 @@ from core_validator import validate_response as _core_validate_response
 # depending on a private underscore‑prefixed function which may change in
 # future releases.
 from core_validator import canonical_allowed_ids
-from . import llm_client
+from gateway.inference_router import call_llm as llm_call
 import gateway.templater as templater
 import inspect
 
+# Import metadata helpers to construct canonical meta information.  The
+# MetaInputs and EvidenceMetrics models define the JSON‑first schema
+# for Gateway metadata; build_meta normalises and validates the final
+# object.  Keeping these imports local to this module avoids
+# introducing dependencies in the public API surface of gateway.builder.
+# MetaInputs provides the JSON‑first schema for meta construction.
+# Use the shared meta builder to normalise and validate meta information.
+from shared.meta_builder import build_meta
+
 
 logger   = get_logger("gateway.builder")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _compute_supporting_ids(ev: WhyDecisionEvidence) -> list[str]:
+    """Compute deterministic supporting_ids for the given evidence.
+
+    Ordering:
+      [anchor] + [top 3 events by selector.rank_events] + [preceding first] + [succeeding first]
+    Only IDs present in ev.allowed_ids are considered; duplicates removed.
+    Set CITE_ALL_IDS=true to bypass and emit ev.allowed_ids in order.
+    """
+    try:
+        s = get_settings()
+        cite_all_env = "1" if getattr(s, "cite_all_ids", False) else ""
+        cite_all = cite_all_env.lower() in ("true", "1", "yes", "y")
+    except Exception:
+        cite_all = False
+    allowed = list(getattr(ev, "allowed_ids", []) or [])
+    if cite_all:
+        return allowed
+    support: list[str] = []
+    # Anchor
+    anchor_id = None
+    try:
+        anchor_id = getattr(ev.anchor, "id", None)
+    except Exception:
+        anchor_id = None
+    if anchor_id and anchor_id in allowed:
+        support.append(anchor_id)
+    # Events: use deterministic selector ranking, then take the top three
+    events: list[dict] = []
+    try:
+        for e in ev.events or []:
+            if isinstance(e, dict):
+                ed = e
+            else:
+                try:
+                    ed = e.model_dump(mode="python")  # type: ignore[attr-defined]
+                except Exception:
+                    ed = dict(e)
+            etype = (ed.get("type") or ed.get("entity_type") or "").lower()
+            if etype == "event":
+                events.append(ed)
+    except Exception:
+        events = []
+    # Rank via shared helper; fallback to timestamp desc if anything goes wrong
+    try:
+        ranked = _selector.rank_events(ev.anchor, events)[:3]
+    except Exception:
+        ranked = sorted(events, key=lambda x: (x.get("timestamp") or "", x.get("id") or ""), reverse=True)[:3]
+    for evd in ranked:
+        eid = evd.get("id")
+        if eid and eid in allowed and eid not in support:
+            support.append(eid)
+    # Preceding transition
+    first_pre_id: str | None = None
+    try:
+        pre_list = list(getattr(ev.transitions, "preceding", []) or [])
+    except Exception:
+        pre_list = []
+    for tr in pre_list:
+        tid = tr.get("id") if isinstance(tr, dict) else getattr(tr, "id", None)
+        if tid:
+            first_pre_id = tid
+            break
+    if first_pre_id and first_pre_id in allowed and first_pre_id not in support:
+        support.append(first_pre_id)
+    # Succeeding transition
+    first_suc_id: str | None = None
+    try:
+        suc_list = list(getattr(ev.transitions, "succeeding", []) or [])
+    except Exception:
+        suc_list = []
+    for tr in suc_list:
+        tid = tr.get("id") if isinstance(tr, dict) else getattr(tr, "id", None)
+        if tid:
+            first_suc_id = tid
+            break
+    if first_suc_id and first_suc_id in allowed and first_suc_id not in support:
+        support.append(first_suc_id)
+    return support
+
+# ---------------------------------------------------------------------------
+# Evidence pre‑processing helpers
+# ---------------------------------------------------------------------------
+def _dedup_and_normalise_events(ev: WhyDecisionEvidence) -> None:
+    """
+    Deduplicate and normalise events on a WhyDecisionEvidence object.
+
+    When evidence is provided directly by callers or tests it may contain
+    duplicate events (e.g. multiple instances with the same ID or very
+    similar summaries on the same day).  This helper collapses such
+    duplicates and attaches normalised monetary amounts to each event.  The
+    deduplication logic mirrors the behaviour of the EvidenceBuilder:
+
+      1. Remove duplicate IDs (preserving the first occurrence).
+      2. Collapse near-identical events occurring on the same day where the
+         textual summary differs only by numeric or currency markers.  A
+         canonical key is derived from the date (YYYY‑MM‑DD) and the
+         summary/description with all digits, currency symbols and
+         punctuation stripped and lower‑cased.  Only one event per key is
+         retained.
+      3. For each retained event, attempt to parse and attach a
+         ``normalized_amount`` and ``currency`` using the shared helper
+         from ``gateway.evidence``.  Parsing is best-effort and silent on
+         failure.
+
+    The input evidence object is modified in place; no value is returned.
+    """
+    try:
+        events = list(ev.events or [])
+    except Exception:
+        return
+    # Step 1: deduplicate by event ID
+    seen_ids: set[str] = set()
+    deduped: list[dict] = []
+    for item in events:
+        try:
+            eid = item.get("id")
+        except Exception:
+            eid = None
+        if eid and eid in seen_ids:
+            continue
+        if eid:
+            seen_ids.add(eid)
+        deduped.append(item)
+    events = deduped
+    # Step 2: deduplicate near‑identical events on the same day
+    try:
+        import re as _re
+        grouped: set[tuple] = set()
+        uniq: list[dict] = []
+        for item in events:
+            try:
+                ts = item.get("timestamp") or ""
+                date_part = ts.split("T")[0] if isinstance(ts, str) else str(ts)[:10]
+                summary = item.get("summary") or item.get("description") or ""
+                if not isinstance(summary, str):
+                    summary = str(summary)
+                # Remove digits, currency symbols and punctuation; collapse whitespace
+                key_text = _re.sub(r"[\d$¥€£,\.\s]+", "", summary).lower()
+                dedup_key = (date_part, key_text)
+            except Exception:
+                dedup_key = (item.get("timestamp"), item.get("id"))
+            if dedup_key in grouped:
+                continue
+            grouped.add(dedup_key)
+            uniq.append(item)
+        events = uniq
+    except Exception:
+        pass
+    # Step 3: normalise monetary amounts
+    for item in events:
+        try:
+            _normalise_event_amount(item)
+        except Exception:
+            pass
+    try:
+        ev.events = events
+    except Exception:
+        pass
 
 # In‑memory cache for artefact bundles.  Each entry stores the exact
 # artefacts used to assemble a response keyed by the request ID.  The
@@ -64,33 +243,15 @@ async def build_why_decision_response(
     if req.evidence is not None:
         ev = req.evidence
     elif req.anchor_id:
-        # Build the evidence from the Memory‑API given an anchor ID.  The
-        # EvidenceBuilder contract should normally never return ``None``.
-        # However, tests may monkey‑patch the builder to return ``None`` or
-        # the builder could fail open if upstream dependencies are down.
-        # In those cases we degrade gracefully by constructing a minimal
-        # evidence stub.  This behaviour ensures the Gateway never throws
-        # an ``AttributeError`` when accessing ``model_dump`` on a ``None``
-        # object and aligns with the tech‑spec requirement that unknown
-        # decisions still produce a valid bundle (spec §B2/B5).
-        # Robustly call the builder even if tests monkey‑patch the instance-level
-        # build method.  If an unbound override exists in the instance __dict__
-        # call it directly to avoid double-binding.
         maybe = evidence_builder.build(req.anchor_id)
         ev = await maybe if inspect.isawaitable(maybe) else maybe
-        if ev is None:  # pragma: no cover – defensive fallback
-            # Fallback: produce an empty evidence bundle with the given
-            # anchor ID.  This stub has no events or transitions and a
-            # conservative snapshot etag.  ``allowed_ids`` will be
-            # recomputed below, so leave it empty here.
+        if ev is None:
+
             ev = WhyDecisionEvidence(
                 anchor=WhyDecisionAnchor(id=req.anchor_id),
                 events=[],
                 transitions=WhyDecisionTransitions(preceding=[], succeeding=[]),
             )
-            # ``snapshot_etag`` is an optional field excluded from the
-            # default model dump.  Set it explicitly so downstream
-            # fingerprinting and caching behave deterministically.
             ev.snapshot_etag = "unknown"
     else:                       # safeguard – should be caught by AskIn validator
         ev = WhyDecisionEvidence(
@@ -98,6 +259,14 @@ async def build_why_decision_response(
             events=[],
             transitions=WhyDecisionTransitions(preceding=[], succeeding=[]),
         )
+    # Preprocess the evidence events to remove duplicates and normalise
+    # monetary amounts.  This mirrors the EvidenceBuilder logic when
+    # callers provide their own evidence stubs.  See tests covering
+    # deduplication and amount normalisation for rationale.
+    try:
+        _dedup_and_normalise_events(ev)
+    except Exception:
+        pass
 
     # Omit empty transition lists from the evidence by converting them to None
     try:
@@ -195,6 +364,35 @@ async def build_why_decision_response(
     except Exception:
         pass
     arte["evidence_post.json"] = orjson.dumps(ev.model_dump(mode="python", exclude_none=True))
+    # ── Events Policy E: show a few, keep all (response up to 10; count & truncate flags) ──
+    try:
+        _full_events_for_policy = list(ev.events or [])
+    except Exception:
+        _full_events_for_policy = []
+    try:
+        _ranked_all = _selector.rank_events(ev.anchor, _full_events_for_policy)
+    except Exception:
+        _ranked_all = sorted(
+            _full_events_for_policy, key=lambda x: (x.get("timestamp") or "", x.get("id") or ""), reverse=True
+        )
+    _events_total = len(_ranked_all)
+    _events_truncated_flag = _events_total > 10
+    # Keep the response events to top 10 (bundle artefacts already captured above retain the full list)
+    ev.events = _ranked_all[:10]
+    # Rebuild allowed_ids after shaping events via the canonical helper
+    try:
+        from core_validator import canonical_allowed_ids as _canon
+        aid = getattr(ev.anchor, "id", "") or ""
+        ev_events = [e if isinstance(e, dict) else getattr(e, "model_dump", dict)(mode="python") for e in (ev.events or [])]
+        ev_trans = []
+        tr = getattr(ev, "transitions", None)
+        if tr is not None:
+            ev_trans.extend(getattr(tr, "preceding", []) or [])
+            ev_trans.extend(getattr(tr, "succeeding", []) or [])
+            ev_trans = [t if isinstance(t, dict) else getattr(t, "model_dump", dict)(mode="python") for t in ev_trans]
+        ev.allowed_ids = _canon(aid, ev_events, ev_trans)
+    except Exception:
+        pass
     # Extract selector/gate metrics (if provided by selector)
     sel_meta = {}
     try:
@@ -241,37 +439,6 @@ async def build_why_decision_response(
 
         except Exception:
             pass
-        # Preflight health check: if the configured control endpoint is unreachable,
-        # disable LLM for this request to avoid noisy “fallback_used=true” semantics.
-        if use_llm:
-            import httpx, os as _os
-            # lazily import OTEL header injector and propagate context to the health check
-            try:
-                from core_observability.otel import inject_trace_context  # type: ignore
-            except Exception:
-                inject_trace_context = None  # type: ignore
-            ep = (_os.getenv("CONTROL_MODEL_ENDPOINT") or "").rstrip("/")
-            hc = f"{ep}/health" if ep else ""
-            unhealthy = False
-            try:
-                if not ep:
-                    unhealthy = True
-                else:
-                    hdrs = inject_trace_context({}) if inject_trace_context else {}
-                    resp = httpx.get(hc, timeout=0.3, headers=hdrs)
-                    unhealthy = resp.status_code >= 500
-            except Exception:
-                unhealthy = True
-            if unhealthy:
-                use_llm = False
-                try:
-                    log_stage(
-                        logger, "llm", "unhealthy",
-                        request_id=req_id, endpoint=ep or "unset",
-                        reason="healthcheck_failed", llm_mode=settings.llm_mode
-                    )
-                except Exception:
-                    pass
         # If the LLM is explicitly disabled by config, record that clearly and mark fallback.
         if not use_llm:
             try:
@@ -303,23 +470,18 @@ async def build_why_decision_response(
             # Gate is authoritative for completion; router will only safety-clamp.
             max_tokens = int(gate_plan.max_tokens or envelope.get("constraints", {}).get("max_tokens", 256))
             try:
-                # Perform a single summarisation call; summarise_json will
-                # internally call the llm_router and apply retries.  When
-                # the LLM is unavailable, summarise_json returns a deterministic
-                # stub that we treat as a fallback.  Use the request_id for
-                # stable canary routing.
-                raw_json = llm_client.summarise_json(
+                raw_json = await llm_call(
                     envelope,
+                    request_id=req_id,
+                    headers=None,
+                    retries=max_retries,
                     temperature=temp,
                     max_tokens=max_tokens,
-                    retries=max_retries,
-                    request_id=req_id,
-                    messages_override=gate_plan.messages,
-                    max_tokens_override=gate_plan.max_tokens,
                 )
             except Exception:
+                # On any exception treat as no raw JSON (fallback path)
                 raw_json = None
-            # No explicit retry loop here; summarise_json handles its own retries.
+            # No explicit retry loop here; llm_call delegates retries.
             retry_count = max_retries
         # Determine whether this is a fallback: if we didn't call the LLM
         # (use_llm is false) or summarise_json returned no result.
@@ -336,10 +498,10 @@ async def build_why_decision_response(
                         logger, "llm", "fallback",
                         request_id=req_id,
                         reason="no_raw_json",
-                        openai_disabled=os.getenv("OPENAI_DISABLED"),
-                        canary_pct=os.getenv("CANARY_PCT"),
-                        control=os.getenv("CONTROL_MODEL_ENDPOINT"),
-                        canary=os.getenv("CANARY_MODEL_ENDPOINT"),
+                        openai_disabled=getattr(s, "openai_disabled", False),
+                        canary_pct=getattr(s, "canary_pct", 0),
+                        control=getattr(s, "control_model_endpoint", ""),
+                        canary=getattr(s, "canary_model_endpoint", ""),
                     )
                 except Exception:
                     pass
@@ -350,24 +512,17 @@ async def build_why_decision_response(
                 if not fallback_reason:
                     fallback_reason = "llm_off"
             # Same richer supporting_ids logic for the “no raw_json” branch
-            support: list[str] = []
+            # Compute supporting ids deterministically
             try:
-                if ev.anchor and getattr(ev.anchor, "id", None):
-                    support.append(ev.anchor.id)
-                evs = [e for e in (ev.events or []) if isinstance(e, dict)]
-                evs_sorted = sorted(evs, key=lambda e: e.get("timestamp") or "")[-3:]
-                support += [e.get("id") for e in evs_sorted if e.get("id")]
-                for t in (ev.transitions.preceding or []) + (ev.transitions.succeeding or []):
-                    tid = t.get("id") if isinstance(t, dict) else getattr(t, "id", None)
-                    if tid:
-                        support.append(tid)
-                if not support and (ev.allowed_ids or []):
-                    support = list(ev.allowed_ids)
-                seen: set[str] = set()
-                support = [x for x in support if x and not (x in seen or seen.add(x))]
+                support = _compute_supporting_ids(ev)
             except Exception:
-                support = [ev.anchor.id] if (ev.anchor and getattr(ev.anchor, "id", None)) else []
-
+                support = []
+                try:
+                    aid = getattr(ev.anchor, "id", None)
+                    if aid:
+                        support.append(aid)
+                except Exception:
+                    support = []
             ans = WhyDecisionAnswer(short_answer="", supporting_ids=support)
             arte["llm_raw.json"] = b"{}"
         else:
@@ -406,139 +561,24 @@ async def build_why_decision_response(
                     pass
                 # Build richer supporting_ids from evidence (anchor + events + transitions),
                 # keeping ordering compatible with allowed_ids and deduping.
-                support: list[str] = []
                 try:
-                    if ev.anchor and getattr(ev.anchor, "id", None):
-                        support.append(ev.anchor.id)
-                    # include up to 3 most recent events
-                    evs = [e for e in (ev.events or []) if isinstance(e, dict)]
-                    evs_sorted = sorted(evs, key=lambda e: e.get("timestamp") or "")[-3:]
-                    support += [e.get("id") for e in evs_sorted if e.get("id")]
-                    # include all present transitions (preceding + succeeding)
-                    for t in (ev.transitions.preceding or []) + (ev.transitions.succeeding or []):
-                        tid = t.get("id") if isinstance(t, dict) else getattr(t, "id", None)
-                        if tid:
-                            support.append(tid)
-                    # fall back to allowed_ids if the bundle is small and anchor wasn’t set
-                    if not support and (ev.allowed_ids or []):
-                        support = list(ev.allowed_ids)
-                    # dedupe preserving order
-                    seen: set[str] = set()
-                    support = [x for x in support if x and not (x in seen or seen.add(x))]
+                    support = _compute_supporting_ids(ev)
                 except Exception:
-                    support = [ev.anchor.id] if (ev.anchor and getattr(ev.anchor, "id", None)) else []
+                    support = []
+                    try:
+                        aid = getattr(ev.anchor, "id", None)
+                        if aid:
+                            support.append(aid)
+                    except Exception:
+                        support = []
 
                 ans = WhyDecisionAnswer(short_answer="", supporting_ids=support)
                 arte["llm_raw.json"] = b"{}"
 
-    # ── LLM prose clamp ---------------------------------------------------
-    # Post-process the LLM's short_answer to remove raw IDs and enforce the
-    # concise style.  If any allowed_id appears as a standalone token in
-    # the short_answer it is removed and the change is recorded via a
-    # structured log.  After scrubbing, the clamp checks for violations of
-    # the style spec: length >320 characters, more than two sentences, or
-    # missing maker/date prefix when the evidence anchor carries both
-    # decision_maker and timestamp.  If any violation is found a
-    # deterministic fallback answer is synthesised and flagged as a
-    # style_violation fallback.
-    if ans is not None and isinstance(ans.short_answer, str) and not llm_fallback:
-        try:
-            short = ans.short_answer or ""
-            removed_count = 0
-            # Remove raw IDs appearing as whole tokens
-            for _id in (ev.allowed_ids or []):
-                if not _id:
-                    continue
-                # match id as a whole word (boundaries by word chars)
-                pattern = rf"\b{re.escape(_id)}\b"
-                matches = re.findall(pattern, short)
-                if matches:
-                    removed_count += len(matches)
-                    short = re.sub(pattern, "", short)
-            # Normalise whitespace after removals
-            if removed_count:
-                short = re.sub(r"\s+", " ", short).strip()
-                try:
-                    log_stage(logger, "answer", "scrubbed_ids", request_id=req_id, scrubbed=True, count=removed_count)
-                except Exception:
-                    pass
-            else:
-                # log that no ids were scrubbed
-                try:
-                    log_stage(logger, "answer", "scrubbed_ids", request_id=req_id, scrubbed=False, count=0)
-                except Exception:
-                    pass
-            style_invalid = False
-            # Too long (>320 characters)
-            if len(short) > 320:
-                style_invalid = True
-            # Too many sentences: split on ., ! or ?
-            segs = [s for s in re.split(r"[.!?]", short) if s.strip()]
-            if len(segs) > 2:
-                style_invalid = True
-            # Ensure maker/date prefix when available
-            maker = ""
-            date_part = ""
-            try:
-                maker = (ev.anchor.decision_maker or "").strip() if ev.anchor else ""
-                ts = (ev.anchor.timestamp or "").strip() if ev.anchor else ""
-                date_part = ts.split("T")[0] if ts else ""
-            except Exception:
-                maker = ""; date_part = ""
-            if maker and date_part:
-                prefix = f"{maker} on {date_part}"
-                if not short.startswith(prefix):
-                    style_invalid = True
-            # If invalid style, synthesise deterministic fallback
-            if style_invalid:
-                llm_fallback = True
-                fallback_reason = "style_violation"
-                try:
-                    short = templater._compose_fallback_answer(ev)
-                except Exception:
-                    short = templater.deterministic_short_answer(ev)
-                ans.short_answer = short
-            else:
-                # enforce the scrubbed/trimmed short answer back on ans
-                ans.short_answer = short
-        except Exception:
-            # Defensive: if clamping fails use fallback
-            llm_fallback = True
-            fallback_reason = "style_violation"
-            try:
-                ans.short_answer = templater._compose_fallback_answer(ev)
-            except Exception:
-                ans.short_answer = templater.deterministic_short_answer(ev)
-
-    # ── adjust supporting_ids using templater (legacy) ───────────────
-    # The Gateway previously invoked ``templater.validate_and_fix`` to
-    # perform legacy supporting_id repairs.  This logic is now entirely
-    # handled by the core validator.  We retain the variables for
-    # compatibility but do not invoke the templater.
     changed_support = False
     templater_errs: list[str] = []
 
-    # Proactively ensure supporting_ids are a subset of allowed_ids and
-    # deduplicated whilst preserving relative order.  This clamps any
-    # stray identifiers introduced by the LLM prior to validation.  The
-    # core validator performs the definitive enforcement, but applying
-    # this here ensures consumers never see unsupported IDs in the
-    # response even if the validator is relaxed.
-    try:
-        if ans is not None and isinstance(ans.supporting_ids, list) and (ev.allowed_ids or []):
-            cleaned: List[str] = []
-            seen_ids: set[str] = set()
-            for sid in ans.supporting_ids:
-                if sid in ev.allowed_ids and sid not in seen_ids:
-                    cleaned.append(sid)
-                    seen_ids.add(sid)
-            # Always include the anchor ID first
-            anchor_id = getattr(ev.anchor, "id", None)
-            if anchor_id and anchor_id in ev.allowed_ids and anchor_id not in seen_ids:
-                cleaned.insert(0, anchor_id)
-            ans.supporting_ids = cleaned
-    except Exception:
-        pass
+    # Safety clamp moved to inference_router._safety_clamp (single clamp policy)
 
     # Count only atomic events (exclude neighbor decisions)
     def _etype(x):
@@ -570,8 +610,8 @@ async def build_why_decision_response(
     # --- Strategic logging on pivotal decisions ------------------------------
     if llm_fallback:
         try:
-            from . import prom_metrics as _pm
-            _pm.gateway_llm_fallback_total.inc()
+            from .metrics import counter as _metric_counter
+            _metric_counter('gateway_llm_fallback_total', 1)
         except Exception:
             pass
         log_stage(get_logger("builder"), "builder", "llm_fallback_used",
@@ -585,23 +625,56 @@ async def build_why_decision_response(
                   max_prompt_tokens=sel_meta.get("max_prompt_tokens"))
     # Ensure `meta` exists for the pre-validation response below. It will be
     # fully populated after validation (see later `meta = { ... }` assignment).
-    meta: Dict[str, Any] = {}
+    # Build a **complete** MetaInfo for pre-validation response to avoid schema errors.
+    # Even though some fields (e.g. validator_error_count, fallback_used) are provisional
+    # at this point, the contract requires them to be present. They will be finalised later.
+    _policy_pre = envelope.get("policy") or {}
+    _policy_id_pre = _policy_pre.get("policy_id") or envelope.get("policy_id") or "unknown"
+    _prompt_id_pre = envelope.get("prompt_id") or "unknown"
+    try:
+        _gw_version_pre = os.getenv("GATEWAY_VERSION", _GATEWAY_VERSION)
+    except Exception:
+        _gw_version_pre = _GATEWAY_VERSION
+    _sel_metrics_pre = {}
+    try:
+        for entry in (gate_plan.logs or []):
+            if "selector_truncation" in entry:
+                _sel_metrics_pre = entry
+                break
+    except Exception:
+        _sel_metrics_pre = {}
+
+    _meta_pre = MetaInfo(
+        policy_id=_policy_id_pre,
+        prompt_id=_prompt_id_pre,
+        prompt_fingerprint=prompt_fp,
+        bundle_fingerprint=bundle_fp,
+        bundle_size_bytes=int(len(arte.get("evidence_post.json", b""))),
+        prompt_tokens=int(getattr(gate_plan, "prompt_tokens", 0)),
+        max_tokens=int(getattr(gate_plan, "max_tokens", 0)),
+        evidence_tokens=int(getattr(gate_plan, "evidence_tokens", 0)),
+        snapshot_etag=snapshot_etag_fp,
+        fallback_used=bool(llm_fallback),
+        fallback_reason=fallback_reason if llm_fallback else None,
+        retries=int(retry_count),
+        gateway_version=_gw_version_pre,
+        selector_model_id=SELECTOR_MODEL_ID,
+        latency_ms=int((time.perf_counter() - t0) * 1000.0),
+        validator_error_count=0,
+        evidence_metrics=dict(_sel_metrics_pre) if _sel_metrics_pre else {},
+    )
+    try:
+        log_stage(get_logger("builder"), "builder", "meta_prepared_pre_validation",
+                  request_id=req_id, policy_id=_policy_id_pre, prompt_id=_prompt_id_pre)
+    except Exception:
+        pass
 
     resp = WhyDecisionResponse(
         intent=req.intent,
         evidence=ev,
         answer=ans,
         completeness_flags=flags,
-        meta={
-            **meta,
-            "request_id": req_id,
-            "llm": {
-                "model": llm_model,
-                "canary": bool(llm_canary) if llm_canary is not None else None,
-                "attempts": llm_attempt,
-                "latency_ms": llm_latency,
-            },
-        },
+        meta=_meta_pre,
     )
     # Validate and normalise the response using the core validator
     # Invoke the validator via the module's global namespace to honour monkey‑patching of
@@ -612,7 +685,12 @@ async def build_why_decision_response(
     ok, validator_errs = _validator_func(resp)
     # Post-process the short answer to replace stubs and enforce length
     ans, finalise_changed = finalise_short_answer(resp.answer, resp.evidence)
-
+    # Recompute supporting_ids after finalising answer
+    try:
+        if ans is not None:
+            ans.supporting_ids = _compute_supporting_ids(ev)
+    except Exception:
+        pass
     # Combine all error messages.  Structured errors originate from the core
     # validator.  Legacy templater string errors are no longer appended.
     errs: list = []
@@ -629,7 +707,7 @@ async def build_why_decision_response(
 
     # Determine gateway version with environment override
     import os as _os
-    gw_version = _os.getenv("GATEWAY_VERSION", _GATEWAY_VERSION)
+    gw_version = os.getenv("GATEWAY_VERSION", _GATEWAY_VERSION)
 
     # Determine fallback_used: true if templater/stub used OR **fatal** validation issues
     # Fatal per spec: JSON parse/schema failure, supporting_ids ⊄ allowed_ids, missing mandatory IDs
@@ -641,24 +719,22 @@ async def build_why_decision_response(
         "anchor_missing_in_supporting_ids",
     }
     fatal_validation = any((e.get("code") in fatal_codes) for e in (validator_errs or []))
-    fallback_used = bool(llm_fallback or fatal_validation)
+    any_validation   = bool(validator_errs)
+    fallback_used = bool(llm_fallback or any_validation)
     # Log an explicit fallback reason for traceability
     try:
         if llm_fallback:
             log_stage(get_logger("builder"), "builder", "llm_fallback_used",
                       request_id=req_id, prompt_fp=prompt_fp, bundle_fp=bundle_fp)
-        elif fallback_used:
-            # validator set fallback (fatal)
-            codes = [e.get("code") for e in validator_errs or [] if e.get("code") in fatal_codes]
-            log_stage(get_logger("builder"), "builder", "validator_fallback",
-                      request_id=req_id, codes=codes)
-        else:
-            # no fallback – but we still log if non-fatal repairs happened for observability
-            if validator_errs:
+        elif any_validation:
+            if fatal_validation:
+                codes = [e.get("code") for e in validator_errs or [] if e.get("code") in fatal_codes]
+                log_stage(get_logger("builder"), "builder", "validator_fallback",
+                          request_id=req_id, codes=codes)
+            else:
                 non_fatal = [e.get("code") for e in validator_errs if e.get("code") not in fatal_codes]
-                if non_fatal:
-                    log_stage(get_logger("builder"), "builder", "validator_repaired_nonfatal",
-                              request_id=req_id, codes=non_fatal)
+                log_stage(get_logger("builder"), "builder", "validator_repaired_nonfatal",
+                          request_id=req_id, codes=non_fatal)
     except Exception:
         pass
 
@@ -667,40 +743,58 @@ async def build_why_decision_response(
     _prompt_id = envelope.get("prompt_id") or "unknown"
     fallback_reason_clean = fallback_reason if fallback_reason is not None else None
 
-    meta = {
-        "policy_id": _policy_id,
-        "prompt_id": _prompt_id,
-        "prompt_fingerprint": prompt_fp,
-        "bundle_fingerprint": bundle_fp,
-        # legacy compat
-        "bundle_size_bytes": len(orjson.dumps(ev.model_dump(mode="python"))),
-        # new token-aware fields for audit
-        "prompt_tokens": int(gate_plan.prompt_tokens),
-        "snapshot_etag": snapshot_etag_fp,
-        "fallback_used": fallback_used,
-        "fallback_reason": fallback_reason_clean,
-        "retries": int(retry_count),
-        "gateway_version": gw_version,
-        "selector_model_id": SELECTOR_MODEL_ID,
-        "latency_ms": int((time.perf_counter() - t0) * 1000),
-        "validator_errors": errs,
-        "evidence_metrics": sel_meta,
-        "load_shed": should_load_shed(),
-    }
-
+    # Clean and flatten evidence metrics; summarise validator errors via count.
+    cleaned_metrics: Dict[str, Any] = {}
     try:
-        ev_etag = getattr(ev, "snapshot_etag", None) or meta.get("snapshot_etag") or "unknown"
-        anchor_id = getattr(ev.anchor, "id", None) or "unknown"
-        log_stage(logger, "builder", "etag_propagated",
-                  anchor_id=anchor_id, snapshot_etag=ev_etag)
+        cleaned_metrics = dict(sel_meta or {})
+        for rm in ("prompt_tokens", "max_prompt_tokens", "bundle_size_bytes", "overhead_tokens", "prompt_tokens_overhead", "selector_model_id"):
+            cleaned_metrics.pop(rm, None)
     except Exception:
-        pass
+        cleaned_metrics = sel_meta or {}
 
-    # Add a helpful footnote when we fall back / retry
+    # Assemble canonical meta via the shared builder.  Wrap raw values into
+    # MetaInputs to forbid unexpected keys and normalise the fingerprint prefix.
+    meta_inputs = MetaInputs(
+        policy_id=_policy_id,
+        prompt_id=_prompt_id,
+        prompt_fingerprint=prompt_fp,
+        bundle_fingerprint=bundle_fp,
+        bundle_size_bytes=int(len(arte.get("evidence_post.json", b""))),
+        prompt_tokens=int(getattr(gate_plan, "prompt_tokens", 0)),
+        max_tokens=int(getattr(gate_plan, "max_tokens", 0)),
+        evidence_tokens=int(getattr(gate_plan, "evidence_tokens", 0)),
+        snapshot_etag=snapshot_etag_fp,
+        gateway_version=gw_version,
+        selector_model_id=SELECTOR_MODEL_ID,
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason_clean,
+        retries=int(retry_count),
+        latency_ms=int((time.perf_counter() - t0) * 1000),
+        validator_error_count=len(errs),
+        evidence_metrics=cleaned_metrics,
+        load_shed=should_load_shed(),
+        events_total=int(_events_total),
+        events_truncated=bool(_events_truncated_flag),
+    )
+
+    # Build the canonical MetaInfo once; idempotent by design.
+    meta_obj = build_meta(meta_inputs, request_id=req_id)
+
     try:
-        # Attach a rationale note when a fallback path was taken (LLM fallback or repairs)
-        if meta.get("fallback_used") and not getattr(ans, "rationale_note", None):
-            ans.rationale_note = "Templater fallback (LLM unavailable/failed)."
+        # Extract the snapshot etag from the evidence or fallback to the meta value.
+        ev_etag = (
+            getattr(ev, "snapshot_etag", None)
+            or getattr(meta_obj, "snapshot_etag", None)
+            or "unknown"
+        )
+        anchor_id = getattr(ev.anchor, "id", None) or "unknown"
+        log_stage(
+            logger,
+            "builder",
+            "etag_propagated",
+            anchor_id=anchor_id,
+            snapshot_etag=ev_etag,
+        )
     except Exception:
         pass
 
@@ -726,7 +820,7 @@ async def build_why_decision_response(
         evidence=ev,
         answer=ans,
         completeness_flags=flags,
-        meta=meta,
+        meta=meta_obj,
         bundle_url=bundle_url,
     )
     arte["response.json"]         = resp.model_dump_json().encode()

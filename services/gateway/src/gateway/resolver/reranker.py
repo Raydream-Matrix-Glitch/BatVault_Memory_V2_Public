@@ -2,6 +2,7 @@ from typing import Dict, List, Tuple
 import os
 from core_logging import get_logger, log_stage
 from shared.content import primary_text_and_field
+from core_config import get_settings
 
 try:
     from sentence_transformers import CrossEncoder
@@ -14,11 +15,8 @@ logger = get_logger('gateway')
 def _get_model():
     global _ce
     if _ce is None and CrossEncoder is not None:
-        # allow override via env (defaulting to the lightweight ms-marco model)
-        model_name = os.getenv(
-            "CROSS_ENCODER_MODEL",
-            "cross-encoder/ms-marco-MiniLM-L-6-v2"
-        )
+        # allow override via settings (defaulting to lightweight ms-marco model)
+        model_name = get_settings().cross_encoder_model
         _ce = CrossEncoder(model_name)
     return _ce
 

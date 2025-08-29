@@ -1,109 +1,50 @@
 """
 Intent router for the Gateway service (Milestone-4).
 
-When the client supplies a ``functions`` array, this module decides which
-Memory-API helper endpoints to call and returns metadata needed for
-structured logging.
-
-Current routing map
--------------------
-* ``search_similar``      →  POST  {MEMORY_API_BASE}/api/resolve/text
-* ``get_graph_neighbors`` →  POST  {MEMORY_API_BASE}/api/graph/expand_candidates
+Maps natural-language queries to Memory API function calls and
+returns lightweight metadata used for audit logs. The actual Memory
+API calls are performed later by the builder.
 """
-
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
 
-import httpx
-from core_observability.otel import inject_trace_context
+from core_logging import get_logger, log_stage
 
+logger = get_logger("gateway.intent_router")
 
-async def route_query(
-    question: str,
-    functions: List[Any] | None = None,
-) -> Dict[str, Any]:
-    """
-    Invoke Memory-API helpers requested via *functions* and return routing
-    metadata.
+SUPPORTED_FUNCS = {"search_similar", "get_graph_neighbors"}
 
-    Parameters
-    ----------
-    question:
-        The user’s natural-language question.
-    functions:
-        A list containing either plain strings (``"search_similar"``) or
-        function-manifest dictionaries with a ``"name"`` field.
-
-    Returns
-    -------
-    dict
-        A dictionary with the keys required by the structured-logging
-        contract: ``function_calls``, ``routing_confidence``,
-        ``routing_model_id``.
-    """
-    # Normalise input to a list of names
-    names: List[str] = []
+def _normalise_functions(functions: List[Any] | None) -> List[str]:
+    out: List[str] = []
     for f in functions or []:
-        if isinstance(f, str):
-            names.append(f)
-        elif isinstance(f, dict):
+        if isinstance(f, dict):
             name = f.get("name")
             if name:
-                names.append(name)
+                out.append(str(name))
+        else:
+            out.append(str(f))
+    return [f for f in out if f in SUPPORTED_FUNCS]
 
-    from core_config import get_settings
-    settings = get_settings()
-    base = os.getenv("MEMORY_API_BASE", settings.memory_api_url)
+async def route_query(question: str, functions: List[Any] | None = None) -> Dict[str, Any]:
+    """Very small rule-based router.
 
-    results: Dict[str, Any] = {}
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        # search_similar → Memory-API text resolver
-        if "search_similar" in names:
-            try:
-                # POST the query under the canonical `q` key per Memory‑API contract
-                # propagate trace context on every outbound call so the Memory‑API
-                # spans are children of this span; without headers the trace would split
-                resp = await client.post(
-                    f"{base}/api/resolve/text",
-                    json={"q": question},
-                    headers=inject_trace_context({}),
-                )
-                if resp.status_code == 200:
-                    results["search_similar"] = resp.json()
-            except Exception:
-                # Memory‑API search unavailable or timed out; skip this helper
-                pass
-            except httpx.HTTPError:
-                # timeout or connection error; skip this helper
-                results["search_similar"] = None
+    * Always proposes ``search_similar``; this is cheap and improves recall.
+    * If the caller explicitly allowed ``get_graph_neighbors``, include it.
+    * Returns structured logging fields expected by app.py.
+    """
+    allowed = set(_normalise_functions(functions))
+    calls: List[str] = ["search_similar"]
+    if "get_graph_neighbors" in allowed:
+        calls.append("get_graph_neighbors")
 
-        # get_graph_neighbors → Memory-API graph expand
-        if "get_graph_neighbors" in names:
-            # Default: raw question as node_id, override if args provided
-            payload: Dict[str, Any] = {"node_id": question}
-            for f in functions or []:
-                if isinstance(f, dict) and f.get("name") == "get_graph_neighbors":
-                    args = f.get("arguments") or {}
-                    if "node_id" in args:
-                        payload["node_id"] = args["node_id"]
-                    break
-            try:
-                resp = await client.post(
-                    f"{base}/api/graph/expand_candidates",
-                    json=payload,
-                    headers=inject_trace_context({}),
-                )
-                if resp.status_code == 200:
-                    results["get_graph_neighbors"] = resp.json()
-            except httpx.HTTPError:
-                # timeout or connection error; skip this helper
-                results["get_graph_neighbors"] = None
-
-    return {
-        "function_calls":      names,
-        "routing_confidence":  1.0 if names else 0.0,
-        "routing_model_id":    "router_stub_v1",
-        "results":             results,              # ← NEW
+    info: Dict[str, Any] = {
+        "function_calls": calls,
+        "routing_confidence": 0.75 if len(calls) == 2 else 0.6,
+        "routing_model_id": "rules_v1",
     }
+    try:
+        log_stage(logger, "intent_router", "route", question_len=len(question or ""), calls=calls)
+    except Exception:
+        pass
+    return info

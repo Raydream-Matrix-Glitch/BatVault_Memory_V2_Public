@@ -1,16 +1,17 @@
 # Imports
 from __future__ import annotations
 
-import asyncio, hashlib, inspect, random, httpx, os, concurrent.futures, json
-from contextlib import asynccontextmanager, contextmanager
+import asyncio, hashlib, random, os
+from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple
+from .metrics import counter as _ctr
 
-import httpx, redis
-from fastapi import HTTPException
-
+from gateway.redis import get_redis_pool
+from core_utils import jsonx
 from core_config import get_settings
 from core_config.constants import TIMEOUT_EXPAND_MS as _EXPAND_MS
 from core_logging import get_logger, trace_span
+from .http import fetch_json
 from core_models.models import (
     WhyDecisionAnchor,
     WhyDecisionEvidence,
@@ -25,8 +26,7 @@ settings        = get_settings()
 logger          = get_logger("gateway.evidence")
 logger.propagate = False
 
-_REDIS_GET_BUDGET_MS = int(os.getenv("REDIS_GET_BUDGET_MS", "100"))   # ≤100 ms fail-open
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+_REDIS_GET_BUDGET_MS = int(get_settings().redis_get_budget_ms)        # ≤100 ms fail-open
 
 CACHE_TTL_SEC   = 900          # 15 min
 ALIAS_TPL       = "evidence:{anchor_id}:latest"
@@ -40,6 +40,12 @@ __all__ = [
     "_collect_allowed_ids",
 ]
 
+def _normalise_event_amount(ev: dict) -> None:
+    """Back-compat wrapper: delegate to shared normalizer."""
+    from shared.normalize import normalise_event_amount as _n
+    _n(ev)
+
+
 @trace_span("resolve")
 async def resolve_anchor(decision_ref: str, *, intent: str | None = None):
     await asyncio.sleep(0)
@@ -47,20 +53,13 @@ async def resolve_anchor(decision_ref: str, *, intent: str | None = None):
 
 async def expand_graph(decision_id: str, *, intent: str | None = None, k: int = 1):
     settings = get_settings()
-    payload  = {"node_id": decision_id, "k": k}
-    timeout_s = 0.25
-    # Use the same resilient client used elsewhere so tests can monkeypatch.
-    async with _safe_async_client(timeout=timeout_s, base_url=settings.memory_api_url) as client:
-        try:
-            resp = await client.post("/api/graph/expand_candidates", json=payload)
-            # tolerate stubs without raise_for_status
-            if hasattr(resp, "raise_for_status"):
-                resp.raise_for_status()
-            return resp.json() or {}
-        except Exception as exc:
-            logger.warning("expand_candidates_failed",
-                           extra={"anchor_id": decision_id, "error": type(exc).__name__})
-            return {"neighbors": [], "meta": {}}
+    payload = {"node_id": decision_id, "k": k}
+    try:
+        data = await fetch_json("POST", f"{settings.memory_api_url}/api/graph/expand_candidates", json=payload, stage="expand")
+        return data or {"neighbors": [], "meta": {}}
+    except Exception as exc:
+        logger.warning("expand_candidates_failed", extra={"anchor_id": decision_id, "error": type(exc).__name__})
+        return {"neighbors": [], "meta": {}}
 
 
 # Helper functions
@@ -179,66 +178,6 @@ if not hasattr(trace_span, "ctx"):
             def end(self): ...
         yield _Span()
     trace_span.ctx = _noop_ctx            # type: ignore[attr-defined]
-_shared_fallback_client: httpx.AsyncClient | None = None
-
-def _inject_trace_context(headers: dict[str, str] | None = None) -> dict[str, str]:
-    h = dict(headers or {})
-    try:
-        from opentelemetry.propagate import inject  # type: ignore
-        inject(h)
-    except Exception:
-        pass
-    return h
-
-@asynccontextmanager
-async def _safe_async_client(**kw):
-    """
-    Return an ``httpx.AsyncClient`` that never explodes when the library is
-    monkey‑patched by the unit‑tests.  Pass ``_fresh=True`` to request a
-    brand‑new stub instance.  In fallback mode without ``_fresh`` the
-    helper reuses a shared client so that internal counters (used by
-    tests to verify call ordering) persist across EvidenceBuilder invocations.
-    """
-    fresh = kw.pop("_fresh", False)
-    clean_kwargs: dict[str, Any] = {k: v for k, v in kw.items() if not k.startswith("_")}
-
-    client: httpx.AsyncClient
-    managed: bool
-    try:
-        client = httpx.AsyncClient(**clean_kwargs)
-        managed = hasattr(client, "__aenter__")
-    except TypeError:
-        global _shared_fallback_client
-        AC = httpx.AsyncClient
-        if fresh or _shared_fallback_client is None:
-            try:
-                _shared_fallback_client = AC()
-            except Exception:
-                _shared_fallback_client = AC()
-        client = _shared_fallback_client  # type: ignore[assignment]
-        managed = False
-    try:
-        if managed and hasattr(client, "__aenter__"):
-            async with client as real_client:
-                # Ensure every outbound request carries W3C trace headers
-                try:
-                    real_client.headers = _inject_trace_context(getattr(real_client, "headers", {}) or {})  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                yield real_client
-        else:
-            yield client
-    finally:
-        if managed:
-            pass
-        else:
-            if fresh:
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-                if client is _shared_fallback_client:
-                    _shared_fallback_client = None
 
 
 # EvidenceBuilder class
@@ -251,30 +190,39 @@ class EvidenceBuilder:
         evidence:sha256(<decision,intent,…>)  → bundled JSON
     """
 
-    def __init__(self, *, redis_client: Optional[redis.Redis] = None):
+    def __init__(self, *, redis_client: Optional[Any] = None):
+        """
+        Initialise the EvidenceBuilder.
+
+        Parameters
+        ----------
+        redis_client: Optional[Any], optional
+            A Redis client to use for caching.  If not provided, the
+            shared asynchronous Redis pool is obtained via
+            :func:`gateway.redis.get_redis_pool`.  Both asynchronous
+            and synchronous clients are supported for backward
+            compatibility.
+        """
         if redis_client is not None:
             self._redis = redis_client
         else:
             try:
-                self._redis = redis.Redis.from_url(settings.redis_url)
+                # Use the shared async Redis pool by default; this will
+                # return a redis.asyncio.Redis instance.  Fall back to
+                # ``None`` on failure to ensure cache is bypassed.
+                self._redis = get_redis_pool()
             except Exception:
                 self._redis = None
-        global _shared_fallback_client
-        _shared_fallback_client = None
 
     async def _safe_get(self, key: str):
         """
-        Wrapper around ``redis.get`` that enforces the 100 ms budget and
-        degrades gracefully when Redis or DNS is down.
-        """
+        Async wrapper around ``redis.get`` that enforces the 100 ms budget and
+        degrades gracefully when Redis or DNS is down. On any exception the
+        internal Redis client reference is cleared to fail open."""
         if not self._redis:
             return None
-        loop = asyncio.get_running_loop()
         try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(_EXECUTOR, self._redis.get, key),
-                timeout=_REDIS_GET_BUDGET_MS / 1000,
-            )
+            return await asyncio.wait_for(self._redis.get(key), timeout=_REDIS_GET_BUDGET_MS / 1000)
         except Exception:
             self._redis = None
             return None
@@ -315,7 +263,7 @@ class EvidenceBuilder:
                     except Exception:
                         raw_str = cached_raw
                     try:
-                        parsed = json.loads(raw_str)
+                        parsed = jsonx.loads(raw_str)
                     except Exception:
                         parsed = None
                     if isinstance(parsed, dict) and "_snapshot_etag" in parsed and "data" in parsed:
@@ -487,7 +435,6 @@ class EvidenceBuilder:
                             extra={"anchor_id": anchor_id, "error": "fetch_failed"}
                         )
                         try:
-                            from core_metrics import counter as _ctr
                             _ctr("gateway_anchor_enrich_fail_total", 1)
                         except Exception:
                             pass
@@ -658,6 +605,40 @@ class EvidenceBuilder:
                 deduped_events.append(ev)
             events = deduped_events
 
+            # Milestone‑5: further deduplicate near‑identical events by day and description.
+            try:
+                import re as _re
+                grouped_keys: set[tuple] = set()
+                unique_events: list[dict] = []
+                for ev in events:
+                    try:
+                        ts = ev.get("timestamp") or ""
+                        date_part = ts.split("T")[0] if isinstance(ts, str) else str(ts)[:10]
+                        summary = ev.get("summary") or ev.get("description") or ""
+                        if not isinstance(summary, str):
+                            summary = str(summary)
+                        key_text = _re.sub(r"[\d\$¥€£,\.\s]+", "", summary).lower()
+                        dedup_key = (date_part, key_text)
+                    except Exception:
+                        dedup_key = (ev.get("timestamp"), ev.get("id"))
+                    if dedup_key in grouped_keys:
+                        continue
+                    grouped_keys.add(dedup_key)
+                    unique_events.append(ev)
+                events = unique_events
+            except Exception:
+                pass
+
+            # After deduplication, normalise monetary amounts on each event.
+            try:
+                for _ev in events:
+                    try:
+                        _normalise_event_amount(_ev)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
         def _dedup_transitions(items: list[dict]) -> list[dict]:
             seen: set[str] = set()
             result: list[dict] = []
@@ -674,6 +655,12 @@ class EvidenceBuilder:
             pre = _dedup_transitions(pre)
         if suc:
             suc = _dedup_transitions(suc)
+
+        # Omit empty transition arrays from the final evidence (Pydantic excludes None).
+        if not pre:
+            pre = None
+        if not suc:
+            suc = None
 
         if events:
             with trace_span.ctx("enrich", anchor_id=anchor_id):
@@ -869,6 +856,43 @@ class EvidenceBuilder:
         pre = trans_pre_list
         suc = trans_suc_list
 
+        # ── Enrich first succeeding transition with titles (to_title/from_title) ──
+        try:
+            if suc:
+                _first = suc[0]
+                # from_title: mirror the anchor's human label when available
+                try:
+                    _from_title = anchor_json.get("title") or anchor_json.get("option")
+                    if _from_title and not _first.get("from_title"):
+                        _first["from_title"] = _from_title
+                except Exception:
+                    pass
+                # to_title: fetch decision doc if missing
+                _to_id = _first.get("to") or _first.get("to_id")
+                needs_title = not _first.get("to_title")
+                if isinstance(_to_id, str) and _to_id and needs_title:
+                    try:
+                        async with _safe_async_client(
+                            base_url=settings.memory_api_url,
+                            timeout=settings.timeout_enrich_ms / 1000.0,
+                        ) as _dec_client:
+                            dresp = await _dec_client.get(f"/api/enrich/decision/{_to_id}")
+                            if hasattr(dresp, "raise_for_status"):
+                                dresp.raise_for_status()
+                            ddoc = dresp.json() or {}
+                            _to_title = ddoc.get("title") or ddoc.get("option")
+                            if _to_title:
+                                _first["to_title"] = _to_title
+                    except Exception:
+                        # best-effort; omit if enrichment fails
+                        try:
+                            logger.info("transition_title_enrich_failed", extra={"transition_id": _first.get("id"), "to": _to_id})
+                        except Exception:
+                            pass
+        except Exception:
+            # Best-effort enrichment — never fail the build pipeline on title lookup
+            pass
+
         if anchor_trans_ids:
             logger.info("transitions_classified",
                         extra={"anchor_id": anchor_id,
@@ -958,14 +982,10 @@ class EvidenceBuilder:
                     "_snapshot_etag": ev.snapshot_etag or "unknown",
                     "data": payload,
                 }
-                serialized = json.dumps(cache_val, separators=(",", ":"))
-                try:
-                    pipe = self._redis.pipeline()
-                    pipe.setex(composite_key, ttl, ev.model_dump_json())
-                    pipe.setex(alias_key, ttl, serialized)
-                    pipe.execute()
-                except AttributeError:
-                    self._redis.setex(alias_key, ttl, serialized)
+                serialized = jsonx.dumps(cache_val)
+                # Async-only writes; no executor or sync fallbacks
+                await self._redis.setex(composite_key, ttl, ev.model_dump_json())
+                await self._redis.setex(alias_key, ttl, serialized)
             except Exception:
                 logger.warning("redis write error", exc_info=True)
                 self._redis = None

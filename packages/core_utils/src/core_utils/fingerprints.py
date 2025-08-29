@@ -42,3 +42,15 @@ def parse_fingerprint(value: str) -> tuple[str, str]:
     if isinstance(value, str) and value.startswith("sha256:"):
         return ("sha256", value.split(":", 1)[1])
     return ("sha256", value)
+
+def sha256_hex(data: bytes) -> str:
+    """Return *hex* SHA-256 digest for given bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+def ensure_sha256_prefix(value: str) -> str:
+    """Ensure the fingerprint string has the ``sha256:`` prefix without recomputation.
+    If *value* already starts with the prefix, return unchanged; otherwise prepend it.
+    """
+    if isinstance(value, str) and value.startswith("sha256:"):
+        return value
+    return "sha256:" + value

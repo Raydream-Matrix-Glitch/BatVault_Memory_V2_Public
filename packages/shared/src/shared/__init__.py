@@ -49,3 +49,7 @@ __all__ += ["estimate_text_tokens", "estimate_messages_tokens"]
 # prompt budgeting
 from .prompt_budget import plan_budget, gate_budget
 __all__ += ["plan_budget", "gate_budget"]
+
+# meta builder
+from .meta_builder import build_meta
+__all__ += ["build_meta"]

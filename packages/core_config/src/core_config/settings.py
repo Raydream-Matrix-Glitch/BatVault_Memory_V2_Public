@@ -93,6 +93,40 @@ class Settings(BaseSettings):
     timeout_search_ms: int = Field(default=TIMEOUT_SEARCH_MS,  alias="TIMEOUT_SEARCH_MS")
     timeout_expand_ms: int = Field(default=TIMEOUT_EXPAND_MS,  alias="TIMEOUT_EXPAND_MS")
     timeout_enrich_ms: int = Field(default=TIMEOUT_ENRICH_MS,  alias="TIMEOUT_ENRICH_MS")
+    # Canary & LLM routing
+    canary_header_override: str = Field(default="", alias="CANARY_HEADER_OVERRIDE")
+    canary_pct: int = Field(default=0, alias="CANARY_PCT")
+    canary_enabled: bool = Field(default=True, alias="CANARY_ENABLED")
+    canary_model_endpoint: str = Field(default="http://tgi-canary:8090", alias="CANARY_MODEL_ENDPOINT")
+    control_model_endpoint: str = Field(default="http://vllm-control:8010", alias="CONTROL_MODEL_ENDPOINT")
+    llm_temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE")
+    llm_max_tokens: int = Field(default=512, alias="LLM_MAX_TOKENS")
+    vllm_gpu_util: str | None = Field(default=None, alias="VLLM_GPU_UTIL")
+    vllm_max_model_len: str | None = Field(default=None, alias="VLLM_MAX_MODEL_LEN")
+    vllm_max_num_seqs: str | None = Field(default=None, alias="VLLM_MAX_NUM_SEQS")
+    vllm_max_batched_tokens: str | None = Field(default=None, alias="VLLM_MAX_BATCHED_TOKENS")
+    # HTTP client pool
+    http_max_keepalive: int = Field(default=20, alias="HTTP_MAX_KEEPALIVE")
+    http_max_connections: int = Field(default=100, alias="HTTP_MAX_CONNECTIONS")
+    http_keepalive_expiry: float = Field(default=30.0, alias="HTTP_KEEPALIVE_EXPIRY")
+    http_connect_timeout: float = Field(default=5.0, alias="HTTP_CONNECT_TIMEOUT")
+    http_read_timeout: float = Field(default=10.0, alias="HTTP_READ_TIMEOUT")
+    http_write_timeout: float = Field(default=10.0, alias="HTTP_WRITE_TIMEOUT")
+    http_pool_timeout: float = Field(default=5.0, alias="HTTP_POOL_TIMEOUT")
+
+    # Misc feature flags / compatibility
+    cite_all_ids: bool = Field(default=False, alias="CITE_ALL_IDS")
+    openai_disabled: bool = Field(default=False, alias="OPENAI_DISABLED")
+
+    # Load-shed / Redis budgets
+    redis_get_budget_ms: int = Field(default=100, alias="REDIS_GET_BUDGET_MS")
+
+    # Policy registry
+    policy_registry_path: str | None = Field(default=None, alias="POLICY_REGISTRY_PATH")
+
+    # LLM metadata / adapters
+    vllm_model_name: str | None = Field(default=None, alias="VLLM_MODEL_NAME")
+    cross_encoder_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2", alias="CROSS_ENCODER_MODEL")
 
 def get_settings() -> "Settings":
     return Settings()  # type: ignore

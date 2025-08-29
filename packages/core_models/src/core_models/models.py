@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 from core_utils import slugify_tag
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 import re
 
 
@@ -11,7 +11,43 @@ class WhyDecisionAnchor(BaseModel):
     timestamp: Optional[str] = None
     decision_maker: Optional[str] = None
     supported_by: Optional[List[str]] = None
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='forbid')
+
+class MetaInfo(BaseModel):
+    """
+    Canonical, JSON-first meta block (single source of truth).
+    Exactly one occurrence per field; validated before serialization.
+    """
+    policy_id: str
+    prompt_id: str
+    prompt_fingerprint: str  # "sha256:<hex>"
+    bundle_fingerprint: str
+    bundle_size_bytes: int
+    prompt_tokens: int
+    evidence_tokens: int
+    max_tokens: int
+    snapshot_etag: str
+    fallback_used: bool
+    fallback_reason: Optional[str] = None  # e.g., "llm_off", "parse_error", "style_violation"
+    retries: int
+    gateway_version: str
+    selector_model_id: Optional[str] = None
+    latency_ms: int
+    validator_error_count: int
+    evidence_metrics: Dict[str, Any] = Field(default_factory=dict)  # {step, selector_truncation, total_neighbors_found, final_evidence_count, dropped_evidence_ids}
+    load_shed: bool = False
+    # Event result shaping
+    events_total: Optional[int] = None
+    events_truncated: Optional[bool] = None
+
+    # Path taken by the resolver when hydrating the anchor.  This field is
+    # populated by the Gateway app for diagnostic purposes and may be
+    # omitted from responses when not applicable.  It is defined on the
+    # canonical MetaInfo model to permit dynamic assignment without
+    # violating the "extra=forbid" constraint.
+    resolver_path: Optional[str] = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class WhyDecisionTransitions(BaseModel):
@@ -26,7 +62,7 @@ class WhyDecisionTransitions(BaseModel):
 
     # Exclude ``None`` fields from the serialized representation.  This ensures
     # that absent transition lists do not appear as ``null`` in API responses.
-    model_config = ConfigDict(extra='allow', exclude_none=True)
+    model_config = ConfigDict(extra='forbid', exclude_none=True)
 
 
 class WhyDecisionEvidence(BaseModel):
@@ -43,17 +79,19 @@ class WhyDecisionEvidence(BaseModel):
             "Used exclusively for cache-key generation and freshness checks."
         ),
     )
+    # Forbid unknown fields on the public response envelope
+    model_config = ConfigDict(extra='forbid')
 
 class WhyDecisionAnswer(BaseModel):
     short_answer: str
     supporting_ids: List[str]
-    rationale_note: Optional[str] = None
-
+    model_config = ConfigDict(extra='forbid')
 
 class CompletenessFlags(BaseModel):
     has_preceding: bool = False
     has_succeeding: bool = False
     event_count: int = 0
+    model_config = ConfigDict(extra='forbid')
 
 # --------------------------------------------------------------------------- #
 #  EventModel – minimal milestone-3 schema (spec §S1/S3, tag rules spec §S3)  #
@@ -106,8 +144,9 @@ class WhyDecisionResponse(BaseModel):
     evidence: WhyDecisionEvidence
     answer: WhyDecisionAnswer
     completeness_flags: CompletenessFlags
-    meta: Dict[str, Any]
+    meta: MetaInfo
     bundle_url: Optional[str] = None
+    model_config = ConfigDict(extra='forbid')
 
 class PromptEnvelope(BaseModel):
     """
@@ -120,6 +159,7 @@ class PromptEnvelope(BaseModel):
     evidence: Dict[str, Any]
     allowed_ids: List[str]
     constraints: Dict[str, Any]
+    model_config = ConfigDict(extra='forbid')
 
 class GatePlan(BaseModel):
     messages: List[Dict[str, str]]
@@ -131,3 +171,4 @@ class GatePlan(BaseModel):
     shrinks: List[int] = Field(default_factory=list)
     fingerprints: Dict[str, str] | None = None
     logs: List[Dict[str, Any]] = Field(default_factory=list)
+    model_config = ConfigDict(extra='forbid')

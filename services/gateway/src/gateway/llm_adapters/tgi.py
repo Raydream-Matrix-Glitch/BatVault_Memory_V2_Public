@@ -1,115 +1,50 @@
 """
 Adapter for Text Generation Inference (TGI) endpoints.
-
-TGI exposes a ``/generate`` endpoint which accepts an input string and
-generation parameters.  This adapter constructs a JSON-mode prompt,
-calls the API synchronously and extracts the generated_text.  It
-strips any Markdown code fences and validates that the result parses as
-JSON before returning.
+Minimal by design: prompt construction lives in `gateway.prompt_messages`.
 """
-
 from __future__ import annotations
 
-import json
-import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 
-import httpx
-import orjson
+from ..prompt_messages import build_messages
+from ..http import fetch_json
 
-from core_logging import trace_span
+def _as_prompt(envelope: Dict[str, Any]) -> str:
+    """TGI /generate accepts a single string prompt; join chat messages plainly."""
+    msgs: List[Dict[str, str]] = build_messages(envelope)
+    parts = []
+    for m in msgs:
+        role = m.get("role") or "user"
+        parts.append(f"{role}:\n{m.get('content','')}")
+    return "\n\n".join(parts)
 
-
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\\s*(.*?)```", re.DOTALL)
-
-def _inject_trace_context(headers: dict | None = None) -> dict:
-    h = dict(headers or {})
-    try:
-        from opentelemetry.propagate import inject  # type: ignore
-        inject(h)
-    except Exception:
-        pass
-    return h
-
-def _extract_json(text: str) -> str:
-    """Strip surrounding code fences if present and return the inner text."""
-    m = _JSON_FENCE_RE.search(text)
-    if m:
-        return m.group(1).strip()
-    return text.strip()
-
-
-def generate(
+async def generate_async(
     endpoint: str,
     envelope: Dict[str, Any],
     *,
     temperature: float = 0.0,
     max_tokens: int = 512,
-    messages: list[dict] | None = None,
 ) -> str:
-    """
-    Generate a summary via a TGI endpoint.
-
-    Parameters
-    ----------
-    endpoint: str
-        Base URL of the TGI service (e.g. "http://tgi-canary:8080").
-    envelope: dict
-        Prompt envelope.  Serialised to JSON and embedded in a structured
-        system/user preface to coax a JSON-only response.
-    temperature: float
-        Sampling temperature.
-    max_tokens: int
-        Maximum new tokens to generate.
-
-    Returns
-    -------
-    str
-        Raw JSON string from the model.
-    """
+    """Call TGI /generate and return `generated_text` (fences stripped). Stage timeout: llm."""
     url = endpoint.rstrip("/") + "/generate"
-    # Compose a prompt that instructs the model to return only JSON.
-    # TGI does not currently support the OpenAI response_format API.  We
-    # prepend a system-like instruction before the JSON envelope.
-    prompt = (
-        "You are a JSON-only assistant.  Return a JSON object with keys "
-        "short_answer (string) and supporting_ids (array of strings).\\n"
-        f"Prompt envelope:\\n{orjson.dumps(envelope).decode()}"
-    )
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "return_full_text": False,
-        },
+        "inputs": _as_prompt(envelope),
+        "parameters": {"temperature": float(temperature), "max_new_tokens": int(max_tokens)},
     }
-    with httpx.Client(timeout=30.0) as client:
-        # Record a span for the HTTP call to the TGI endpoint.  Capture key
-        # attributes from the payload rather than referencing an undefined
-        # variable.  Use the prepared parameters dictionary so that
-        # temperature and token limits are correctly attached to the span.
-        with trace_span("gateway.llm.http", stage="llm") as sp:
-            try:
-                sp.set_attribute("endpoint", url)
-                params = payload.get("parameters", {})
-                if isinstance(params, dict):
-                    temp_val = params.get("temperature")
-                    max_new = params.get("max_new_tokens")
-                    if temp_val is not None:
-                        sp.set_attribute("temperature", float(temp_val))
-                    if max_new is not None:
-                        sp.set_attribute("max_tokens", int(max_new))
-            except Exception:
-                pass
-            resp = client.post(url, json=payload, headers=_inject_trace_context({}))
-        resp.raise_for_status()
-        data = resp.json()
-        try:
-            raw_text = data["generated_text"]
-        except Exception:
-            raise ValueError("Unexpected TGI response schema")
-        raw = _extract_json(raw_text)
-        # Validate parse
-        json.loads(raw)
-        return raw
+    # Use the unified fetch_json helper for consistent OTEL propagation,
+    # retries and stage‑based timeouts.  TGI returns either a list of
+    # completion objects or a dict with ``generated_text``.  Fallback to
+    # stringification if the shape is unexpected.
+    data = await fetch_json("POST", url, json=payload, stage="llm")
+    text = ""
+    if isinstance(data, list) and data:
+        text = str((data[0] or {}).get("generated_text") or "")
+    elif isinstance(data, dict):
+        text = str(data.get("generated_text") or "")
+    else:
+        text = str(data)
+    # Strip surrounding Markdown code fences if present to return raw text.
+    stripped = text.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        return stripped.strip("`").strip()
+    return text

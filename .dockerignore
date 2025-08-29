@@ -1,0 +1,10 @@
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
+**/venv/
+**/node_modules/
+services/*/build/
+build/
+dist/
+*.egg-info/
+docker-data/

@@ -22,7 +22,7 @@ Optionally, set `include_event=True` to add named events:
 
 from __future__ import annotations
 
-import json
+from core_utils import jsonx
 from typing import Generator
 
 
@@ -61,7 +61,7 @@ def stream_chunks(
             yield "event: short_answer\n"
 
         # Each SSE record ends with a blank line (double LF).
-        yield f"data: {json.dumps({'token': chunk})}\n\n"
+        yield f"data: {jsonx.dumps({'token': chunk})}\\n\\n"
 
     # Stream completion
     if include_event:

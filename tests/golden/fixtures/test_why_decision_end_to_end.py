@@ -7,7 +7,18 @@ from gateway.app import app
 
 def _assert_event_shape(evt: dict) -> None:
     """Assert that the event dict contains only whitelisted keys and normalised tags."""
-    allowed = {"id", "summary", "timestamp", "tags", "snippet", "x-extra", "led_to"}
+    # Milestone‑5: allow extra normalisation fields on events
+    allowed = {
+        "id",
+        "summary",
+        "timestamp",
+        "tags",
+        "snippet",
+        "x-extra",
+        "led_to",
+        "normalized_amount",
+        "currency",
+    }
     assert set(evt.keys()).issubset(allowed)
     # ensure tags are lower‑case underscores
     for t in evt.get("tags", []):
@@ -103,10 +114,10 @@ def test_why_decision_panasonic_plasma_end_to_end(monkeypatch, cite_all):
             assert t == t.lower()
             assert "-" not in t
 
-    # 5. Validator errors should be empty for this healthy case
+    # 5. Validator errors should be empty for this healthy case.  The meta now
+    # exposes only the count of validation errors.
     meta = body.get("meta") or {}
-    v_errs = meta.get("validator_errors") or []
-    assert not v_errs, f"unexpected validator errors: {v_errs}"
+    assert meta.get("validator_error_count") == 0
 
 
 @pytest.mark.parametrize("cite_all", [True, False])
@@ -161,6 +172,6 @@ def test_why_decision_minimal_end_to_end(monkeypatch, cite_all):
         assert t == t.lower()
         assert "-" not in t
     # Validator errors should be empty
-    v_errs = body.get("meta", {}).get("validator_errors") or []
-    assert not v_errs, f"unexpected validator errors: {v_errs}"
+    meta = body.get("meta", {})
+    assert meta.get("validator_error_count") == 0
 

@@ -6,7 +6,7 @@ from typing import List, Optional
 import importlib.metadata as _md
 
 # Third-party
-import httpx as _httpx_real, orjson, redis
+import httpx as _httpx_real, orjson
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -20,7 +20,7 @@ from core_config.constants import (
 )
 from core_logging import get_logger, log_stage, trace_span
 from core_observability.otel import init_tracing, instrument_fastapi_app
-from core_metrics import (
+from .metrics import (
     counter as metric_counter,
     histogram as metric_histogram,
     gauge   as metric_gauge,
@@ -37,9 +37,11 @@ from core_validator import validate_response
 # Import the public canonical helper rather than the private underscore version.
 from core_validator import canonical_allowed_ids
 
-from . import evidence, prom_metrics
-from .evidence import EvidenceBuilder, _safe_async_client
-from .load_shed import should_load_shed
+from . import evidence
+from .evidence import EvidenceBuilder
+from .schema_cache import fetch_schema
+from .http import fetch_json
+from .load_shed import should_load_shed, start_background_refresh, stop_background_refresh
 from .match_snippet import build_match_snippet
 from .builder import build_why_decision_response
 from .builder import BUNDLE_CACHE
@@ -63,18 +65,13 @@ _EXPAND_MS      = TIMEOUT_EXPAND_MS
 # ---- Application & router --------------------------------------------------
 app    = FastAPI(title="BatVault Gateway", version="0.1.0")
 router = APIRouter(prefix="/v2")
-instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'gateway')
+instrument_fastapi_app(app, service_name='gateway')
 
 # ---- Evidence builder & caches --------------------------------------------
 _evidence_builder = EvidenceBuilder()
 
-try:
-    _schema_cache = redis.Redis.from_url(settings.redis_url, decode_responses=True)
-except Exception:
-    _schema_cache = None   # cache-less fallback
-
 # ---- Tracing init (kept as-is) --------------------------------------------
-init_tracing(os.getenv("OTEL_SERVICE_NAME") or "gateway")
+init_tracing("gateway")
 
 # ---- Proxy helpers (router / resolver) ------------------------------------
 async def route_query(*args, **kwargs):  # pragma: no cover - proxy
@@ -214,13 +211,34 @@ async def request_logging_middleware(request: Request, call_next):
 # ---- Exception handlers ----------------------------------------------------
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    body = await request.body()
-    logger.warning("request_validation_error",
-                   extra={"service":"gateway","stage":"validation","errors":exc.errors(),
-                          "url":str(request.url),"method":request.method})
+    # Structured, JSON-first error envelope aligned with API
+    try:
+        body = await request.body()
+    except Exception:
+        body = b""
+    req_id = generate_request_id()
+    logger.warning(
+        "request_validation_error",
+        extra={
+            "service": "gateway",
+            "stage": "validation",
+            "errors": exc.errors(),
+            "url": str(request.url),
+            "method": request.method,
+            "request_id": req_id,
+        },
+    )
     return JSONResponse(
-        content={"title": ["title", "option"]},
-        headers={"x-snapshot-etag": "dummy-etag"},
+        status_code=422,
+        content={
+            "error": {
+                "code": "VALIDATION_FAILED",
+                "message": "Request validation failed",
+                "details": {"errors": exc.errors()},
+            },
+            "request_id": req_id,
+        },
+        headers={},  # snapshot_etag is not meaningful here
     )
 
 # ---- Ops & metrics endpoints ----------------------------------------------
@@ -253,37 +271,28 @@ attach_health_routes(
 # ---- Schema mirror ---------------------------------------------------------
 @router.get("/schema/{kind}")
 @app.get("/schema/{kind}")          # temporary back-compat
-async def schema_mirror(kind: str):
+async def schema_mirror(kind: str, request: Request):
     if kind not in ("fields", "rels"):
         raise HTTPException(status_code=404, detail="unknown schema kind")
 
-    key = f"schema:{kind}"
-    if _schema_cache and (cached := _schema_cache.get(key)):
-        data, etag = orjson.loads(cached)
-        return JSONResponse(content=data,
-                            headers={"x-snapshot-etag": etag} if etag else {})
-
+    path = f"/api/schema/{'fields' if kind=='fields' else 'rels'}"
+    data, etag = await fetch_schema(path)
+    headers = {"x-snapshot-etag": etag} if etag else {}
+    # Deprecation header on legacy alias (non-/v2/ path)
+    if request.url.path.startswith("/schema/"):
+        headers["Deprecation"] = "true"
     try:
-        async with _safe_async_client(timeout=5, base_url=settings.memory_api_url) as c:
-            upstream = await c.get(f"/api/schema/{kind}")
-        if hasattr(upstream, "raise_for_status"):
-            upstream.raise_for_status()
-        elif getattr(upstream, "status_code", 500) >= 400:
-            raise HTTPException(
-                status_code=int(getattr(upstream, "status_code", 500)),
-                detail="upstream error",
-            )
-    except Exception:  # degraded fallback
-        return JSONResponse(
-            content={"title": ["title", "option"]},
-            headers={"x-snapshot-etag": "test-etag"},
-        )
-
-    data, etag = upstream.json(), upstream.headers.get("x-snapshot-etag", "")
-    if _schema_cache:
-        _schema_cache.setex(key, _SCHEMA_TTL_SEC, orjson.dumps((data, etag)))
-    return JSONResponse(content=data,
-                        headers={"x-snapshot-etag": etag} if etag else {})
+        if not str(request.url.path).startswith("/v2/"):
+            headers["Deprecation"] = "true"
+            headers["Sunset"] = "2025-12-31"
+            try:
+                # strategic structured log, reusing existing logger
+                log_stage(logger, "schema", "alias_deprecated", request_id=None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return JSONResponse(content=data, headers=headers)
 
 # ---- Streaming helper ------------------------------------------------------
 def _traced_stream(text: str, include_event: bool = False):
@@ -293,6 +302,11 @@ def _traced_stream(text: str, include_event: bool = False):
 
 # ---- API models ------------------------------------------------------------
 class AskIn(BaseModel):
+    # Enforce strict JSON‑first input by forbidding unknown fields and
+    # allowing population by alias names.  A single ConfigDict is defined
+    # here rather than later to avoid silently overriding the model
+    # configuration.  See prompts P1/P2 for rationale.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
     intent: str = Field(default="why_decision")
     anchor_id: str | None = Field(
         default=None,
@@ -305,8 +319,6 @@ class AskIn(BaseModel):
     policy_id: Optional[str] = None
     prompt_id: Optional[str] = None
     request_id: Optional[str] = None
-
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -328,6 +340,7 @@ class AskIn(BaseModel):
         return self
 
 class QueryIn(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
     text: str | None = Field(default=None, alias="text")
     q: str | None = Field(default=None, alias="q")
     functions: list[str | dict] | None = None
@@ -351,7 +364,15 @@ async def ask(
         if gw_mod is not None and hasattr(gw_mod, "should_load_shed"):
             fn = getattr(gw_mod, "should_load_shed")
             if callable(fn):
-                resp.meta["load_shed"] = bool(fn())
+                # Assign load_shed on the MetaInfo via attribute to avoid index errors.
+                try:
+                    resp.meta.load_shed = bool(fn())
+                except Exception:
+                    # Fall back to dict-style assignment for resilience.
+                    try:
+                        resp.meta["load_shed"] = bool(fn())
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -380,7 +401,7 @@ async def ask(
         except Exception:
             pass
         try:
-            from gateway.llm_router import last_call as _last_llm_call  # type: ignore
+            from gateway.inference_router import last_call as _last_llm_call
             mdl = _last_llm_call.get("model")
             can = _last_llm_call.get("canary")
             if mdl:
@@ -394,8 +415,23 @@ async def ask(
             media_type="text/event-stream",
             headers=headers,
         )
-
-    return JSONResponse(content=resp.model_dump(mode="python"))
+    headers = {"x-request-id": req_id}
+    try:
+        etag = resp.meta.get("snapshot_etag")
+        if etag:
+            headers["x-snapshot-etag"] = etag
+    except Exception:
+        pass
+    try:
+        from gateway.inference_router import last_call as _last_llm_call
+        mdl = _last_llm_call.get("model"); can = _last_llm_call.get("canary")
+        if mdl:
+            headers["x-model"] = str(mdl)
+        if can is not None:
+            headers["x-canary"] = "true" if can else "false"
+    except Exception:
+        pass
+    return JSONResponse(content=resp.model_dump(mode="python"), headers=headers)
 
 # ---- /v2/query -------------------------------------------------------------
 @router.post("/query")
@@ -631,19 +667,26 @@ async def v2_query(
         ask_payload, _evidence_builder
     )
 
-    # Surface resolver path and rationale provenance in the response.
+    # Surface resolver path in the response meta for debugging.  When the
+    # resolver falls back to BM25 and the anchor carries a rationale the
+    # rationale is now incorporated into the deterministic short answer by
+    # the templater.  To avoid leaking implementation details the legacy
+    # ``rationale_note`` field is no longer populated (Milestone‑5 §A9).
+    # Assign to the canonical meta model via attribute assignment.  The
+    # MetaInfo model defines ``resolver_path`` as an optional field, so
+    # setting it directly will not violate the ``extra=forbid`` constraint.
     try:
         if resolver_path:
-            resp.meta["resolver_path"] = resolver_path
-        if resolver_path == "bm25":
-            # If fallback was BM25 and we have an anchor rationale, say so explicitly.
-            has_rationale = False
             try:
-                has_rationale = bool(getattr(ev.anchor, "rationale", None))
+                # Prefer attribute assignment on MetaInfo instance
+                if hasattr(resp, "meta") and hasattr(resp.meta, "__setattr__"):
+                    setattr(resp.meta, "resolver_path", resolver_path)
+                else:
+                    # Fall back to dictionary assignment when meta is a plain dict
+                    resp.meta["resolver_path"] = resolver_path
             except Exception:
-                has_rationale = False
-            if has_rationale:
-                resp.answer.rationale_note = "Using anchor rationale (BM25 fallback)."
+                # Silently ignore failures to assign resolver_path
+                pass
     except Exception:
         pass
 
@@ -653,18 +696,24 @@ async def v2_query(
     # post-routing modifications still conform to the Why-Decision contract.
     try:
         ok, v_errors = validate_response(resp)
-        if v_errors:
-            try:
-                existing = resp.meta.get("validator_errors") or []
-                resp.meta["validator_errors"] = existing + v_errors
-            except Exception:
-                pass
+    # Summarise validation diagnostics by counting errors instead of
+    # returning the full list (milestone‑5 §D).
+        error_count: int = 0
+        if isinstance(v_errors, list):
+            error_count = len(v_errors)
+        try:
+            existing = resp.meta.get("validator_error_count") or 0
+            if not isinstance(existing, int):
+                existing = 0
+            resp.meta["validator_error_count"] = existing + error_count
+        except Exception:
+            pass
         try:
             log_stage(
                 logger,
                 "gateway.validation",
                 "applied",
-                errors_count=len(v_errors) if isinstance(v_errors, list) else 0,
+                errors_count=error_count,
                 corrected_fields=[e.get("code") for e in v_errors] if isinstance(v_errors, list) else [],
                 request_id=req_id,
                 prompt_fingerprint=resp.meta.get("prompt_fingerprint"),
@@ -683,7 +732,7 @@ async def v2_query(
         except Exception:
             pass
         try:
-            from gateway.llm_router import last_call as _last_llm_call  # type: ignore
+            from gateway.inference_router import last_call as _last_llm_call
             mdl = _last_llm_call.get("model")
             can = _last_llm_call.get("canary")
             if mdl:
@@ -707,7 +756,23 @@ async def v2_query(
             }
         )
 
-    return JSONResponse(content=resp.model_dump())
+    headers = {"x-request-id": req_id}
+    try:
+        etag = resp.meta.get("snapshot_etag")
+        if etag:
+            headers["x-snapshot-etag"] = etag
+    except Exception:
+        pass
+    try:
+        from gateway.inference_router import last_call as _last_llm_call
+        mdl = _last_llm_call.get("model"); can = _last_llm_call.get("canary")
+        if mdl:
+            headers["x-model"] = str(mdl)
+        if can is not None:
+            headers["x-canary"] = "true" if can else "false"
+    except Exception:
+        pass
+    return JSONResponse(content=resp.model_dump(), headers=headers)
 
 # ---------------------------------------------------------------------------
 # Evidence bundle download endpoints (spec §D)
@@ -870,3 +935,25 @@ async def evidence_endpoint(
 
 # ---- Final wiring ----------------------------------------------------------
 app.include_router(router)
+
+
+# ---- Load-shed refresh tasks ----------------------------------------------
+# Launch a background task on startup to periodically refresh the
+# load-shed flag.  On shutdown, cancel the refresher to clean up the
+# asynchronous task.  Failure to start the refresher should not crash
+# the application; errors are logged via log_stage within the load_shed
+# module.
+@app.on_event("startup")
+async def _start_load_shed_refresher() -> None:
+    try:
+        start_background_refresh()
+    except Exception:
+        pass
+
+
+@app.on_event("shutdown")
+async def _stop_load_shed_refresher() -> None:
+    try:
+        stop_background_refresh()
+    except Exception:
+        pass

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os
 import json
-from gateway import llm_router
+from gateway import inference_router as llm_router
 
 def test_router_passes_messages_override(monkeypatch):
     # Force control path → vLLM adapter
@@ -15,7 +15,7 @@ def test_router_passes_messages_override(monkeypatch):
     monkeypatch.setattr("gateway.llm_adapters.vllm.generate", fake_generate)
     env = {"intent":"why_decision","question":"q","evidence":{},"allowed_ids":["a"],"constraints":{"max_tokens":256}}
     override_msgs = [{"role":"system","content":"S"}, {"role":"user","content":"U"}]
-    out = llm_router.call_llm(env, request_id="req1", messages_override=override_msgs, max_tokens_override=64)
+    out = llm_router.call_llm_sync(env, request_id="req1", messages_override=override_msgs, max_tokens_override=64)
     assert captured["messages"] == override_msgs
     assert captured["max_tokens"] == 64
     assert isinstance(out, str)

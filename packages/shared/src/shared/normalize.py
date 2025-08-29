@@ -321,3 +321,65 @@ def normalize_transition(doc: Dict[str, Any]) -> Dict[str, Any]:
         "type",
     }
     return _common_normalise(doc, "transition", allowed)
+
+# --- Evidence utilities promoted from gateway.evidence ------------------
+_CURRENCY_MAP = {
+    "$": "USD", "usd": "USD",
+    "€": "EUR", "eur": "EUR",
+    "¥": "JPY", "jpy": "JPY",
+    "£": "GBP", "gbp": "GBP",
+}
+
+def _parse_amount(val: str, unit: str | None) -> float | None:
+    try:
+        num = float(val.replace(",", ""))
+    except Exception:
+        return None
+    if not unit:
+        return num
+    u = unit.lower()
+    if u in ("k", "thousand"):
+        num *= 1_000.0
+    elif u in ("m", "million", "millions"):
+        num *= 1_000_000.0
+    elif u in ("b", "billion", "billions"):
+        num *= 1_000_000_000.0
+    return num
+
+def normalise_event_amount(ev: dict) -> None:
+    """
+    Extract a normalised amount and currency code from an event's textual fields
+    (summary/description) and attach them to the event as:
+      - normalized_amount: float (base units)
+      - normalized_currency: str (ISO-like)
+    Safe to call multiple times; leaves ev unchanged if nothing is found.
+    """
+    if not isinstance(ev, dict) or "normalized_amount" in ev:
+        return
+    texts: list[str] = []
+    for fld in ("summary", "description"):
+        val = ev.get(fld)
+        if isinstance(val, str):
+            texts.append(val)
+    import re as _re
+    pattern = r"(?i)(?P<currency>[\\$€¥£]|[A-Z]{3})?\\s*([\\d,]+(?:\\.\\d+)?)\\s*(?P<unit>[kmb]|thousand|million|billion|millions|billions)?"
+    for txt in texts:
+        for m in _re.finditer(pattern, txt):
+            cur = (m.group("currency") or "").strip()
+            unit = m.group("unit")
+            val_str = m.group(2)
+            cur_key = cur.lower()
+            currency = _CURRENCY_MAP.get(cur_key) if cur else None
+            amount = _parse_amount(val_str, unit)
+            if amount is None:
+                continue
+            if not currency:
+                tail = txt[m.end():]
+                m2 = _re.search(r"(?i)\\b([A-Z]{3})\\b", tail)
+                if m2:
+                    currency = _CURRENCY_MAP.get(m2.group(1).lower(), m2.group(1).upper())
+            if amount is not None:
+                ev.setdefault("normalized_amount", float(amount))
+                if currency:
+                    ev.setdefault("normalized_currency", currency)
+                return

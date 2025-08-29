@@ -1,70 +1,87 @@
-import time
-import contextvars
-import redis
-import httpx
-from core_observability.otel import inject_trace_context
-from core_logging import get_logger, trace_span, log_stage
+from __future__ import annotations
+
+import asyncio
+from contextvars import ContextVar
+from typing import Optional
+
+from core_logging import get_logger, log_stage
 from core_config import get_settings
+from .redis import get_redis_pool
 
-logger = get_logger("gateway")
+_logger = get_logger("gateway.load_shed")
 
-settings = get_settings()
+# Cached flag (async-safe)
+_load_shed_flag: ContextVar[bool] = ContextVar("_load_shed_flag", default=False)
+_refresh_task: asyncio.Task | None = None
 
-# --------------------------------------------------------------------------- #
-#  Context flag – lets any downstream stage ask “are we in load-shed mode?”  #
-# --------------------------------------------------------------------------- #
-_load_shed_flag: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "gateway_load_shed_flag", default=False
-)
+async def _refresh_loop(period_s: float) -> None:
+    """
+    Background refresher that polls Redis for the load-shed flag and caches it
+    locally. Emits structured logs each cycle with a deterministic task_id and
+    monotonic cycle counter.
+    """
+    from core_utils.ids import stable_short_id
+    settings = get_settings()
+    task_id = f"load_shedder:{stable_short_id(getattr(settings, 'redis_url', ''))}"
+    cycle = 0
+    pool = None
+    try:
+        pool = get_redis_pool()
+    except Exception:
+        pool = None
+    while True:
+        cycle += 1
+        try:
+            val = None
+            if pool is not None:
+                res = pool.get("gateway:load_shed")
+                val = (await res) if hasattr(res, "__await__") else res
+            flag = bool(str(val or "").strip() == "1")
+            _load_shed_flag.set(flag)
+            log_stage(
+                _logger, "load_shed", "refresh_cycle",
+                task_id=task_id, cycle=cycle, enabled=flag
+            )
+        except Exception as e:
+            log_stage(
+                _logger, "load_shed", "refresh_error",
+                task_id=task_id, cycle=cycle, error=str(e)
+            )
+        await asyncio.sleep(max(0.1, float(period_s)))
 
-def is_load_shed_active() -> bool:
-    """Return ``True`` when the *current request* is operating in load-shed mode."""
-    return _load_shed_flag.get()
+async def _refresh_loop(period_s: float) -> None:
+    while True:
+        try:
+            flag = await _compute_load_shed()
+            _load_shed_flag.set(flag)
+            try:
+                log_stage(_logger, "load_shed", "refresh", value=flag)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Errors already handled; continue
+            pass
+        await asyncio.sleep(period_s)
+
+def start_background_refresh(period_ms: int = 300) -> None:
+    """Start the refresher loop if not already running."""
+    global _refresh_task
+    if _refresh_task is None or _refresh_task.done():
+        loop = asyncio.get_event_loop()
+        _refresh_task = loop.create_task(_refresh_loop(period_ms / 1000.0))
+
+def stop_background_refresh() -> None:
+    """Cancel the background refresher if running."""
+    global _refresh_task
+    if _refresh_task is not None:
+        _refresh_task.cancel()
+        _refresh_task = None
 
 def should_load_shed() -> bool:
-    """
-    The guard can be **globally disabled** by setting
-    `LOAD_SHED_ENABLED=false` (or `settings.load_shed_enabled = False`).
-    This prevents unit/CI runs – which often lack Redis or Memory-API –
-    from being spuriously throttled while leaving the mechanism active in
-    staging and production.
-    """
-
-    # ── Fast-exit when the feature-flag is off ──────────────────────────
-    if not getattr(settings, "load_shed_enabled", False):
+    """Return the last cached flag without performing I/O."""
+    try:
+        return bool(_load_shed_flag.get())
+    except Exception:
         return False
-
-    triggered = False
-
-    with trace_span("gateway.load_shed"):
-        # ---- Redis health --------------------------------------------------
-        try:
-            r = redis.Redis.from_url(settings.redis_url, socket_timeout=0.10)
-            t0 = time.perf_counter()
-            r.ping()
-            redis_latency_ms = (time.perf_counter() - t0) * 1000
-            if redis_latency_ms > getattr(settings, "load_shed_redis_threshold_ms", 100):
-                triggered = True
-        except Exception:  # redis down / unreachable
-            log_stage(logger, "gateway", "load_shed_redis_down")
-            triggered = True
-
-        # ---- Memory-API health --------------------------------------------
-        if not triggered:  # short-circuit if already shedding
-            try:
-                resp = httpx.get(
-                    f"{settings.memory_api_url}/healthz",
-                    timeout=1.0,
-                    headers=inject_trace_context({}),
-                )
-                if resp.status_code >= 500:
-                    log_stage(
-                        logger, "gateway", "load_shed_backend_5xx", status=resp.status_code
-                    )
-                    triggered = True
-            except Exception:  # backend unreachable
-                log_stage(logger, "gateway", "load_shed_backend_unreachable")
-                triggered = True
-
-    _load_shed_flag.set(triggered)
-    return triggered

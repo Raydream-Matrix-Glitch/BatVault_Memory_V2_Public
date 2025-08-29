@@ -6,11 +6,10 @@ import inspect
 from typing import Dict, Any
 from redis.exceptions import RedisError, ConnectionError
 
-import httpx
-from core_observability.otel import inject_trace_context
+from gateway.http import fetch_json
 import orjson
-import redis.asyncio as redis
-import core_metrics
+from gateway.redis import get_redis_pool
+from ..metrics import counter as _metric_counter, histogram as _metric_histogram
 
 from core_logging import trace_span, get_logger, log_stage
 from .reranker import rerank
@@ -26,14 +25,12 @@ settings = get_settings()
 # Redis connection (optional – falls back to None when Redis is unavailable) #
 # ---------------------------------------------------------------------------#
 try:
-    _redis: redis.Redis | None = redis.from_url(settings.redis_url)
+    # Use the shared Redis pool for all resolver operations
+    _redis = get_redis_pool()
 except Exception:                       # pragma: no-cover (local pytest)
     _redis = None
 
-# ---------------------------------------------------------------------------#
-# Pre-compiled slug regex (spec §B-2) – slug fast-path to skip BM25/X-enc.   #
-# ---------------------------------------------------------------------------#
-logger = get_logger("app")
+logger = get_logger("gateway.resolver")
 
 # ---------------------------------------------------------------------------#
 # Cache helpers – swallow Redis errors so tests run w/o a live server        #
@@ -82,31 +79,28 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
         cache_key = f"resolver:{text}"
         cached = await _cache_get(cache_key)
         if cached:
-            core_metrics.counter("cache_hit_total", 1, service="resolver")
+            _metric_counter("cache_hit_total", 1, service="resolver")
             return orjson.loads(cached)
 
         try:
+            # Start the slug short‑circuit via the unified fetch_json helper.  This will
+            # propagate the current trace context automatically and apply stage‑based
+            # timeouts and retries.  If the enrich call succeeds and returns a
+            # matching ID, update the cache and metrics accordingly.
             log_stage(logger, "resolver", "slug_short_circuit_start", decision_ref=_text)
-            async with httpx.AsyncClient(timeout=0.25) as client:
-                # Inject the current trace context so the upstream enrich call
-                # becomes part of the same trace rather than starting a new root span.
-                resp = await client.get(
-                    f"{settings.memory_api_url}/api/enrich/decision/{_text}",
-                    headers=inject_trace_context({}),
-                )
-            if resp.status_code == 200:
-                doc = resp.json()
-                if doc.get("id") == _text:           # sanity check
-                    core_metrics.counter(
-                        "resolver_slug_short_circuit_total", 1, service="resolver"
-                    )
-                    await _cache_setex(cache_key, CACHE_TTL, orjson.dumps(doc))
-                    log_stage(logger, "resolver", "slug_short_circuit_end", cache_key=cache_key, ok=True)
-                    return doc
-        except Exception:
-            core_metrics.counter(
-                "resolver_slug_short_circuit_error_total", 1, service="resolver"
+            data = await fetch_json(
+                "GET",
+                f"{settings.memory_api_url}/api/enrich/decision/{_text}",
+                stage="enrich",
             )
+            if isinstance(data, dict) and data.get("id") == _text:
+                _metric_counter("resolver_slug_short_circuit_total", 1, service="resolver")
+                await _cache_setex(cache_key, CACHE_TTL, orjson.dumps(data))
+                log_stage(logger, "resolver", "slug_short_circuit_end", cache_key=cache_key, ok=True)
+                return data
+        except Exception:
+            # Record failures without raising; the resolver must degrade gracefully.
+            _metric_counter("resolver_slug_short_circuit_error_total", 1, service="resolver")
 
     # ---------- 2️⃣  BM25 → Cross-encoder path --------------------------- #
     key = "resolver:" + hashlib.sha256(text.encode()).hexdigest()
@@ -131,7 +125,7 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
             search_fn = search_bm25
         candidates = await search_fn(text, k=24)
     except Exception:                                # network / timeout
-        core_metrics.counter("bm25_search_error_total", 1, service="resolver")
+        _metric_counter("bm25_search_error_total", 1, service="resolver")
         candidates = []
 
     if not candidates:
@@ -139,7 +133,7 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
 
     ranked = rerank(text, candidates)
     best_candidate, best_score = ranked[0]
-    core_metrics.histogram("resolver_confidence", float(best_score))
+    _metric_histogram("resolver_confidence", float(best_score))
     best = best_candidate
 
     await _cache_setex(key, CACHE_TTL, orjson.dumps(best))

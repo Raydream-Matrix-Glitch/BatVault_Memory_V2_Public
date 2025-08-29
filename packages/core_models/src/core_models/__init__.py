@@ -8,6 +8,9 @@ from .models import (
     CompletenessFlags,
 )
 
+# meta input and canonical models
+from .meta_inputs import MetaInputs
+
 __all__ = [
     "EventModel",
     "WhyDecisionAnchor",
@@ -18,4 +21,5 @@ __all__ = [
     "WhyDecisionResponse",
     "SupportingEvidence",
     "Anchor",
+    "MetaInputs",
 ]

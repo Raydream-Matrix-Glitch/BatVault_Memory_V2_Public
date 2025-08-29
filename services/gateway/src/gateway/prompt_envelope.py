@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import hashlib
-import json
+from core_utils import jsonx
 import os
 from pathlib import Path
 from typing import Any, Dict
 
 from core_utils.fingerprints import canonical_json
 from core_logging import trace_span
+from core_utils.fingerprints import sha256_hex, ensure_sha256_prefix
+from core_config import get_settings
 
 # --------------------------------------------------------------#
 #  Lazy-loaded policy registry with flexible path resolution    #
@@ -30,7 +32,7 @@ def _find_registry() -> Path | None:
     pathlib.Path | None
         Path to the registry file, or *None* if nothing found.
     """
-    env = os.getenv("POLICY_REGISTRY_PATH")
+    env = getattr(get_settings(), "policy_registry_path", None)
     if env and Path(env).is_file():
         return Path(env)
 
@@ -74,12 +76,12 @@ def _load_policy_registry() -> Dict[str, Any]:
     return _POLICY_REGISTRY
 
 
-_OPTS = json.dumps({"x": 1}).encode()  # noqa: E501 – silences flake8 “unused”
+_OPTS = jsonx.dumps({"x": 1}).encode()  # noqa: E501 – silences flake8 “unused”
 
 
 def _sha256(data: bytes) -> str:
     """Return *spec-compliant* SHA-256 fingerprint (“sha256:<hex>”)."""
-    return "sha256:" + hashlib.sha256(data).hexdigest()
+    return ensure_sha256_prefix(sha256_hex(data))
 
 
 @trace_span("prompt")

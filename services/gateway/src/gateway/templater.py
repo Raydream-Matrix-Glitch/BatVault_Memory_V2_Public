@@ -5,44 +5,6 @@ from core_models.models import WhyDecisionEvidence, WhyDecisionAnswer
 
 logger = get_logger("templater")
 
-def build_allowed_ids(ev: WhyDecisionEvidence) -> List[str]:
-    """
-    Compute a deterministic union of anchor, event and transition IDs.
-
-    This helper has been updated to delegate to the core validator's
-    canonical allowed‑ID computation.  It gathers the anchor ID, all
-    event IDs and all transition IDs from the supplied evidence and
-    returns them in canonical order (anchor first, then events by
-    timestamp, then transitions by timestamp).  Duplicate IDs are
-    removed.  The returned list may differ from the previous
-    implementation's lexicographically sorted set.
-    """
-    from core_validator import canonical_allowed_ids
-
-    # Collect plain dictionaries for events and transitions.  The
-    # evidence model may contain pydantic objects; convert them to
-    # dictionaries if necessary.
-    ev_list: list[dict] = []
-    for e in ev.events or []:
-        if isinstance(e, dict):
-            ev_list.append(e)
-        else:
-            try:
-                ev_list.append(e.model_dump(mode="python"))
-            except Exception:
-                ev_list.append(dict(e))
-    tr_list: list[dict] = []
-    for t in list(getattr(ev.transitions, "preceding", []) or []) + list(getattr(ev.transitions, "succeeding", []) or []):
-        if isinstance(t, dict):
-            tr_list.append(t)
-        else:
-            try:
-                tr_list.append(t.model_dump(mode="python"))
-            except Exception:
-                tr_list.append(dict(t))
-    anchor_id = getattr(ev.anchor, "id", None) or ""
-    return canonical_allowed_ids(anchor_id, ev_list, tr_list)
-
 _ALIAS_RE = re.compile(r"^[AET]\d+$")
 
 def _pretty_anchor(node_id: str) -> str:
@@ -126,101 +88,20 @@ def validate_and_fix(
     answer.supporting_ids = support
     return answer, changed, errs
 
-def _fallback_short_answer(ev: WhyDecisionEvidence) -> str:
-    """Synthesize a deterministic fallback short answer (legacy).
-
-    Historically the templater produced a counts-based fallback when no
-    rationale was available.  This helper is retained for backward
-    compatibility but is no longer used by the Gateway.  It remains
-    exposed for unit-tests that depend on its previous behaviour.  See
-    `_compose_fallback_answer` for the modern deterministic fallback.
-    """
-    # Attempt to use the anchor's rationale when available
-    rationale: str = ""
-    try:
-        rationale = (ev.anchor.rationale or "").strip()
-    except Exception:
-        rationale = ""
-    # Determine counts for fallback in case rationale is empty
-    def _etype(x):
-        try:
-            return (x.get("type") or x.get("entity_type") or "").lower()
-        except Exception:
-            return ""
-
-    n_events = sum(1 for e in (ev.events or []) if _etype(e) == "event")
-    n_pre = len(ev.transitions.preceding or [])
-    n_suc = len(ev.transitions.succeeding or [])
-
-    if not rationale:
-        # No rationale – fall back to counts-based deterministic summary
-        return _det_short_answer(
-            ev.anchor.id if ev.anchor else "unknown",
-            n_events,
-            n_pre,
-            n_suc,
-            len(getattr(ev, "supporting_ids", []) or []),
-            len(ev.allowed_ids or []),
-        )
-    # If there is a rationale, append up to three most recent event summaries.
-    event_summaries: list[str] = []
-    try:
-        sorted_events = sorted(
-            [e for e in (ev.events or []) if isinstance(e, dict)],
-            key=lambda e: e.get("timestamp") or ""
-        )
-        # take up to three most recent events
-        for e in sorted_events[-3:]:
-            s = e.get("summary") or e.get("description") or e.get("id")
-            if s:
-                event_summaries.append(s)
-    except Exception:
-        pass
-
-    fallback = ("Rationale: " + rationale) if rationale else ""
-    if event_summaries:
-        fallback += " Key events: " + "; ".join(event_summaries) + "."
-    # Build compact counts; omit zero categories.
-    parts: list[str] = []
-    if n_events:
-        parts.append(f"{n_events} event" + ("" if n_events == 1 else "s"))
-    trans_bits: list[str] = []
-    if n_pre:
-        trans_bits.append(f"{n_pre} preceding")
-    if n_suc:
-        trans_bits.append(f"{n_suc} succeeding")
-    if trans_bits:
-        total_trans = n_pre + n_suc
-        parts.append(", ".join(trans_bits) + " transition" + ("" if total_trans == 1 else "s"))
-    if parts:
-        fallback += " (" + "; ".join(parts) + ")."
-    return fallback[:320]
-
 def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
-    """Compose a deterministic, human‑readable fallback answer.
+    """Compose a deterministic, human-readable fallback answer.
 
-    This pure helper synthesises a concise two‑sentence explanation when the
-    LLM is disabled, unhealthy or returns an output that violates the
-    style specification.  It follows a strict template:
-
-      1. If a decision maker and timestamp are present on the anchor then
-         the lead sentence begins with "<Maker> on <YYYY-MM-DD>: <rationale>.".
-         Otherwise the rationale alone forms the lead sentence.
-      2. If there is at least one succeeding transition, append a second
-         sentence "Next: <to_id or title>." referencing the first
-         succeeding transition's id or its ``to`` field.  If no succeeding
-         transitions exist, the second sentence is omitted.
-      3. If there are events present then append a final clause
-         " Key events: A; B; C." containing up to three of the most
-         recent event summaries (most recent first).  This clause is
-         omitted if the overall answer would exceed 320 characters.
-
-    The final answer is clamped to a maximum of 320 characters and at
-    most two sentences (the optional "Key events" clause counts as part
-    of the second sentence).  Raw evidence IDs must not appear in
-    the prose; callers should strip them prior to invocation.
+    Two-step template:
+      1) Lead: "<Maker> on <YYYY-MM-DD>: <rationale>." (or "<rationale>." if maker/date missing).
+      2) If a succeeding transition exists, append " Next: <to_title>."
+         Prefer `to_title`; fall back to a human-looking `to` string only if it is not an ID.
+    Clamp to ≤320 chars and ≤2 sentences. Never emit raw IDs in the prose.
     """
-    # Extract maker and date from the anchor if available
+    # Extract maker, date and rationale from the anchor if available.  When a
+    # rationale ends with terminal punctuation (period, semicolon, colon or
+    # comma) we strip it off so that the composed lead sentence never
+    # contains a double punctuation mark.  This trimming applies only to
+    # the trailing character and preserves internal punctuation.
     maker: str = ""
     date_part: str = ""
     rationale: str = ""
@@ -229,11 +110,16 @@ def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
         ts = (ev.anchor.timestamp or "").strip() if ev.anchor else ""
         date_part = ts.split("T")[0] if ts else ""
         rationale = (ev.anchor.rationale or "").strip() if ev.anchor else ""
+        if rationale and rationale[-1] in ".;,:":
+            rationale = rationale[:-1].rstrip()
     except Exception:
         maker = ""
         date_part = ""
         rationale = ""
-    # Lead sentence
+    # Compose the lead sentence.  When both maker and date are available
+    # produce "<Maker> on <YYYY-MM-DD>: <rationale>.", otherwise just
+    # "<rationale>.".  The rationale has been stripped of its trailing
+    # punctuation above to avoid double periods.
     lead: str
     if maker and date_part:
         if rationale:
@@ -256,50 +142,34 @@ def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
                 to_id = first.get("to") if isinstance(first, dict) else getattr(first, "to", None)
             except Exception:
                 to_id = None
-            # fallback to id/title
+            # Resolve a human-friendly label for the next pointer.  **Never** emit raw IDs.
             label = None
-            # Prefer the explicit `to` field for the transition pointer.  Only
-            # fall back to a title when no `to` is provided.  We do not
-            # surface raw transition IDs here per spec – identifiers must
-            # never appear in the prose.
-            if to_id:
-                label = to_id
-            else:
-                # Attempt to use a human-readable title when available
+            # Prefer an explicit `to_title` (enriched), then generic `title`
+            title = None
+            try:
+                title = (first.get("to_title") if isinstance(first, dict) else getattr(first, "to_title", None)) \
+                        or (first.get("title") if isinstance(first, dict) else getattr(first, "title", None))
+            except Exception:
                 title = None
-                try:
-                    title = first.get("title") if isinstance(first, dict) else getattr(first, "title", None)
-                except Exception:
-                    title = None
-                if title:
-                    label = title
+            if title:
+                label = title
+            # If no title is available, attempt to use the `to` field only if it
+            # is clearly *not* an ID (e.g., contains spaces). Otherwise, omit Next.
+            if not label:
+                if isinstance(to_id, str) and (" " in to_id.strip()):
+                    label = to_id.strip()
             if label:
                 next_sent = f" Next: {label}."
+            else:
+                try:
+                    logger.info("templater.next_pointer_omitted", extra={"reason": "no_title_or_nonhuman_to"})
+                except Exception:
+                    pass
     except Exception:
         pass
-    # Key events clause – gather up to three most recent events (most recent first)
-    key_events: str = ""
-    try:
-        events = [e for e in (ev.events or []) if isinstance(e, dict)]
-        # sort by timestamp ascending then take last 3 reversed
-        events_sorted = sorted(events, key=lambda e: e.get("timestamp") or "")
-        most_recent = list(reversed(events_sorted[-3:]))
-        names: list[str] = []
-        for e in most_recent:
-            # prefer summary, then description, then id
-            s = e.get("summary") or e.get("description") or e.get("title") or e.get("id")
-            if s:
-                names.append(str(s))
-        if names:
-            key_events = f" Key events: {'; '.join(names)}."
-    except Exception:
-        key_events = ""
-    # Construct the provisional answer and clamp to 320 characters
-    answer = lead + (next_sent or "") + (key_events or "")
-    # If the key_events clause pushes us over 320 chars remove it entirely
-    if len(answer) > 320 and key_events:
-        answer = (lead + (next_sent or "")).strip()
-    # Clamp to max length
+    # Construct the provisional answer (lead + optional Next) and clamp to 320 characters
+    answer = (lead + (next_sent or "")).strip()
+    # Final clamp to max length
     if len(answer) > 320:
         answer = answer[:320]
     return answer.strip()
@@ -319,11 +189,7 @@ def finalise_short_answer(
     s = answer.short_answer or ""
     if not s or s.strip().upper().startswith("STUB ANSWER"):
         # Generate deterministic fallback via modern composer
-        try:
-            new_s = _compose_fallback_answer(evidence)
-        except Exception:
-            # fallback to legacy if composer fails
-            new_s = _fallback_short_answer(evidence)
+        new_s = _compose_fallback_answer(evidence)
         if new_s != s:
             answer.short_answer = new_s
             changed = True

@@ -35,3 +35,9 @@ docker-data/
 # Windows ADS noise
 *:Zone.Identifier
 *Zone.Identifier
+
+# Build artefacts (do not commit)
+**/build/
+**/build/lib/
+**/dist/
+**/*.egg-info/
