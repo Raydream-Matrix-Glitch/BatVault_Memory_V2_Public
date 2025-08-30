@@ -6,7 +6,8 @@ from typing import Any, Dict, Optional
 import httpx
 import orjson
 
-from core_logging import get_logger, log_stage
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 from core_observability.otel import inject_trace_context
 from core_config import get_settings
 from core_config.constants import timeout_for_stage
@@ -73,7 +74,7 @@ async def fetch_json(
 
             if status >= 400:
                 try:
-                    log_stage(_logger, "http", "error", url=url, status=status, body_len=len(orjson.dumps(data)))
+                    log_stage("http", "error", url=url, status=status, body_len=len(orjson.dumps(data)))
                 except Exception:
                     pass
                 resp.raise_for_status()

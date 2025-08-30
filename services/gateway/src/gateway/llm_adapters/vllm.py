@@ -42,7 +42,7 @@ async def generate_async(endpoint: str, envelope: Dict[str, Any], *, temperature
     """Async variant using the shared HTTP client (OTEL/headers applied)."""
     url = endpoint.rstrip("/") + "/v1/chat/completions"
     payload = _build_payload(envelope, temperature=temperature, max_tokens=max_tokens)
-    client = get_http_client()
+    client = get_http_client(timeout_ms=int(timeout_for_stage('llm')*1000))
     r = await client.post(url, json=payload)
     r.raise_for_status()
     data = r.json()

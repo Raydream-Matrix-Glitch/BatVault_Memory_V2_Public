@@ -364,7 +364,7 @@ def normalise_event_amount(ev: dict) -> None:
     import re as _re
     pattern = r"(?i)(?P<currency>[\\$€¥£]|[A-Z]{3})?\\s*([\\d,]+(?:\\.\\d+)?)\\s*(?P<unit>[kmb]|thousand|million|billion|millions|billions)?"
     for txt in texts:
-        for m in _re.finditer(pattern, txt):
+        for m in re.finditer(pattern, txt):
             cur = (m.group("currency") or "").strip()
             unit = m.group("unit")
             val_str = m.group(2)

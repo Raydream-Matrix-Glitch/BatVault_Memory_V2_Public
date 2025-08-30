@@ -1,7 +1,8 @@
 from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
-from core_logging import get_logger, log_stage
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 from core_config import get_settings
 from ..http import fetch_json
 _logger = get_logger("gateway.llm")
@@ -58,14 +59,14 @@ async def call(envelope: Dict[str, Any], *, request_id: str, headers: Optional[D
         )
         latency_ms = int((time.perf_counter() - t0) * 1000)
         try:
-            log_stage(_logger, 'llm', 'llm.success', request_id=request_id, adapter=cohort, latency_ms=latency_ms, retry_count=retries)
+            log_stage('llm', 'llm.success', request_id=request_id, adapter=cohort, latency_ms=latency_ms, retry_count=retries)
         except Exception:
             pass
         return resp
     except Exception as e:
         latency_ms = int((time.perf_counter() - t0) * 1000)
         try:
-            log_stage(_logger, 'llm', 'llm.error', request_id=request_id, adapter=cohort, latency_ms=latency_ms, retry_count=retries, reason=type(e).__name__)
+            log_stage('llm', 'llm.error', request_id=request_id, latency_ms=latency_ms, retry_count=retries, reason=type(e).__name__)
         except Exception:
             pass
         raise

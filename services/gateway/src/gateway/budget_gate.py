@@ -4,7 +4,7 @@ from typing import Any, Dict
 from core_config import get_settings
 
 from core_utils.fingerprints import sha256_hex, ensure_sha256_prefix
-from core_logging import log_stage
+from .logging_helpers import stage as log_stage
 from core_utils.fingerprints import canonical_json
 from core_config.constants import (
     CONTROL_CONTEXT_WINDOW,
@@ -61,7 +61,7 @@ def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, mo
     prompt_fingerprint = _blake3_or_sha256(fp_bytes)
 
     try:
-        log_stage(logger, "gate", "plan", request_id=request_id,
+        log_stage("gate", "plan", request_id=request_id,
                   overhead_tokens=gp_dict["overhead_tokens"],
                   evidence_tokens=gp_dict["evidence_tokens"],
                   desired_completion_tokens=gp_dict["desired_completion_tokens"])
@@ -70,12 +70,12 @@ def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, mo
 
     for i, shr in enumerate(gp_dict.get("shrinks", []), start=1):
         try:
-            log_stage(logger, "gate", "shrink", request_id=request_id, attempt=i, to_tokens=shr)
+            log_stage("gate", "shrink", request_id=request_id, attempt=i, to_tokens=shr)
         except Exception:
             pass
 
     try:
-        log_stage(logger, "gate", "final", request_id=request_id,
+        log_stage("gate", "final", request_id=request_id,
                   prompt_tokens=gp_dict["prompt_tokens"],
                   max_tokens=gp_dict["max_tokens"],
                   prompt_fingerprint=prompt_fingerprint)
@@ -139,7 +139,7 @@ def authoritative_truncate(
             "bundle_size_bytes": 0,
         }
         try:
-            log_stage(logger, "gate", "selector_complete", request_id=request_id, **meta)
+            log_stage("gate", "selector_complete", request_id=request_id, **meta)
         except Exception:
             pass
         return ev, meta
@@ -171,7 +171,7 @@ def authoritative_truncate(
             "bundle_size_bytes": 0,
         }
         try:
-            log_stage(logger, "gate", "selector_complete", request_id=request_id, **meta)
+            log_stage("gate", "selector_complete", request_id=request_id, **meta)
         except Exception:
             pass
         return ev, meta
@@ -229,7 +229,7 @@ def authoritative_truncate(
         "bundle_size_bytes": 0,
     }
     try:
-        log_stage(logger, "gate", "selector_complete", request_id=request_id, **meta)
+        log_stage("gate", "selector_complete", request_id=request_id, **meta)
     except Exception:
         pass
     return ev, meta

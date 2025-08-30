@@ -12,13 +12,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
+from core_utils.ids import compute_request_id
 
 # Internal packages
 from core_config import get_settings
 from core_config.constants import (
     TTL_SCHEMA_CACHE_SEC as _SCHEMA_TTL_SEC,
 )
-from core_logging import get_logger, log_stage, trace_span
+from core_logging import get_logger, trace_span
+from .logging_helpers import stage as log_stage
 from core_observability.otel import init_tracing, instrument_fastapi_app
 from .metrics import (
     counter as metric_counter,
@@ -42,7 +44,6 @@ from .evidence import EvidenceBuilder
 from .schema_cache import fetch_schema
 from .http import fetch_json
 from .load_shed import should_load_shed, start_background_refresh, stop_background_refresh
-from .match_snippet import build_match_snippet
 from .builder import build_why_decision_response
 from .builder import BUNDLE_CACHE
 from gateway.sse import stream_chunks
@@ -84,7 +85,7 @@ async def route_query(*args, **kwargs):  # pragma: no cover - proxy
     proxy invocation for debugging.
     """
     try:
-        log_stage(logger, "router_proxy", "invoke", function="route_query")
+        log_stage("router_proxy", "invoke", function="route_query")
     except Exception:
         pass  # avoid cascading failures if logger not initialised
     import importlib, sys
@@ -112,7 +113,7 @@ def _minio_client_or_null():
     try:
         from minio import Minio  # type: ignore
     except Exception as exc:
-        log_stage(logger, "artefacts", "minio_unavailable", error=str(exc))
+        log_stage("artefacts", "minio_unavailable", error=str(exc))
         return None
     return Minio(
         settings.minio_endpoint,
@@ -130,8 +131,7 @@ _bucket_prepared: bool = False
 def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
     client = minio_client()
     if client is None:
-        log_stage(
-            logger, "artefacts", "sink_noop_enabled",
+        log_stage("artefacts", "sink_noop_enabled",
             request_id=request_id, count=len(artefacts)
         )
         return
@@ -145,9 +145,7 @@ def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
             )
             _bucket_prepared = True
         except Exception as exc:
-            log_stage(
-                logger,
-                "artifacts",
+            log_stage("artifacts",
                 "minio_bucket_prepare_failed",
                 request_id=request_id,
                 error=str(exc),
@@ -178,21 +176,20 @@ async def _minio_put_batch_async(
             timeout=timeout_sec,
         )
     except asyncio.TimeoutError:
-        log_stage(
-            logger, "artifacts", "minio_put_batch_timeout",
+        log_stage("artifacts", "minio_put_batch_timeout",
             request_id=request_id, timeout_ms=int(timeout_sec * 1000),
         )
     except Exception as exc:
         log_stage(
-            logger, "artifacts", "minio_put_batch_failed",
+            "artifacts", "minio_put_batch_failed",
             request_id=request_id, error=str(exc),
         )
 
 # ---- Request logging & counters middleware ---------------------------------
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
-    req_id = generate_request_id(); t0 = time.perf_counter()
-    log_stage(logger, "request", "request_start", request_id=req_id,
+    req_id = compute_request_id(str(request.url.path), dict(request.query_params), None); t0 = time.perf_counter()
+    log_stage("request", "request_start", request_id=req_id,
               path=request.url.path, method=request.method)
 
     resp = await call_next(request)
@@ -203,7 +200,7 @@ async def request_logging_middleware(request: Request, call_next):
                    method=request.method, code=str(resp.status_code))
     if resp.status_code >= 500:
         metric_counter("gateway_http_5xx_total", 1)
-    log_stage(logger, "request", "request_end",
+    log_stage("request", "request_end",
               request_id=req_id, latency_ms=dt_s * 1000.0, status_code=resp.status_code)
     resp.headers["x-request-id"] = req_id
     return resp
@@ -216,7 +213,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         body = await request.body()
     except Exception:
         body = b""
-    req_id = generate_request_id()
+    try:
+        req_id = compute_request_id(str(request.url.path), dict(request.query_params), body)
+    except Exception:
+        req_id = compute_request_id(str(request.url.path), None, None)
     logger.warning(
         "request_validation_error",
         extra={
@@ -235,6 +235,8 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 "code": "VALIDATION_FAILED",
                 "message": "Request validation failed",
                 "details": {"errors": exc.errors()},
+                "request_id": req_id,
+
             },
             "request_id": req_id,
         },
@@ -247,8 +249,8 @@ def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/ops/minio/ensure-bucket")
-@log_stage(logger, "gateway", "ensure_bucket")
 def ensure_bucket():
+    log_stage("gateway", "ensure_bucket")
     return ensure_minio_bucket(minio_client(),
                                bucket=settings.minio_bucket,
                                retention_days=settings.minio_retention_days)
@@ -257,7 +259,7 @@ def ensure_bucket():
 async def _readiness() -> dict[str, str]:
     return {
         "status": "ready" if await _ping_memory_api() else "degraded",
-        "request_id": generate_request_id(),
+        "request_id": compute_request_id("/readyz", None, None),
     }
 
 attach_health_routes(
@@ -287,7 +289,7 @@ async def schema_mirror(kind: str, request: Request):
             headers["Sunset"] = "2025-12-31"
             try:
                 # strategic structured log, reusing existing logger
-                log_stage(logger, "schema", "alias_deprecated", request_id=None)
+                log_stage("schema", "alias_deprecated", request_id=None)
             except Exception:
                 pass
     except Exception:
@@ -709,15 +711,10 @@ async def v2_query(
         except Exception:
             pass
         try:
-            log_stage(
-                logger,
-                "gateway.validation",
-                "applied",
-                errors_count=error_count,
-                corrected_fields=[e.get("code") for e in v_errors] if isinstance(v_errors, list) else [],
-                request_id=req_id,
-                prompt_fingerprint=resp.meta.get("prompt_fingerprint"),
-            )
+            log_stage("gateway.validation",
+                      "applied",
+                      errors_count=error_count,
+                      corrected_fields=[e.get("code") for e in v_errors] if isinstance(v_errors, list) else [])
         except Exception:
             pass
     except Exception:
@@ -797,7 +794,7 @@ async def download_bundle(request_id: str):
     entry is emitted with the download.presigned tag for observability.
     """
     try:
-        log_stage(logger, "bundle", "download.presigned", request_id=request_id)
+        log_stage("bundle", "download.presigned", request_id=request_id)
     except Exception:
         pass
     return JSONResponse(
@@ -833,7 +830,7 @@ async def get_bundle(request_id: str):
             content[name] = None
     try:
         # Log the size of the serialized bundle for metrics
-        log_stage(logger, "bundle", "download.served", request_id=request_id,
+        log_stage("bundle", "download.served", request_id=request_id,
                   size=len(orjson.dumps(content)))
     except Exception:
         pass
@@ -927,11 +924,14 @@ async def evidence_endpoint(
             headers={"Cache-Control": "no-cache"},
         )
 
-    return JSONResponse(
-        status_code=200,
-        content=resp_obj.model_dump(),
-        headers={"x-snapshot-etag": "dummy-etag"},
-    )
+    headers = {}
+    try:
+        etag = getattr(resp_obj, "meta", {}).get("snapshot_etag") or None
+        if etag:
+            headers["x-snapshot-etag"] = etag
+    except Exception:
+        pass
+    return JSONResponse(status_code=200, content=resp_obj.model_dump(), headers=headers)
 
 # ---- Final wiring ----------------------------------------------------------
 app.include_router(router)

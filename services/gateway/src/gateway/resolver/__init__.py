@@ -11,7 +11,8 @@ import orjson
 from gateway.redis import get_redis_pool
 from ..metrics import counter as _metric_counter, histogram as _metric_histogram
 
-from core_logging import trace_span, get_logger, log_stage
+from core_logging import trace_span, get_logger
+from .logging_helpers import stage as log_stage
 from .reranker import rerank
 from .fallback_search import search_bm25
 from core_utils import is_slug
@@ -43,7 +44,7 @@ async def _cache_get(key: str):
         result = _redis.get(key)
         return await result if inspect.isawaitable(result) else result
     except (RedisError, ConnectionError, OSError):
-        core_metrics.counter("cache_error_total", 1, service="resolver")
+        _metric_counter("cache_error_total", 1, service="resolver")
         return None
 
 
@@ -58,7 +59,7 @@ async def _cache_setex(key: str, ttl: int, value: bytes):
             await result
         # else: best-effort synchronous client; nothing to await
     except (RedisError, ConnectionError, OSError, TypeError, AttributeError):
-        core_metrics.counter("cache_error_total", 1, service="resolver")
+        _metric_counter("cache_error_total", 1, service="resolver")
 
 # ---------------------------------------------------------------------------#
 # Public API                                                                 #
@@ -87,7 +88,7 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
             # propagate the current trace context automatically and apply stage‑based
             # timeouts and retries.  If the enrich call succeeds and returns a
             # matching ID, update the cache and metrics accordingly.
-            log_stage(logger, "resolver", "slug_short_circuit_start", decision_ref=_text)
+            log_stage("resolver", "slug_short_circuit_start", decision_ref=_text)
             data = await fetch_json(
                 "GET",
                 f"{settings.memory_api_url}/api/enrich/decision/{_text}",
@@ -96,7 +97,7 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
             if isinstance(data, dict) and data.get("id") == _text:
                 _metric_counter("resolver_slug_short_circuit_total", 1, service="resolver")
                 await _cache_setex(cache_key, CACHE_TTL, orjson.dumps(data))
-                log_stage(logger, "resolver", "slug_short_circuit_end", cache_key=cache_key, ok=True)
+                log_stage("resolver", "slug_short_circuit_end", cache_key=cache_key, ok=True)
                 return data
         except Exception:
             # Record failures without raising; the resolver must degrade gracefully.
@@ -106,10 +107,10 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
     key = "resolver:" + hashlib.sha256(text.encode()).hexdigest()
     cached = await _cache_get(key)
     if cached:
-        core_metrics.counter("cache_hit_total", 1, service="resolver")
+        _metric_counter("cache_hit_total", 1, service="resolver")
         return orjson.loads(cached)
 
-    core_metrics.counter("cache_miss_total", 1, service="resolver")
+    _metric_counter("cache_miss_total", 1, service="resolver")
 
     # BM25 search with graceful degradation.  Dynamically resolve the
     # search function at runtime so that monkey‑patches on

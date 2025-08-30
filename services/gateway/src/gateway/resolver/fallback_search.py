@@ -3,7 +3,8 @@ from __future__ import annotations
 from typing import Any, Dict, List
 import httpx, json, pathlib, re
 
-from core_logging import get_logger, trace_span, log_stage
+from core_logging import get_logger, trace_span
+from ..logging_helpers import stage as log_stage
 from core_observability.otel import inject_trace_context
 from core_config import get_settings
 
@@ -68,25 +69,17 @@ async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
         if resp.status_code == 200:
             doc = resp.json()
             matches = doc.get("matches", [])
-            log_stage(
-                logger,
-                "gateway",
-                "bm25_search_complete",
-                match_count=len(matches),
-                vector_used=doc.get("vector_used"),
-            )
+            log_stage("resolver", "bm25_search_complete",
+                      match_count=len(matches),
+                      vector_used=doc.get("vector_used"))
     except Exception:           # network failure / service down
         logger.warning("bm25_search_http_error", exc_info=True)
 
     if not matches:             # offline back-stop
         matches = _offline_fixture_search(text, k)
-        log_stage(
-            logger,
-            "gateway",
-            "bm25_offline_fallback",
-            match_count=len(matches),
-            vector_used=False,
-        )
+        log_stage("resolver", "bm25_offline_fallback",
+                  match_count=len(matches),
+                  vector_used=False)
     return matches
 
 # Back-compat alias

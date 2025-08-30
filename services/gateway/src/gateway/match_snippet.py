@@ -4,10 +4,13 @@ import html
 import hashlib
 from typing import Iterable, Optional, Dict, Any
 
-from core_logging import get_logger, log_stage
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 from shared.content import primary_text
 
 logger = get_logger("gateway.snippet")
+
+__all__ = ["make_snippet", "build_match_snippet"]
 
 _MAX = 160
 _BEFORE = 70
@@ -63,11 +66,19 @@ def make_snippet(query: str, match: Dict[str, Any]) -> str:
 
     safe = html.escape(snippet, quote=False)
     match_id = str(match.get("id") or match.get("_id") or "")
-    log_stage(
-        logger, "gateway", "match_snippet_created",
+    log_stage("gateway", "match_snippet_created",
         match_id=match_id,
         snippet_id=_mk_id(match_id, q, safe),
         q_terms=ts,
         length=len(safe),
     )
     return safe
+
+# Backwards-compat wrapper (legacy name & argument order)
+def build_match_snippet(match: Dict[str, Any], query: str) -> str:
+    """Compatibility shim for older imports.
+
+    Old code calls ``build_match_snippet(match, query)``; the new
+    implementation exposes :func:`make_snippet(query, match)`.
+    This wrapper preserves the old name and argument order.
+    return make_snippet(query, match)"""

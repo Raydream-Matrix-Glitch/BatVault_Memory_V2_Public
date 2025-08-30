@@ -4,7 +4,8 @@ import asyncio
 from contextvars import ContextVar
 from typing import Optional
 
-from core_logging import get_logger, log_stage
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 from core_config import get_settings
 from .redis import get_redis_pool
 
@@ -38,24 +39,27 @@ async def _refresh_loop(period_s: float) -> None:
                 val = (await res) if hasattr(res, "__await__") else res
             flag = bool(str(val or "").strip() == "1")
             _load_shed_flag.set(flag)
-            log_stage(
-                _logger, "load_shed", "refresh_cycle",
+            log_stage("load_shed", "refresh_cycle",
                 task_id=task_id, cycle=cycle, enabled=flag
             )
         except Exception as e:
-            log_stage(
-                _logger, "load_shed", "refresh_error",
+            log_stage("load_shed", "refresh_error",
                 task_id=task_id, cycle=cycle, error=str(e)
             )
         await asyncio.sleep(max(0.1, float(period_s)))
 
 async def _refresh_loop(period_s: float) -> None:
+    cycle = 0
+    task = asyncio.current_task()
+    task_id = getattr(task, 'get_name', lambda: '')() or hex(id(task))
     while True:
         try:
             flag = await _compute_load_shed()
             _load_shed_flag.set(flag)
+            cycle += 1
             try:
-                log_stage(_logger, "load_shed", "refresh", value=flag)
+                log_stage("load_shed", "refresh", value=flag, task_id=task_id, cycle=cycle)
+
             except Exception:
                 pass
         except asyncio.CancelledError:

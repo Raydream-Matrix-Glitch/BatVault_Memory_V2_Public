@@ -976,7 +976,7 @@ class ArangoStore:
             if not results:
                 try:
                     import re as _re
-                    terms = [t for t in _re.findall(r"\w+", q.lower()) if len(t) >= 3]
+                    terms = [t for t in re.findall(r"\w+", q.lower()) if len(t) >= 3]
                 except Exception:
                     terms = []
                 if terms:

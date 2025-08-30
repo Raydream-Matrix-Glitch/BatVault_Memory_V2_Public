@@ -2,10 +2,33 @@ from typing import List, Tuple
 import re
 from core_logging import get_logger
 from core_models.models import WhyDecisionEvidence, WhyDecisionAnswer
+from core_validator import canonical_allowed_ids
 
 logger = get_logger("templater")
 
 _ALIAS_RE = re.compile(r"^[AET]\d+$")
+
+def _scrub_ids_from_text(text: str, allowed_ids: List[str]) -> str:
+    """Remove any raw evidence IDs from free-form prose.
+
+    Matches whole IDs only (IDs are slugs: letters, digits, dashes, underscores).
+    We replace occurrences with an empty string and then normalise whitespace.
+    """
+    if not text:
+        return text
+    if not allowed_ids:
+        return text
+    cleaned = text
+    for _id in sorted(set([i for i in allowed_ids if isinstance(i, str)]), key=len, reverse=True):
+        if not _id:
+            continue
+        # match when not part of a larger slug token
+        pattern = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(_id)}(?![A-Za-z0-9_-])")
+        cleaned = pattern.sub("", cleaned)
+    # collapse excessive whitespace and fix spaces before punctuation
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+([.,;:!?])", r"\1", cleaned)
+    return cleaned
 
 def _pretty_anchor(node_id: str) -> str:
     """
@@ -167,9 +190,16 @@ def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
                     pass
     except Exception:
         pass
-    # Construct the provisional answer (lead + optional Next) and clamp to 320 characters
-    answer = (lead + (next_sent or "")).strip()
-    # Final clamp to max length
+    # Construct answer – append Next only if it fits the 320-char cap
+    if next_sent:
+        if len(lead) + len(next_sent) <= 320:
+            answer = (lead + next_sent).strip()
+        else:
+            # Omit Next when it would be truncated mid-word
+            answer = lead
+    else:
+        answer = lead
+    # Final clamp to max length (lead may still exceed cap)
     if len(answer) > 320:
         answer = answer[:320]
     return answer.strip()
@@ -194,6 +224,61 @@ def finalise_short_answer(
             answer.short_answer = new_s
             changed = True
         s = new_s
+    # Scrub any raw evidence IDs from prose (post-model safety)
+    try:
+        allowed = list(getattr(evidence, 'allowed_ids', []) or [])
+        if not allowed:
+            # fall back to canonical build if evidence.allowed_ids is empty
+            anchor_id = getattr(getattr(evidence, 'anchor', None), 'id', '')
+            events = []
+            for e in (getattr(evidence, 'events', []) or []):
+                if isinstance(e, dict):
+                    events.append(e)
+                else:
+                    try:
+                        events.append(e.model_dump())
+                    except Exception:
+                        pass
+            trans = []
+            trans_obj = getattr(evidence, 'transitions', None)
+            if trans_obj:
+                for _k in ('preceding', 'succeeding'):
+                    try:
+                        arr = getattr(trans_obj, _k, []) or []
+                        for t in arr:
+                            if isinstance(t, dict):
+                                trans.append(t)
+                            else:
+                                try:
+                                    trans.append(t.model_dump())
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+            allowed = canonical_allowed_ids(anchor_id, events, trans)
+        # detect which IDs appear in prose before scrubbing (for logs)
+        try:
+            _hits = []
+            for _id in allowed:
+                try:
+                    if re.search(rf'(?<![A-Za-z0-9_-]){re.escape(_id)}(?![A-Za-z0-9_-])', s):
+                        _hits.append(_id)
+                except Exception:
+                    pass
+            if _hits:
+                try:
+                    logger.info('safety.scrub_ids', extra={'hit_count': len(_hits)})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        scrubbed = _scrub_ids_from_text(s, allowed)
+        if scrubbed != s:
+            s = scrubbed
+            answer.short_answer = scrubbed
+            changed = True
+    except Exception:
+        pass
     # Enforce maximum length
     if s and len(s) > 320:
         answer.short_answer = s[:320]

@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from core_utils import jsonx
 import os
 from pathlib import Path
 from typing import Any, Dict
+import json
 
 from core_utils.fingerprints import canonical_json
 from core_logging import trace_span
 from core_utils.fingerprints import sha256_hex, ensure_sha256_prefix
 from core_config import get_settings
+try:
+    # Prefer unified schema cache (no blocking I/O; read-only access)
+    from .schema_cache import get_cached as _schema_get_cached
+except Exception:  # defensive
+    _schema_get_cached = None
+
+# Unified API path for the registry mirror
+_POLICY_REGISTRY_API_PATH = "/api/policy/registry"
 
 # --------------------------------------------------------------#
 #  Lazy-loaded policy registry with flexible path resolution    #
 # --------------------------------------------------------------#
 _POLICY_REGISTRY: Dict[str, Any] | None = None
-
+_POLICY_REGISTRY_ETAG: str | None = None
 
 def _find_registry() -> Path | None:
     """
@@ -55,6 +65,19 @@ def _load_policy_registry() -> Dict[str, Any]:
     """
     global _POLICY_REGISTRY
     if _POLICY_REGISTRY is None:
+        # 1) Try unified schema cache first (non-blocking; returns None if empty/expired)
+        if _schema_get_cached is not None:
+            try:
+                cached, _etag = _schema_get_cached(_POLICY_REGISTRY_API_PATH)
+                if cached:
+                    _POLICY_REGISTRY = cached
+                    globals()["_POLICY_REGISTRY_ETAG"] = _etag or ""
+                    return _POLICY_REGISTRY
+            except Exception:
+                # Cache read is best-effort; fall back to local file
+                pass
+
+        # 2) Fall back to on-disk registry (dev/local)
         path = _find_registry()
         if path:
             with open(path, "r", encoding="utf-8") as fp:
@@ -144,6 +167,7 @@ def build_prompt_envelope(
         "bundle_fingerprint": bundle_fp,
         "prompt_fingerprint": prompt_fp,
         "snapshot_etag": snapshot_etag,
+        "policy_registry_etag": globals().get("_POLICY_REGISTRY_ETAG", ""),
     }
 
     # ── expose fingerprints on current OTEL span ──────────────────

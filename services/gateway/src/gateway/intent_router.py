@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from core_logging import get_logger, log_stage
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 
 logger = get_logger("gateway.intent_router")
 
@@ -44,7 +45,7 @@ async def route_query(question: str, functions: List[Any] | None = None) -> Dict
         "routing_model_id": "rules_v1",
     }
     try:
-        log_stage(logger, "intent_router", "route", question_len=len(question or ""), calls=calls)
+        log_stage("intent_router", "route", question_len=len(question or ""), calls=calls)
     except Exception:
         pass
     return info

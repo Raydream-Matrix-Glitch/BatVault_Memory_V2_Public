@@ -1,6 +1,7 @@
 from typing import Dict, List, Tuple
 import os
-from core_logging import get_logger, log_stage
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 from shared.content import primary_text_and_field
 from core_config import get_settings
 
@@ -31,7 +32,7 @@ def rerank(query: str, candidates: List[Dict]) -> List[Tuple[Dict, float]]:
         from collections import Counter
         field_counts = Counter([f for (_t, f) in texts if f])
         top3 = dict(field_counts.most_common(3))
-        log_stage(logger, "resolver", "rerank_pairs_built",
+        log_stage("resolver", "rerank_pairs_built",
                   field_top3=top3, candidate_count=len(candidates))
     except Exception:
         pass

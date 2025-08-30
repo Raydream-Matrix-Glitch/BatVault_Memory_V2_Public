@@ -4,7 +4,8 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from core_config import get_settings
-from core_logging import get_logger, log_stage
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 from . import llm_adapters
 from .metrics import gateway_llm_requests, gateway_llm_latency_ms
 
@@ -40,13 +41,13 @@ def _safety_clamp(envelope: Dict[str, Any], raw_json: str, *, request_id: Option
                 data["short_answer"] = short
         out = json.dumps(data, separators=(",", ":"))
         try:
-            log_stage(logger, "inference", "safety_clamp", request_id=request_id, clamped=True)
+            log_stage("inference", "safety_clamp", request_id=request_id, clamped=False)
         except Exception:
             pass
         return out
     except Exception:
         try:
-            log_stage(logger, "inference", "safety_clamp", request_id=request_id, clamped=False)
+            log_stage("inference", "safety_clamp", request_id=request_id, clamped=False)
         except Exception:
             pass
         return raw_json
@@ -114,7 +115,7 @@ async def call_llm(
         try:
             gateway_llm_requests(model_label, "true" if cohort == "canary" else "false", status)
             gateway_llm_latency_ms(model_label, "true" if cohort == "canary" else "false", dur_ms)
-            log_stage(logger, "inference", "call", request_id=request_id, model=model_label, canary=("true" if cohort == "canary" else "false"), latency_ms=int(dur_ms), status=status, retries=attempt-1)
+            log_stage("inference", "call", request_id=request_id, latency_ms=int(dur_ms), status=status, retries=attempt-1)
         except Exception:
             pass
 

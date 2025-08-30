@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio, hashlib, random, os
-from contextlib import contextmanager
+import re
+
 from typing import Any, Dict, Optional, Tuple
+from contextlib import contextmanager
 from .metrics import counter as _ctr
 
 from gateway.redis import get_redis_pool
@@ -11,13 +13,14 @@ from core_utils import jsonx
 from core_config import get_settings
 from core_config.constants import TIMEOUT_EXPAND_MS as _EXPAND_MS
 from core_logging import get_logger, trace_span
-from .http import fetch_json
+from .http import fetch_json, get_http_client
 from core_models.models import (
     WhyDecisionAnchor,
     WhyDecisionEvidence,
     WhyDecisionTransitions,
 )
-from .selector import truncate_evidence, bundle_size_bytes
+from .budget_gate import authoritative_truncate
+from .selector import bundle_size_bytes
 from core_validator import canonical_allowed_ids
 
 
@@ -138,7 +141,7 @@ def _collect_allowed_ids(
     # timestamp, then transitions by timestamp).
     return canonical_allowed_ids(anchor_id, ev_list, tr_list)
 
-def _extract_snapshot_etag(resp: httpx.Response | object) -> str:
+def _extract_snapshot_etag(resp: Any) -> str:
     """
     Retrieve the *snapshot_etag* marker from an HTTP response.
     Robust to:
@@ -327,118 +330,70 @@ class EvidenceBuilder:
         with trace_span.ctx("plan", anchor_id=anchor_id):
             plan = {"node_id": anchor_id, "k": 1}
             expand_ms = min(settings.timeout_expand_ms, _EXPAND_MS)  # clamp to perf budget
-            async with _safe_async_client(
-                timeout=expand_ms / 1000.0,
-                base_url=settings.memory_api_url,
-            ) as client:
-                # Primary attempt to fetch the anchor; fall back to a stub if network fails
-                anchor_json: dict
-                hdr_etag: str
+            client = get_http_client(timeout_ms=int(expand_ms))
+            # Primary attempt to fetch the anchor; fall back to a stub if network fails
+            anchor_json: dict
+            hdr_etag: str
+            try:
+                resp_anchor = await client.get(f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}")
+                if hasattr(resp_anchor, "raise_for_status"):
+                    resp_anchor.raise_for_status()
+                anchor_json = resp_anchor.json() or {}
                 try:
-                    resp_anchor = await client.get(f"/api/enrich/decision/{anchor_id}")
-                    # tolerate stubs without raise_for_status
-                    if hasattr(resp_anchor, "raise_for_status"):
-                        resp_anchor.raise_for_status()
-                    anchor_json = resp_anchor.json() or {}
-                    try:
-                        logger.info(
-                            "anchor_fetch_ok",
-                            extra={
-                                "anchor_id": anchor_id,
-                                "status": int(getattr(resp_anchor, "status_code", 0) or 0),
-                                "has_title": bool(anchor_json.get("title")),
-                                "supported_by_n": len(anchor_json.get("supported_by") or []),
-                                "transitions_n": len(anchor_json.get("transitions") or []),
-                            },
-                        )
-                    except Exception:
-                        pass
-                    if anchor_json.get("id") and anchor_json["id"] != anchor_id:
-                        logger.warning(
-                            "anchor_id_mismatch",
-                            extra={
-                                "requested_anchor_id": anchor_id,
-                                "memory_anchor_id": anchor_json["id"],
-                            },
-                        )
-                    anchor_json["id"] = anchor_id
-                    hdr_etag = _extract_snapshot_etag(resp_anchor) or "unknown"
-                    # If enrich returned a thin anchor (missing rationale/timestamp), retry once with jitter
-                    try:
-                        if not (anchor_json.get("rationale") or anchor_json.get("timestamp")):
-                            await asyncio.sleep(random.uniform(0.02, 0.05))
-                            retry_resp = await client.get(f"/api/enrich/decision/{anchor_id}")
-                            if hasattr(retry_resp, "raise_for_status"):
-                                retry_resp.raise_for_status()
-                            cand = retry_resp.json() or {}
-                            if cand.get("id"):
-                                cand["id"] = anchor_id
-                            if cand.get("rationale") or cand.get("timestamp"):
-                                anchor_json = cand
-                        logger.info(
-                            "anchor_fields_check",
-                            extra={
-                                "anchor_id": anchor_id,
-                                "has_rationale": bool(anchor_json.get("rationale")),
-                                "has_timestamp": bool(anchor_json.get("timestamp")),
-                            },
-                        )
-                    except Exception:
-                        pass
+                    logger.info(
+                        "anchor_fetch_ok",
+                        extra={
+                            "anchor_id": anchor_id,
+                            "status": int(getattr(resp_anchor, "status_code", 0) or 0),
+                            "has_title": bool(anchor_json.get("title")),
+                            "supported_by_n": len(anchor_json.get("supported_by") or []),
+                            "transitions_n": len(anchor_json.get("transitions") or []),
+                        },
+                    )
                 except Exception:
-                    # fallback: try without base_url in a fresh client so that monkey‑patched
-                    # AsyncClient can serve the request (tests provide relative-url stubs)
-                    try:
-                        async with _safe_async_client(
-                            timeout=expand_ms / 1000.0,
-                            _fresh=True,
-                        ) as fb_client:
-                            fresp = await fb_client.get(f"/api/enrich/decision/{anchor_id}")
-                            if hasattr(fresp, "raise_for_status"):
-                                fresp.raise_for_status()
-                            anchor_json = fresp.json() or {}
-                            if anchor_json.get("id") and anchor_json["id"] != anchor_id:
-                                logger.warning(
-                                    "anchor_id_mismatch",
-                                    extra={
-                                        "requested_anchor_id": anchor_id,
-                                        "memory_anchor_id": anchor_json.get("id"),
-                                    },
-                                )
-                            anchor_json["id"] = anchor_id
-                            hdr_etag = _extract_snapshot_etag(fresp) or "unknown"
-                            # Thin anchor retry with jitter in fallback branch
-                            try:
-                                if not (anchor_json.get("rationale") or anchor_json.get("timestamp")):
-                                    await asyncio.sleep(random.uniform(0.02, 0.05))
-                                    r2 = await fb_client.get(f"/api/enrich/decision/{anchor_id}")
-                                    if hasattr(r2, "raise_for_status"):
-                                        r2.raise_for_status()
-                                    cand2 = r2.json() or {}
-                                    if cand2.get("id"):
-                                        cand2["id"] = anchor_id
-                                    if cand2.get("rationale") or cand2.get("timestamp"):
-                                        anchor_json = cand2
-                                logger.info(
-                                    "anchor_fields_check_fb",
-                                    extra={
-                                        "anchor_id": anchor_id,
-                                        "has_rationale": bool(anchor_json.get("rationale")),
-                                        "has_timestamp": bool(anchor_json.get("timestamp")),
-                                    },
-                                )
-                            except Exception:
-                                pass
-                    except Exception:
-                        logger.warning(
-                            "anchor_enrich_failed",
-                            extra={"anchor_id": anchor_id, "error": "fetch_failed"}
-                        )
-                        try:
-                            _ctr("gateway_anchor_enrich_fail_total", 1)
-                        except Exception:
-                            pass
-                        anchor_json, hdr_etag = {"id": anchor_id}, "unknown"
+                    pass
+                if anchor_json.get("id") and anchor_json["id"] != anchor_id:
+                    logger.warning(
+                        "anchor_id_mismatch",
+                        extra={
+                            "requested_anchor_id": anchor_id,
+                            "memory_anchor_id": anchor_json["id"],
+                        },
+                    )
+                anchor_json["id"] = anchor_id
+                hdr_etag = _extract_snapshot_etag(resp_anchor) or "unknown"
+                # If enrich returned a thin anchor (missing rationale/timestamp), retry once with jitter
+                try:
+                    if not (anchor_json.get("rationale") or anchor_json.get("timestamp")):
+                        await asyncio.sleep(random.uniform(0.02, 0.05))
+                        retry_resp = await client.get(f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}")
+                        if hasattr(retry_resp, "raise_for_status"):
+                            retry_resp.raise_for_status()
+                        cand = retry_resp.json() or {}
+                        if cand.get("id"):
+                            cand["id"] = anchor_id
+                        if cand.get("rationale") or cand.get("timestamp"):
+                            anchor_json = cand
+                    logger.info(
+                        "anchor_fields_check",
+                        extra={
+                            "anchor_id": anchor_id,
+                            "has_rationale": bool(anchor_json.get("rationale")),
+                            "has_timestamp": bool(anchor_json.get("timestamp")),
+                        },
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.warning(
+                    "anchor_enrich_failed",
+                    extra={"anchor_id": anchor_id, "error": type(exc).__name__},
+                )
+                try:
+                    _ctr("gateway_anchor_enrich_fail_total", 1)
+                except Exception:
+                    pass
+                anchor_json, hdr_etag = {"id": anchor_id}, "unknown"
                 # Mirror option to title if title is missing (supports stubbed Memory API)
                 try:
                     if anchor_json.get("option") and not anchor_json.get("title"):
@@ -446,46 +401,43 @@ class EvidenceBuilder:
                 except Exception:
                     pass
 
-                with trace_span.ctx("exec", anchor_id=anchor_id) as span:
-                        try:
-                            resp_neigh = await client.post("/api/graph/expand_candidates", json=plan)
-                            resp_neigh.raise_for_status()
-                            neigh: dict = resp_neigh.json() or {}
-                        except (asyncio.TimeoutError, httpx.HTTPError, Exception) as exc:
-                            # fallback: try expand_candidates again without base_url in fresh client
-                            try:
-                                async with _safe_async_client(
-                                    timeout=expand_ms / 1000.0,
-                                    _fresh=True,
-                                ) as fb_client:
-                                    fresp_neigh = await fb_client.post(
-                                        "/api/graph/expand_candidates", json=plan
-                                    )
-                                    fresp_neigh.raise_for_status()
-                                    neigh = fresp_neigh.json() or {}
-                            except Exception:
-                                logger.warning(
-                                    "expand_candidates_failed",
-                                    extra={"anchor_id": anchor_id, "error": type(exc).__name__},
-                                )
-                                span.set_attribute("timeout", True)
-                                neigh = {"neighbors": []}
+        # Default snapshot_etag to the anchor header etag; may be updated by expand meta.
+        snapshot_etag = hdr_etag
 
-                meta = neigh.get("meta") or {}
-                # Strategic: show whether expand actually returned anything,
-                # without dumping payloads.
-                try:
-                    logger.info("expand_result",
-                                extra={"anchor_id": anchor_id, "neighbor_count": len(neigh.get("neighbors") or []), "meta_keys": list((meta or {}).keys())})
-                except Exception:  # logging must never break the hot path
-                    pass
-                meta_etag = None
-                if isinstance(meta, dict):
-                    meta_etag = meta.get("snapshot_etag")
-                if meta_etag:
-                    snapshot_etag = meta_etag
-                else:
-                    snapshot_etag = hdr_etag
+        # Execute neighbor expansion (single authoritative block)
+        with trace_span.ctx("exec", anchor_id=anchor_id) as span:
+            try:
+                resp_neigh = await client.post(f"{settings.memory_api_url}/api/graph/expand_candidates", json=plan)
+                if hasattr(resp_neigh, "raise_for_status"):
+                    resp_neigh.raise_for_status()
+                neigh: dict = resp_neigh.json() or {}
+            except Exception as exc:
+                logger.warning(
+                    "expand_candidates_failed",
+                    extra={"anchor_id": anchor_id, "error": type(exc).__name__},
+                )
+                span.set_attribute("timeout", True)
+                neigh = {"neighbors": []}
+
+        meta = neigh.get("meta") or {}
+        # Strategic: show whether expand actually returned anything,
+        # without dumping payloads.
+        try:
+            logger.info(
+                "expand_result",
+                extra={
+                    "anchor_id": anchor_id,
+                    "neighbor_count": len(neigh.get("neighbors") or []),
+                    "meta_keys": list((meta or {}).keys()),
+                },
+            )
+        except Exception:  # logging must never break the hot path
+            pass
+        meta_etag = None
+        if isinstance(meta, dict):
+            meta_etag = meta.get("snapshot_etag")
+        if meta_etag:
+            snapshot_etag = meta_etag
 
         events: list[dict] = []                    # event neighbours
         pre:    list[dict] = []                    # will hold classified preceding transitions
@@ -557,7 +509,7 @@ class EvidenceBuilder:
                         neighbor_trans_orient[tid] = rel
             else:  # flattened list
                 for n in neighbors:
-                    # Determine declared entity type (lower‑cased); default to empty string
+                    # Determine declared entity type (lower-cased); default to empty string
                     raw_type = n.get("type") or n.get("entity_type") or ""
                     ntype = str(raw_type).lower() if raw_type is not None else ""
                     edge = n.get("edge") or {}
@@ -605,7 +557,7 @@ class EvidenceBuilder:
                 deduped_events.append(ev)
             events = deduped_events
 
-            # Milestone‑5: further deduplicate near‑identical events by day and description.
+            # Milestone-5: further deduplicate near-identical events by day and description.
             try:
                 import re as _re
                 grouped_keys: set[tuple] = set()
@@ -617,7 +569,7 @@ class EvidenceBuilder:
                         summary = ev.get("summary") or ev.get("description") or ""
                         if not isinstance(summary, str):
                             summary = str(summary)
-                        key_text = _re.sub(r"[\d\$¥€£,\.\s]+", "", summary).lower()
+                        key_text = re.sub(r"[\d\$¥€£,\.\s]+", "", summary).lower()
                         dedup_key = (date_part, key_text)
                     except Exception:
                         dedup_key = (ev.get("timestamp"), ev.get("id"))
@@ -665,42 +617,40 @@ class EvidenceBuilder:
         if events:
             with trace_span.ctx("enrich", anchor_id=anchor_id):
                 enriched_events: list[dict] = []
-                async with _safe_async_client(
-                    base_url=settings.memory_api_url,
-                    timeout=settings.timeout_enrich_ms / 1000.0,
-                ) as ev_client:
-                    for ev in events:
-                        # Skip enrichment for events that already carry a led_to marker (support link)
-                        if "led_to" in ev:
-                            enriched_events.append(ev)
-                            continue
-                        eid = ev.get("id")
-                        if not eid:
-                            enriched_events.append(ev)
-                            continue
-                        # Determine declared type (if any) for enrichment routing.  Decisions are
-                        # not included in events, but guard defensively.
-                        etype = (ev.get("type") or ev.get("entity_type") or "").lower()
-                        # Only enrich true events via the event endpoint.  Decisions are skipped
-                        # entirely (no enrichment), as they are dropped from the evidence.
-                        if etype == "decision":
-                            # Skip enrichment for decisions; append original to maintain position
-                            enriched_events.append(ev)
-                            continue
-                        path = f"/api/enrich/event/{eid}"
-                        try:
-                            eresp = await ev_client.get(path)
+                ev_client = get_http_client(timeout_ms=int(settings.timeout_enrich_ms))
+                for ev in events:
+                    # Skip enrichment for events that already carry a led_to marker (support link)
+                    if "led_to" in ev:
+                        enriched_events.append(ev)
+                        continue
+                    eid = ev.get("id")
+                    if not eid:
+                        enriched_events.append(ev)
+                        continue
+                    # Determine declared type (if any) for enrichment routing.  Decisions are
+                    # not included in events, but guard defensively.
+                    etype = (ev.get("type") or ev.get("entity_type") or "").lower()
+                    # Only enrich true events via the event endpoint.  Decisions are skipped
+                    # entirely (no enrichment), as they are dropped from the evidence.
+                    if etype == "decision":
+                        # Skip enrichment for decisions; append original to maintain position
+                        enriched_events.append(ev)
+                        continue
+                    path = f"{settings.memory_api_url}/api/enrich/event/{eid}"
+                    try:
+                        eresp = await ev_client.get(path)
+                        if hasattr(eresp, "raise_for_status"):
                             eresp.raise_for_status()
-                            # Merge enriched payload first so that input fields (summary, timestamp)
-                            # override returned defaults.  This yields a base with id only,
-                            # overwritten by any input metadata we wish to preserve.
-                            enriched_events.append({**eresp.json(), **ev})
-                        except Exception:
-                            logger.warning(
-                                "event_enrich_failed",
-                                extra={"event_id": eid, "anchor_id": anchor_id},
-                            )
-                            enriched_events.append(ev)
+                        # Merge enriched payload first so that input fields (summary, timestamp)
+                        # override returned defaults.  This yields a base with id only,
+                        # overwritten by any input metadata we wish to preserve.
+                        enriched_events.append({**eresp.json(), **ev})
+                    except Exception:
+                        logger.warning(
+                            "event_enrich_failed",
+                            extra={"event_id": eid, "anchor_id": anchor_id},
+                        )
+                        enriched_events.append(ev)
                 # After enrichment, the Memory API is responsible for returning
                 # neighbour events that have already been normalised.  The
                 # EvidenceBuilder no longer reprojects or sanitises the event
@@ -743,106 +693,74 @@ class EvidenceBuilder:
         if anchor_trans_ids or neighbor_transitions:
             with trace_span.ctx("transitions_enrich", anchor_id=anchor_id):
                 try:
-                    async with _safe_async_client(
-                        base_url=settings.memory_api_url,
-                        timeout=settings.timeout_enrich_ms / 1000.0,
-                    ) as tr_client:
-                        # First hydrate and classify transitions declared on the anchor
-                        for tid in anchor_trans_ids:
-                            if not isinstance(tid, str) or tid in seen_trans:
-                                continue
-                            seen_trans.add(tid)
-                            tdoc: dict | None = None
-                            # Attempt primary fetch
-                            try:
-                                resp = await tr_client.get(f"/api/enrich/transition/{tid}")
+                    tr_client = get_http_client(timeout_ms=int(settings.timeout_enrich_ms))
+                    # First hydrate and classify transitions declared on the anchor
+                    for tid in anchor_trans_ids:
+                        if not isinstance(tid, str) or tid in seen_trans:
+                            continue
+                        seen_trans.add(tid)
+                        tdoc: dict | None = None
+                        # Attempt primary fetch
+                        try:
+                            resp = await tr_client.get(f"{settings.memory_api_url}/api/enrich/transition/{tid}")
+                            if hasattr(resp, "raise_for_status"):
                                 resp.raise_for_status()
-                                tdoc = resp.json() or {}
-                            except Exception:
-                                # Fallback fetch without base_url using fresh client
-                                try:
-                                    async with _safe_async_client(
-                                        timeout=settings.timeout_enrich_ms / 1000.0,
-                                        _fresh=True,
-                                    ) as fb_client:
-                                        try:
-                                            fresp = await fb_client.get(f"/api/enrich/transition/{tid}")
-                                            fresp.raise_for_status()
-                                            tdoc = fresp.json() or {}
-                                        except Exception:
-                                            tdoc = None
-                                except Exception:
-                                    tdoc = None
-                                # Final fallback: use neighbour-provided stub if available
-                                if tdoc is None:
-                                    stub = neighbor_transitions.get(tid)
-                                    if stub:
-                                        tdoc = stub
-                            # If still missing, record and skip
-                            if not tdoc:
-                                missing_trans.append(tid)
-                                continue
-                            # Determine orientation solely based on explicit "to"/"from" relative to anchor
-                            to_id   = tdoc.get("to")   or tdoc.get("to_id")
-                            from_id = tdoc.get("from") or tdoc.get("from_id")
-                            orient: str | None = None
-                            if to_id == anchor_id:
-                                orient = "preceding"
-                            elif from_id == anchor_id:
-                                orient = "succeeding"
-                            if orient == "preceding":
-                                trans_pre_list.append(tdoc)
-                            elif orient == "succeeding":
-                                trans_suc_list.append(tdoc)
-                            else:
-                                # Unknown orientation – consider missing
-                                missing_trans.append(tid)
-                        # Now hydrate and classify neighbour transitions (those not on anchor)
-                        for tid, stub in neighbor_transitions.items():
-                            # Skip IDs already processed from the anchor list
-                            if not isinstance(tid, str) or tid in seen_trans:
-                                continue
-                            seen_trans.add(tid)
-                            tdoc: dict | None = None
-                            try:
-                                resp = await tr_client.get(f"/api/enrich/transition/{tid}")
+                            tdoc = resp.json() or {}
+                        except Exception:
+                            # Final fallback: use neighbour-provided stub if available
+                            tdoc = neighbor_transitions.get(tid)
+                        # If still missing, record and skip
+                        if not tdoc:
+                            missing_trans.append(tid)
+                            continue
+                        # Determine orientation solely based on explicit "to"/"from" relative to anchor
+                        to_id   = tdoc.get("to")   or tdoc.get("to_id")
+                        from_id = tdoc.get("from") or tdoc.get("from_id")
+                        orient: str | None = None
+                        if to_id == anchor_id:
+                            orient = "preceding"
+                        elif from_id == anchor_id:
+                            orient = "succeeding"
+                        if orient == "preceding":
+                            trans_pre_list.append(tdoc)
+                        elif orient == "succeeding":
+                            trans_suc_list.append(tdoc)
+                        else:
+                            # Unknown orientation – consider missing
+                            missing_trans.append(tid)
+                    # Now hydrate and classify neighbour transitions (those not on anchor)
+                    for tid, stub in neighbor_transitions.items():
+                        # Skip IDs already processed from the anchor list
+                        if not isinstance(tid, str) or tid in seen_trans:
+                            continue
+                        seen_trans.add(tid)
+                        tdoc: dict | None = None
+                        try:
+                            resp = await tr_client.get(f"{settings.memory_api_url}/api/enrich/transition/{tid}")
+                            if hasattr(resp, "raise_for_status"):
                                 resp.raise_for_status()
-                                tdoc = resp.json() or {}
-                            except Exception:
-                                try:
-                                    async with _safe_async_client(
-                                        timeout=settings.timeout_enrich_ms / 1000.0,
-                                        _fresh=True,
-                                    ) as fb_client:
-                                        try:
-                                            fresp = await fb_client.get(f"/api/enrich/transition/{tid}")
-                                            fresp.raise_for_status()
-                                            tdoc = fresp.json() or {}
-                                        except Exception:
-                                            tdoc = None
-                                except Exception:
-                                    tdoc = None
-                                if tdoc is None and stub:
-                                    tdoc = stub
-                            if not tdoc:
-                                missing_trans.append(tid)
-                                continue
-                            # Determine orientation: explicit to/from dominates; fallback to neighbour hint
-                            to_id = tdoc.get("to")
-                            from_id = tdoc.get("from")
-                            orient: str | None = None
-                            if to_id == anchor_id:
-                                orient = "preceding"
-                            elif from_id == anchor_id:
-                                orient = "succeeding"
-                            if orient is None:
-                                orient = neighbor_trans_orient.get(tid)
-                            if orient == "preceding":
-                                trans_pre_list.append(tdoc)
-                            elif orient == "succeeding":
-                                trans_suc_list.append(tdoc)
-                            else:
-                                missing_trans.append(tid)
+                            tdoc = resp.json() or {}
+                        except Exception:
+                            tdoc = stub
+                        if not tdoc:
+                            missing_trans.append(tid)
+                            continue
+                        # Determine orientation: explicit to/from dominates; fallback to neighbour hint
+                        to_id = tdoc.get("to")
+                        from_id = tdoc.get("from")
+                        orient: str | None = None
+                        if to_id == anchor_id:
+                            orient = "preceding"
+                        elif from_id == anchor_id:
+                            orient = "succeeding"
+                        if orient is None:
+                            orient = neighbor_trans_orient.get(tid)
+                        if orient == "preceding":
+                            trans_pre_list.append(tdoc)
+                        elif orient == "succeeding":
+                            trans_suc_list.append(tdoc)
+                        else:
+                            missing_trans.append(tid)
                 except Exception:
                     # Catastrophic failure: mark all IDs as missing
                     missing_trans.extend([tid for tid in anchor_trans_ids if isinstance(tid, str)])
@@ -872,17 +790,14 @@ class EvidenceBuilder:
                 needs_title = not _first.get("to_title")
                 if isinstance(_to_id, str) and _to_id and needs_title:
                     try:
-                        async with _safe_async_client(
-                            base_url=settings.memory_api_url,
-                            timeout=settings.timeout_enrich_ms / 1000.0,
-                        ) as _dec_client:
-                            dresp = await _dec_client.get(f"/api/enrich/decision/{_to_id}")
-                            if hasattr(dresp, "raise_for_status"):
-                                dresp.raise_for_status()
-                            ddoc = dresp.json() or {}
-                            _to_title = ddoc.get("title") or ddoc.get("option")
-                            if _to_title:
-                                _first["to_title"] = _to_title
+                        _dec_client = get_http_client(timeout_ms=int(settings.timeout_enrich_ms))
+                        dresp = await _dec_client.get(f"{settings.memory_api_url}/api/enrich/decision/{_to_id}")
+                        if hasattr(dresp, "raise_for_status"):
+                            dresp.raise_for_status()
+                        ddoc = dresp.json() or {}
+                        _to_title = ddoc.get("title") or ddoc.get("option")
+                        if _to_title:
+                            _first["to_title"] = _to_title
                     except Exception:
                         # best-effort; omit if enrichment fails
                         try:
@@ -929,7 +844,23 @@ class EvidenceBuilder:
                 )
             except Exception:
                 pass
-        anchor = WhyDecisionAnchor(**anchor_json)
+        # Strict schema: filter out unexpected fields from anchor_json before model init
+        _allowed_anchor_fields = set(WhyDecisionAnchor.model_fields.keys())
+        _incoming_anchor_keys = set((anchor_json or {}).keys())
+        if _incoming_anchor_keys - _allowed_anchor_fields:
+            try:
+                logger.info(
+                    "anchor_extra_fields_dropped",
+                    extra={
+                        "anchor_id": anchor_id,
+                        "dropped": sorted([k for k in _incoming_anchor_keys - _allowed_anchor_fields]),
+                    },
+                )
+            except Exception:
+                pass
+        _safe_anchor = {k: v for k, v in (anchor_json or {}).items() if k in _allowed_anchor_fields}
+        _safe_anchor.setdefault("id", anchor_id)
+        anchor = WhyDecisionAnchor(**_safe_anchor)
         ev = WhyDecisionEvidence(
             anchor=anchor,
             events=events,
@@ -940,7 +871,7 @@ class EvidenceBuilder:
 
         ev.snapshot_etag = snapshot_etag
         ev.__dict__["_retry_count"] = retry_count
-        ev, selector_meta = truncate_evidence(ev)
+        ev, selector_meta = authoritative_truncate(ev)
         if getattr(ev, "snapshot_etag", None) != snapshot_etag:
             ev.snapshot_etag = snapshot_etag
         try:
@@ -1005,7 +936,7 @@ class EvidenceBuilder:
 
         If the etag is missing (None or empty string) we assume the bundle is fresh.
         The sentinel value ``"unknown"`` forces regeneration.  We attempt to
-        re-fetch the anchor with a lightweight ETag check; when the monkey‑patched
+        re-fetch the anchor with a lightweight ETag check; when the monkey-patched
         HTTP client does not accept headers we retry without them.  Any unexpected
         exception is treated as **stale** (fail-closed) so we regenerate when the
         Memory API is unreachable or returns an error.
@@ -1015,16 +946,12 @@ class EvidenceBuilder:
         if cached_etag == "unknown":
             return False
         try:
-            async with _safe_async_client(
-                timeout=0.05,
-                base_url=settings.memory_api_url,
-                _fresh=True,
-            ) as client:
-                url = f"/api/enrich/decision/{anchor_id}"
-                try:
-                    resp = await client.get(url, headers={"x-cache-etag-check": "1"})
-                except TypeError:
-                    resp = await client.get(url)
+            client = get_http_client(timeout_ms=50)
+            url = f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}"
+            try:
+                resp = await client.get(url, headers={"x-cache-etag-check": "1"})
+            except Exception:
+                resp = await client.get(url)
             return _extract_snapshot_etag(resp) == cached_etag
         except Exception:
             try:
@@ -1032,5 +959,6 @@ class EvidenceBuilder:
             except Exception:
                 pass
             return False
+
     async def get_evidence(self, anchor_id: str) -> WhyDecisionEvidence:
         return await self.build(anchor_id)

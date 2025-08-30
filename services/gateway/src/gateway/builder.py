@@ -6,7 +6,8 @@ import orjson
 from core_config import get_settings
 
 import importlib.metadata as _md
-from core_logging import log_stage, get_logger
+from core_logging import get_logger
+from .logging_helpers import stage as log_stage
 from core_utils.fingerprints import canonical_json
 from core_models.models import (
     WhyDecisionAnchor,
@@ -187,7 +188,7 @@ def _dedup_and_normalise_events(ev: WhyDecisionEvidence) -> None:
                 if not isinstance(summary, str):
                     summary = str(summary)
                 # Remove digits, currency symbols and punctuation; collapse whitespace
-                key_text = _re.sub(r"[\d$¥€£,\.\s]+", "", summary).lower()
+                key_text = re.sub(r"[\d$¥€£,\.\s]+", "", summary).lower()
                 dedup_key = (date_part, key_text)
             except Exception:
                 dedup_key = (item.get("timestamp"), item.get("id"))
@@ -310,19 +311,33 @@ async def build_why_decision_response(
             ev_trans,
         )
     except Exception as e:
-        log_stage(logger, "builder", "allowed_ids_canonicalization_failed",
+        log_stage("builder", "allowed_ids_canonicalization_failed",
                   error=str(e), request_id=getattr(req, "request_id", None))
         raise
     # Persist the final evidence with empty collections omitted
     arte["evidence_final.json"] = orjson.dumps(ev.model_dump(mode="python", exclude_none=True))
     try:
-        log_stage(logger, "builder", "evidence_final_persisted",
+        log_stage("builder", "evidence_final_persisted",
                   request_id=req_id,
                   allowed_ids=len(getattr(ev, "allowed_ids", []) or []))
     except Exception:
         pass
 
     # Build a pre-envelope (the gate will strip evidence when computing overhead)
+    # Warm the policy registry via unified schema cache (P1: collapse schema fetching)
+    try:
+        from .schema_cache import fetch_schema as _fetch_schema
+        await _fetch_schema("/api/policy/registry")
+        try:
+            log_stage("schema", "policy_registry_warmed", request_id=req_id)
+        except Exception:
+            pass
+    except Exception:
+        # Non-fatal: fall back to local file in prompt_envelope loader
+        try:
+            log_stage("schema", "policy_registry_warm_failed", request_id=req_id)
+        except Exception:
+            pass
     pre_envelope = build_prompt_envelope(
         question=f"Why was decision {ev.anchor.id} made?",
         # Pass only non‑None fields in the evidence bundle to avoid including
@@ -352,7 +367,7 @@ async def build_why_decision_response(
             ev_trans,
         )
     except Exception as e:
-        log_stage(logger, "builder", "allowed_ids_recanonicalize_failed",
+        log_stage("builder", "allowed_ids_recanonicalize_failed",
                   error=str(e), request_id=req_id)
     # Normalise empty transition lists to None before serialising the post-gate evidence.
     # When a field is None Pydantic can omit it from the JSON (exclude_none=True).
@@ -435,15 +450,14 @@ async def build_why_decision_response(
         use_llm = (settings.llm_mode or "off").lower() != "off"
         # Strategic log (B5 envelope): makes the gate visible in traces & audit
         try:
-            log_stage(logger, "prompt", "llm_gate", llm_mode=settings.llm_mode, use_llm=use_llm)
+            log_stage("prompt", "llm_gate", llm_mode=settings.llm_mode, use_llm=use_llm)
 
         except Exception:
             pass
         # If the LLM is explicitly disabled by config, record that clearly and mark fallback.
         if not use_llm:
             try:
-                log_stage(
-                    logger, "llm", "disabled",
+                log_stage("llm", "disabled",
                     request_id=req_id,
                     llm_mode=settings.llm_mode,
                     reason="llm_mode_off",
@@ -494,8 +508,7 @@ async def build_why_decision_response(
             if use_llm:
                 # Strategic log: immediate fallback decision (+ environment for audit)
                 try:
-                    log_stage(
-                        logger, "llm", "fallback",
+                    log_stage("llm", "fallback_decision",
                         request_id=req_id,
                         reason="no_raw_json",
                         openai_disabled=getattr(s, "openai_disabled", False),
@@ -537,10 +550,10 @@ async def build_why_decision_response(
                     llm_fallback = True
                     fallback_reason = "stub_answer"
                     try:
-                        log_stage(
-                            logger, "llm", "fallback",
+                        log_stage("llm", "fallback",
                             request_id=req_id,
                             reason="stub_answer",
+                            snapshot_etag=snapshot_etag_fp,
                         )
                     except Exception:
                         pass
@@ -552,10 +565,11 @@ async def build_why_decision_response(
                 llm_fallback = True
                 fallback_reason = "parse_error"
                 try:
-                    log_stage(
-                        logger, "llm", "fallback",
+                    log_stage("llm", "fallback",
                         request_id=req_id,
-                        reason="parse_error", detail=str(e)[:200],
+                        reason="parse_error",
+                        detail=str(e)[:200],
+                        snapshot_etag=snapshot_etag_fp,
                     )
                 except Exception:
                     pass
@@ -614,12 +628,12 @@ async def build_why_decision_response(
             _metric_counter('gateway_llm_fallback_total', 1)
         except Exception:
             pass
-        log_stage(get_logger("builder"), "builder", "llm_fallback_used",
+        log_stage("builder", "llm_fallback_used",
                   request_id=req_id,
                   prompt_fp=prompt_fp,
                   bundle_fp=bundle_fp)
     if sel_meta.get("selector_truncation"):
-        log_stage(get_logger("builder"), "builder", "selector_truncated",
+        log_stage("builder", "selector_truncated",
                   request_id=req_id,
                   prompt_tokens=sel_meta.get("prompt_tokens"),
                   max_prompt_tokens=sel_meta.get("max_prompt_tokens"))
@@ -664,8 +678,9 @@ async def build_why_decision_response(
         evidence_metrics=dict(_sel_metrics_pre) if _sel_metrics_pre else {},
     )
     try:
-        log_stage(get_logger("builder"), "builder", "meta_prepared_pre_validation",
-                  request_id=req_id, policy_id=_policy_id_pre, prompt_id=_prompt_id_pre)
+        log_stage("builder", "meta_prepared_pre_validation",
+                  request_id=req_id, policy_id=_policy_id_pre, prompt_id=_prompt_id_pre,
+                  snapshot_etag=snapshot_etag_fp)
     except Exception:
         pass
 
@@ -697,8 +712,9 @@ async def build_why_decision_response(
     if validator_errs:
         errs.extend(validator_errs)
     if errs:
-        log_stage(get_logger("builder"), "builder", "validator_repaired",
-                  request_id=req_id, error_count=len(errs))
+        log_stage("builder", "validator_repaired",
+                  request_id=req_id, error_count=len(errs),
+                  snapshot_etag=snapshot_etag_fp)
 
     # ── persist artefacts ───────────────────────────────────────────
     arte["envelope.json"] = orjson.dumps(envelope)
@@ -724,17 +740,20 @@ async def build_why_decision_response(
     # Log an explicit fallback reason for traceability
     try:
         if llm_fallback:
-            log_stage(get_logger("builder"), "builder", "llm_fallback_used",
-                      request_id=req_id, prompt_fp=prompt_fp, bundle_fp=bundle_fp)
+            log_stage("builder", "llm_fallback_used",
+                      request_id=req_id, prompt_fp=prompt_fp, bundle_fp=bundle_fp,
+                      snapshot_etag=snapshot_etag_fp)
         elif any_validation:
             if fatal_validation:
                 codes = [e.get("code") for e in validator_errs or [] if e.get("code") in fatal_codes]
-                log_stage(get_logger("builder"), "builder", "validator_fallback",
-                          request_id=req_id, codes=codes)
+                log_stage("builder", "validator_fallback",
+                          request_id=req_id, codes=codes,
+                          snapshot_etag=snapshot_etag_fp)
             else:
                 non_fatal = [e.get("code") for e in validator_errs if e.get("code") not in fatal_codes]
-                log_stage(get_logger("builder"), "builder", "validator_repaired_nonfatal",
-                          request_id=req_id, codes=non_fatal)
+                log_stage("builder", "validator_repaired_nonfatal",
+                          request_id=req_id, codes=non_fatal,
+                          snapshot_etag=snapshot_etag_fp)
     except Exception:
         pass
 

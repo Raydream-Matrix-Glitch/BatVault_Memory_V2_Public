@@ -102,11 +102,14 @@ services:
     networks: [batnet]
 
   api_edge:
+    image: batvault/python-svc:dev
     build:
       context: .
       dockerfile: ops/docker/Dockerfile.python
-      args:
-        SERVICE_NAME: api_edge
+      cache_from:
+        - type=local,src=.docker-cache
+      cache_to:
+        - type=local,dest=.docker-cache,mode=max
     environment:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
@@ -135,11 +138,7 @@ services:
     networks: [batnet]
 
   gateway:
-    build:
-      context: .
-      dockerfile: ops/docker/Dockerfile.python
-      args:
-        SERVICE_NAME: gateway
+    image: batvault/python-svc:dev
     environment:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
@@ -169,11 +168,7 @@ services:
     networks: [batnet]
 
   memory_api:
-    build:
-      context: .
-      dockerfile: ops/docker/Dockerfile.python
-      args:
-        SERVICE_NAME: memory_api
+    image: batvault/python-svc:dev
     environment:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
@@ -341,11 +336,7 @@ services:
     networks: [batnet]
 
   ingest:
-    build:
-      context: .
-      dockerfile: ops/docker/Dockerfile.python
-      args:
-        SERVICE_NAME: ingest
+    image: batvault/python-svc:dev
     environment:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}

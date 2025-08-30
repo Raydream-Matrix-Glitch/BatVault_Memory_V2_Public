@@ -6,11 +6,6 @@ import orjson
 
 from core_models.models import WhyDecisionAnchor, WhyDecisionEvidence
 
-# Expose shortcuts in the global namespace so Milestone-3 test-suites that
-# still import these symbols *bare* keep working until they migrate.
-import builtins as _b
-_b.WhyDecisionEvidence = WhyDecisionEvidence
-_b.WhyDecisionAnchor = WhyDecisionAnchor
 from core_validator import canonical_allowed_ids
 
 import time
@@ -93,25 +88,3 @@ def rank_events(anchor: WhyDecisionAnchor, events: list[dict]) -> list[dict]:
         # Fallback: timestamp desc → id asc
         return sorted(list(events), key=lambda e: (e.get("timestamp") or "", e.get("id") or ""), reverse=True)
 
-def truncate_evidence(
-    ev: WhyDecisionEvidence,
-    *,
-    overhead_tokens: int = 0,
-    desired_completion_tokens: int | None = None,
-    context_window: int | None = None,
-    guard_tokens: int | None = None,
-) -> Tuple[WhyDecisionEvidence, Dict[str, Any]]:
-
-    """Delegate trimming to the authoritative budget gate.
-
-    Selector now owns *ordering only*. All token budgeting and evidence
-    trimming happens in ``budget_gate.authoritative_truncate``.
-    """
-    from .budget_gate import authoritative_truncate  # local import to avoid cycles
-    return authoritative_truncate(
-        ev,
-        overhead_tokens=overhead_tokens,
-        desired_completion_tokens=desired_completion_tokens,
-        context_window=context_window,
-        guard_tokens=guard_tokens,
-    )

@@ -4,10 +4,11 @@ from core_logging import log_stage as _log_stage, trace_span as _trace_span, get
 
 _logger = get_logger("gateway")
 
-def stage(stage_name: str, action: str, **fields: Any) -> None:
+def stage(stage_name: str, action: str, /, **fields: Any) -> None:
     """
-    Thin wrapper around core_logging.log_stage that guarantees a consistent envelope.
-    Always injects service='gateway' and passes through common IDs when present.
+    Strict wrapper around core_logging.log_stage with a stable envelope.
+    Signature: stage(stage_name, action, **fields)
+    (Legacy positional `logger` is no longer accepted.)
     """
     try:
         _log_stage(_logger, stage_name, action, service="gateway", **fields)
