@@ -1,15 +1,3 @@
-"""
-Schema definition for metadata inputs used during meta construction.
-
-This Pydantic model enumerates the expected telemetry fields needed to
-construct a canonical :class:`MetaInfo` instance.  It forbids extra
-attributes to surface unknown keys early and ensures a JSON-first
-contract.  See :mod:`shared.meta_builder` for the corresponding
-construction helper.
-"""
-
-from __future__ import annotations
-
 from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -49,6 +37,11 @@ class MetaInputs(BaseModel):
     validator_error_count: int
     # Selector/evidence metrics
     evidence_metrics: Dict[str, Any] = Field(default_factory=dict)
+    # Trace correlation
+    trace_id: Optional[str] = None
+    span_id: Optional[str] = None
+    # Compact validator signal for public payloads
+    validator_warnings: list[str] = Field(default_factory=list)
     # Load shed indicator
     load_shed: bool = False
     # Event shaping telemetry

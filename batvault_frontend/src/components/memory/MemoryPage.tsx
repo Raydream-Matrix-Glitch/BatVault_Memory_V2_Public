@@ -8,7 +8,7 @@ import type { EvidenceItem, EvidenceBundle } from "../../types/memory";
 import AuditDrawer from "./AuditDrawer";
 import Button from "./ui/Button";
 import TagCloud from "./TagCloud";
-import SchemaExplorer from "./SchemaExplorer";
+import { logEvent } from "../../utils/logger";
 import GraphView from "./GraphView";
 import { motion } from "framer-motion";
 
@@ -29,7 +29,6 @@ export default function MemoryPage() {
     finalData,
     ask,
     query,
-    cancel,
   } = useMemoryAPI();
 
   // Track which evidence item is currently selected (for graph/audit integration).
@@ -45,14 +44,17 @@ export default function MemoryPage() {
   const handleOpenAudit = () => {
     setAuditOpen(true);
     // Deterministic event key; include request id if present.
-    console.debug("[memory.audit.open]", { evt: "audit_open", rid: finalData?.meta?.request_id ?? null });
-  };
-  const handleCloseAudit = () => {
-    setAuditOpen(false);
-    console.debug("[memory.audit.close]", { evt: "audit_close", rid: finalData?.meta?.request_id ?? null });
+    logEvent("ui.audit_open", { rid: finalData?.meta?.request_id ?? null });
   };
 
-  const shortAnswer = finalData?.answer?.short_answer;
+  const rawShortAnswer = finalData?.answer?.short_answer;
+  const shortAnswer = useMemo(() => {
+    if (!rawShortAnswer) return undefined;
+    try {
+      const parts = String(rawShortAnswer).split(/(?<=[.!?])\s+/).slice(0, 2);
+      return parts.join(" ");
+    } catch { return rawShortAnswer; }
+  }, [rawShortAnswer]);
 
   // Extract supplementary answer fields for UI enhancements
   const citationIds: string[] = finalData?.answer?.supporting_ids ?? [];
@@ -71,7 +73,7 @@ export default function MemoryPage() {
   useEffect(() => {
     if ((anchorMaker || anchorTs) && finalData?.meta?.request_id) {
       try {
-        console.debug("[ui.memory.anchor_seen]", {
+        logEvent("ui.memory.anchor_seen", {
           maker: anchorMaker ?? null,
           ts: anchorTs ?? null,
           rid: finalData.meta.request_id,
@@ -91,7 +93,7 @@ export default function MemoryPage() {
 
     // Attempt canonical flow: POST /v2/bundles/{rid}/download → {url, expires_in}
     try {
-      console.debug("[ui.memory.bundle_download]", {
+      logEvent("ui.memory.bundle_download", {
         rid,
         flow: "post_then_get",
       });
@@ -103,7 +105,7 @@ export default function MemoryPage() {
         const data = await resp.json().catch(() => null) as any;
         const url = data && typeof data.url === "string" ? data.url : undefined;
         try {
-          console.debug("[ui.memory.bundle_download.presigned_received]", {
+          logEvent("ui.memory.bundle_download.presigned_received", {
             rid,
             has_url: !!url,
             expires_in: (data && data.expires_in) || null,
@@ -121,7 +123,7 @@ export default function MemoryPage() {
     // Fallback 1: legacy bundle_url on the response (if present)
     if (bundleUrl) {
       try {
-        console.debug("[ui.memory.bundle_download.fallback_bundle_url]", { rid });
+        logEvent("ui.memory.bundle_download.fallback_bundle_url", { rid });
       } catch { /* ignore logging errors */ }
       window.open(bundleUrl, "_blank");
       return;
@@ -129,7 +131,7 @@ export default function MemoryPage() {
 
     // Fallback 2: direct GET to the gateway/edge bundle endpoint
     try {
-      console.debug("[ui.memory.bundle_download.fallback_direct_get]", { rid, path: `/v2/bundles/${rid}` });
+      logEvent("ui.memory.bundle_download.fallback_direct_get", { rid, path: `/v2/bundles/${rid}` });
     } catch { /* ignore logging errors */ }
     try {
       const resp = await fetch(`/v2/bundles/${rid}`);
@@ -148,38 +150,60 @@ export default function MemoryPage() {
     }
   }, [finalData]);
 
-  // Flatten the evidence bundle into a single array of items. Anchor and events
-  // come first; transitions (preceding/succeeding) follow. This memoised
-  // computation avoids recalculation on every render.
-  const evidenceItems: EvidenceItem[] = useMemo(() => {
+  // Build separate arrays for anchor, events, and transitions
+  const anchorId = finalData?.evidence?.anchor?.id;
+  const eventsOnly: EvidenceItem[] = useMemo(() => {
     const bundle: EvidenceBundle | undefined = finalData?.evidence;
     if (!bundle) return [];
-    const items: EvidenceItem[] = [];
-    if (bundle.anchor) items.push({ ...bundle.anchor });
-    if (bundle.events) items.push(...bundle.events.map((e) => ({ ...e })));
-    if (bundle.transitions) {
-      if (bundle.transitions.preceding) items.push(...bundle.transitions.preceding.map((t) => ({ ...t })));
-      if (bundle.transitions.succeeding) items.push(...bundle.transitions.succeeding.map((t) => ({ ...t })));
-    }
-    return items;
+    const evts = Array.isArray(bundle.events) ? bundle.events.map((e) => ({ ...e })) : [];
+    // Ensure ids are present
+    return evts.filter((e) => typeof (e as any).id === "string" && e.id);
   }, [finalData]);
+
+  // Rank events by selector score (desc) then timestamp (desc), then id
+  const selectorScores: Record<string, number> = finalData?.meta?.selector_scores ?? {};
+  const rankedEvents: EvidenceItem[] = useMemo(() => {
+    const copy = [...eventsOnly];
+    copy.sort((a, b) => {
+      const sa = selectorScores[a.id] ?? -Infinity;
+      const sb = selectorScores[b.id] ?? -Infinity;
+      if (sa !== sb) return sb - sa;
+      const ta = Date.parse(a.timestamp || "") || 0;
+      const tb = Date.parse(b.timestamp || "") || 0;
+      if (ta !== tb) return tb - ta;
+      return (a.id || "").localeCompare(b.id || "");
+    });
+    // Take top 10 for display
+    return copy.slice(0, 10);
+
+  }, [eventsOnly, selectorScores]);
+
+  // Build receipts strip separately (prevents nested useMemo).
+  // Order: anchor → supporting_ids → top ranked events, capped at 3.
+  const receipts: string[] = useMemo(() => {
+    const ids = new Set<string>();
+    if (anchorId) ids.add(anchorId); // anchor from evidence
+    (finalData?.answer?.supporting_ids ?? []).forEach((id: string) => ids.add(id));
+    rankedEvents.forEach((e) => ids.add(e.id));
+    return Array.from(ids).slice(0, 3);
+  }, [anchorId, finalData, rankedEvents]);
 
   // Compute tag frequencies for the tag cloud
   const tagCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    evidenceItems.forEach((item) => {
+    rankedEvents.forEach((item) => {
       item.tags?.forEach((tag) => {
         counts[tag] = (counts[tag] || 0) + 1;
       });
     });
     return counts;
-  }, [evidenceItems]);
+  }, [rankedEvents]);
 
   // Apply tag filter to evidence items
   const filteredEvidenceItems = useMemo(() => {
-    if (!tagFilter) return evidenceItems;
-    return evidenceItems.filter((item) => item.tags?.includes(tagFilter));
-  }, [evidenceItems, tagFilter]);
+    if (!tagFilter) return rankedEvents;
+    return rankedEvents.filter((item) => item.tags?.includes(tagFilter));
+  }, [rankedEvents, tagFilter]);
 
   // When final data arrives, expose its request id on the window for debug logs.
   useEffect(() => {
@@ -230,22 +254,27 @@ export default function MemoryPage() {
             <div className="flex justify-between items-start">
               <div className="flex-1 mr-4">
                 <h2 className="text-lg font-semibold text-vaultred mb-1">Short answer</h2>
-                <p className="text-copy mb-2">{shortAnswer}</p>
+                <p className="text-copy mb-2 text-lg md:text-xl leading-snug">{shortAnswer}</p>
                 {/* Citation pills: render up to the first three supporting IDs */}
-                {citationIds && citationIds.length > 0 && (
+                {receipts && receipts.length > 0 && (
                   <div className="flex flex-wrap gap-2 mb-2">
-                    {citationIds.slice(0, 3).map((cid) => (
+                    {receipts.slice(0, 3).map((cid) => (
                       <button
                         key={cid}
                         type="button"
                         onClick={() => {
                           try {
-                            console.debug("[ui.memory.citation_click]", {
+                            logEvent("ui.citation_click", {
                               id: cid,
                               rid: finalData?.meta?.request_id ?? null,
                             });
-                          } catch {
-                            /* ignore logging errors */
+                          } catch { /* ignore logging errors */ }
+                          setSelectedEvidenceId(cid);
+                          const el = document.getElementById(`evidence-${cid}`);
+                          if (el) {
+                            el.scrollIntoView({ behavior: "smooth", block: "center" });
+                            el.classList.add("animate-pulse");
+                            window.setTimeout(() => el.classList.remove("animate-pulse"), 1200);
                           }
                         }}
                         className="text-xs font-mono px-2 py-0.5 rounded-full border border-vaultred/50 text-vaultred hover:bg-vaultred/30 transition-colors"
@@ -327,18 +356,27 @@ export default function MemoryPage() {
                 <EvidenceList
                   items={filteredEvidenceItems}
                   selectedId={selectedEvidenceId}
-                  onSelect={(id) => setSelectedEvidenceId(id)}
+                  onSelect={(id) => {
+                    setSelectedEvidenceId(id);
+                    try { logEvent("ui.evidence_select", { id, rid: finalData?.meta?.request_id ?? null }); } catch {}
+                  }}
                   className="mt-2"
                 />
                 {/* Graph view for visualising relationships between evidence items */}
-                <div className="mt-6">
-                  <h3 className="text-sm font-semibold text-vaultred mb-1">Relation graph</h3>
-                  <GraphView
+                <details className="mt-6">
+                  <summary className="text-sm font-semibold text-vaultred cursor-pointer">Advanced</summary>
+                  <div className="mt-2">
+                    <h3 className="text-sm font-semibold text-vaultred mb-1">Relation graph</h3>
+                    <GraphView
                     items={filteredEvidenceItems}
                     selectedId={selectedEvidenceId}
-                    onSelect={(id) => setSelectedEvidenceId(id)}
+                    onSelect={(id) => {
+                      setSelectedEvidenceId(id);
+                      try { logEvent("ui.evidence_select", { id, rid: finalData?.meta?.request_id ?? null }); } catch {}
+                    }}
                   />
-                </div>
+                  </div>
+                </details>
               </>
             ) : (
               <p className="text-copy text-sm">No evidence returned.</p>
@@ -364,19 +402,18 @@ export default function MemoryPage() {
           </div>
         )}
       </Card>
-      {/* Schema Explorer shown below the main card */}
-      <SchemaExplorer />
       {/* Off-canvas Audit Drawer */}
       {finalData && (
         <AuditDrawer
           open={auditOpen}
           onClose={() => {
-            console.debug("[memory.audit.close]", { evt: "audit_close", rid: finalData?.meta?.request_id ?? null });
+            logEvent("ui.audit_close", { rid: finalData?.meta?.request_id ?? null });
             setAuditOpen(false);
           }}
           meta={finalData.meta}
           evidence={finalData.evidence}
           answer={finalData.answer}
+          bundle_url={finalData.bundle_url}
         />
       )}
     </div>

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=65.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "core_ml"
+version = "0.1.0"
+description = "Shared ML utilities (embeddings client)"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27.0",
+  "core_logging",
+  "core_config",
+  "core_observability",
+  "core_http",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["core_ml"]
+
+[tool.ruff]
+line-length = 100

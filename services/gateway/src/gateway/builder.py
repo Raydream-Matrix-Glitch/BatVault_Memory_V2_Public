@@ -2,7 +2,7 @@ from __future__ import annotations
 import time, uuid, os, re
 from typing import Any, Mapping, Tuple, Dict, List
 
-import orjson
+from core_utils import jsonx
 from core_config import get_settings
 
 import importlib.metadata as _md
@@ -211,15 +211,48 @@ def _dedup_and_normalise_events(ev: WhyDecisionEvidence) -> None:
     except Exception:
         pass
 
-# In‑memory cache for artefact bundles.  Each entry stores the exact
-# artefacts used to assemble a response keyed by the request ID.  The
-# ``/v2/bundles/{request_id}`` endpoint reads from this cache when
-# streaming a bundle back to the caller.  See ``gateway.app`` for
-# download routes.  Keeping the cache here avoids a circular import.
-BUNDLE_CACHE: Dict[str, Dict[str, bytes]] = {}
+class _LruTTLCache:
+    def __init__(self, max_items: int = 200, ttl_seconds: int = 600):
+        from collections import OrderedDict
+        self._data: "OrderedDict[str, tuple[float, dict[str, bytes]]]" = OrderedDict()
+        self._ttl = max(1, int(ttl_seconds))
+        self._cap = max(1, int(max_items))
+    def _purge(self, now: float):
+        # Drop expired
+        keys = [k for k,(ts,_) in list(self._data.items()) if now - ts > self._ttl]
+        for k in keys:
+            self._data.pop(k, None)
+        # Enforce cap
+        while len(self._data) > self._cap:
+            self._data.popitem(last=False)
+    def __setitem__(self, key: str, value: dict[str, bytes]):
+        import time as _t
+        now = _t.time()
+        self._data[key] = (now, value)
+        self._data.move_to_end(key)
+        self._purge(now)
+    def get(self, key: str):
+        import time as _t
+        now = _t.time()
+        item = self._data.get(key)
+        if not item:
+            self._purge(now)
+            return None
+        ts, val = item
+        if now - ts > self._ttl:
+            self._data.pop(key, None)
+            self._purge(now)
+            return None
+        self._data.move_to_end(key)
+        return val
+
+import os as _os
+_max = int((_os.getenv("BUNDLE_CACHE_MAX_ITEMS") or "200").strip() or "200")
+_ttl = int((_os.getenv("BUNDLE_CACHE_TTL_S") or "600").strip() or "600")
+BUNDLE_CACHE = _LruTTLCache(max_items=_max, ttl_seconds=_ttl)
 
 try:
-    _GATEWAY_VERSION = _md.version("batvault_gateway")
+    _GATEWAY_VERSION = _md.version("gateway")
 except _md.PackageNotFoundError:
     _GATEWAY_VERSION = "unknown"
 
@@ -278,11 +311,11 @@ async def build_why_decision_response(
             ev.transitions.succeeding = None  # type: ignore
     except Exception:
         pass
-    arte["evidence_pre.json"] = orjson.dumps(ev.model_dump(mode="python", exclude_none=True))
+    arte["evidence_pre.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True))
 
     # ── deterministic plan stub (needed for audit contract) ────────────
     plan_dict = {"node_id": ev.anchor.id, "k": 1}
-    arte["plan.json"] = orjson.dumps(plan_dict)
+    arte["plan.json"] = jsonx.dumps(plan_dict)
 
     # ---- Gate: single budgeting authority (renders messages + max_tokens) ----
     # We compute canonical allowed_ids first to give the gate a stable envelope,
@@ -316,7 +349,7 @@ async def build_why_decision_response(
                   error=str(e), request_id=getattr(req, "request_id", None))
         raise
     # Persist the final evidence with empty collections omitted
-    arte["evidence_final.json"] = orjson.dumps(ev.model_dump(mode="python", exclude_none=True))
+    arte["evidence_final.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True))
     try:
         log_stage("builder", "evidence_final_persisted",
                   request_id=req_id,
@@ -389,7 +422,7 @@ async def build_why_decision_response(
             ev.transitions.succeeding = None  # type: ignore
     except Exception:
         pass
-    arte["evidence_post.json"] = orjson.dumps(ev.model_dump(mode="python", exclude_none=True))
+    arte["evidence_post.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True))
     # ── Events Policy E: show a few, keep all (response up to 10; count & truncate flags) ──
     try:
         _full_events_for_policy = list(ev.events or [])
@@ -517,11 +550,31 @@ async def build_why_decision_response(
             # "no_raw_json" when the LLM was expected to run.
             llm_fallback = True
             if use_llm:
+                try:
+                    from gateway.llm import (_llm_last_call as _llm_last_call_imported,
+                                             _sanitize_reason as _sanitize_reason_imported)
+                    imported_last_call = _llm_last_call_imported
+                    sanitize_fn = _sanitize_reason_imported
+                except Exception:
+                    # Fall back to a local sanitiser and an empty last_call
+                    imported_last_call = {}
+                    def sanitize_fn(reason: str | None) -> str:
+                        if not reason:
+                            return "no_raw_json"
+                        r = str(reason).strip().lower()
+                        allowed = {"llm_off", "endpoint_unreachable", "timeout",
+                                   "http_error", "parse_error", "stub_answer",
+                                   "no_raw_json"}
+                        if r in allowed:
+                            return r
+                        return "http_error" if "http" in r else "no_raw_json"
+                error_code = imported_last_call.get('error_code') if isinstance(imported_last_call, dict) else None
+                fallback_reason = sanitize_fn(error_code)
                 # Strategic log: immediate fallback decision (+ environment for audit)
                 try:
                     log_stage("llm", "fallback_decision",
                         request_id=req_id,
-                        reason="no_raw_json",
+                        reason=(_llm_last_call.get("error_code") or "no_raw_json"),
                         openai_disabled=getattr(s, "openai_disabled", False),
                         canary_pct=getattr(s, "canary_pct", 0),
                         control=getattr(s, "control_model_endpoint", ""),
@@ -552,7 +605,7 @@ async def build_why_decision_response(
         else:
             arte["llm_raw.json"] = raw_json.encode()
             try:
-                parsed = orjson.loads(raw_json)
+                parsed = jsonx.loads(raw_json)
                 ans = WhyDecisionAnswer.model_validate(parsed)
                 # If summarise_json returned a deterministic stub answer,
                 # mark this as a fallback.  Stub answers begin with
@@ -648,11 +701,6 @@ async def build_why_decision_response(
                   request_id=req_id,
                   prompt_tokens=sel_meta.get("prompt_tokens"),
                   max_prompt_tokens=sel_meta.get("max_prompt_tokens"))
-    # Ensure `meta` exists for the pre-validation response below. It will be
-    # fully populated after validation (see later `meta = { ... }` assignment).
-    # Build a **complete** MetaInfo for pre-validation response to avoid schema errors.
-    # Even though some fields (e.g. validator_error_count, fallback_used) are provisional
-    # at this point, the contract requires them to be present. They will be finalised later.
     _policy_pre = envelope.get("policy") or {}
     _policy_id_pre = _policy_pre.get("policy_id") or envelope.get("policy_id") or "unknown"
     _prompt_id_pre = envelope.get("prompt_id") or "unknown"
@@ -753,8 +801,8 @@ async def build_why_decision_response(
                   snapshot_etag=snapshot_etag_fp)
 
     # ── persist artefacts ───────────────────────────────────────────
-    arte["envelope.json"] = orjson.dumps(envelope)
-    arte["rendered_prompt.txt"] = canonical_json(envelope)
+    arte["envelope.json"] = jsonx.dumps(envelope)
+    arte["validator_report.json"] = jsonx.dumps({"errors": errs})
     arte.setdefault("llm_raw.json", b"{}")
 
     # Determine gateway version with environment override
@@ -819,6 +867,26 @@ async def build_why_decision_response(
     except Exception:
         _snapshot_available = False
 
+    # ---- Trace correlation (trace_id/span_id) ----
+    _trace_id = None
+    _span_id = None
+    try:
+        from core_observability.otel import current_trace_id_hex as _cur_tid
+        _trace_id = _cur_tid()
+    except Exception:
+        _trace_id = None
+    if not _trace_id:
+        try:
+            from core_logging import current_trace_ids
+            _trace_id, _span_id = current_trace_ids()
+        except Exception:
+            _trace_id, _span_id = None, None
+    try:
+        if _trace_id and not _span_id:
+            _span_id = _trace_id[:16]
+    except Exception:
+        pass
+
     meta_inputs = MetaInputs(
         policy_id=_policy_id,
         prompt_id=_prompt_id,
@@ -837,6 +905,9 @@ async def build_why_decision_response(
         latency_ms=int((time.perf_counter() - t0) * 1000),
         validator_error_count=len(errs),
         evidence_metrics=cleaned_metrics,
+        trace_id=_trace_id,
+        span_id=_span_id,
+        validator_warnings=sorted({e.get('code') for e in (validator_errs or []) if e.get('code') not in fatal_codes}) if validator_errs else [],
         load_shed=should_load_shed(),
         events_total=int(_events_total),
         events_truncated=bool(_events_truncated_flag),
@@ -864,16 +935,8 @@ async def build_why_decision_response(
     except Exception:
         pass
 
-    # Compose a bundle URL for downstream callers.  This is a relative
-    # route into the Gateway that returns the JSON artefact bundle for
-    # this request.  A POST to ``/v2/bundles/<id>/download`` may be used
-    # to obtain a presigned URL in production; here we surface the
-    # direct GET endpoint.
     bundle_url = f"/v2/bundles/{req_id}"
-    # Persist artefacts into the in-memory bundle cache so the GET
-    # endpoint can retrieve the bundle later.  This must be done before
-    # returning the response as the app layer imports BUNDLE_CACHE from
-    # this module.
+
     try:
         BUNDLE_CACHE[req_id] = dict(arte)
     except Exception:
@@ -881,9 +944,16 @@ async def build_why_decision_response(
         # without raising an error; the GET endpoint will return 404.
         pass
 
-    # Ensure resolver_path defaults to "direct" when unset.  /v2/ask bypasses the
-    # external resolver, so callers expect "direct" rather than null.  Downstream
-    # handlers (e.g., /v2/query) may override this value with "slug" or "bm25".
+    # Optionally persist artefacts to MinIO without blocking the request path.
+    try:
+        # Lazy-import to avoid hard runtime dep in tests/local.
+        from gateway.app import _minio_put_batch_async as _minio_save
+        import asyncio as _asyncio
+        _asyncio.create_task(_minio_save(req_id, arte))
+    except Exception:
+        # MinIO not configured / import failed — ignore silently.
+        pass
+
     try:
         if not getattr(meta_obj, "resolver_path", None):
             setattr(meta_obj, "resolver_path", "direct")
@@ -902,5 +972,5 @@ async def build_why_decision_response(
         bundle_url=bundle_url,
     )
     arte["response.json"]         = resp.model_dump_json().encode()
-    arte["validator_report.json"] = orjson.dumps({"errors": errs})
+    arte["validator_report.json"] = jsonx.dumps({"errors": errs}).encode("utf-8")
     return resp, arte, req_id

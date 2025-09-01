@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from ..prompt_messages import build_messages
-from ..http import fetch_json
+from core_http.client import fetch_json
 
 def _as_prompt(envelope: Dict[str, Any]) -> str:
     """TGI /generate accepts a single string prompt; join chat messages plainly."""

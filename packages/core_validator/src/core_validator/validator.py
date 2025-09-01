@@ -48,11 +48,9 @@ data has been corrected and the caller may wish to mark the response
 as a fallback or degraded result.
 """
 
-from __future__ import annotations
-
 import os
 from datetime import timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from dateutil import parser as dateutil_parser
 
@@ -219,6 +217,9 @@ def _normalise_transition(tr: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict
         "id",
         "from",
         "to",
+        "from_title",
+        "to_title",
+        "title",
         "relation",
         "reason",
         "timestamp",

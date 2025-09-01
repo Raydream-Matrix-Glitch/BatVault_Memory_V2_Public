@@ -308,12 +308,10 @@ class _TraceSpan:
                 # Bind only **valid** (non-zero) OTEL IDs; otherwise leave unbound
                 if getattr(ctx, "trace_id", 0):
                     _TRACE_IDS.set((f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"))
-                else:
-                    _TRACE_IDS.set((None, None))
             except Exception:
-                _TRACE_IDS.set((None, None))
+                pass
         except Exception:
-            _TRACE_IDS.set((None, None))
+            pass
         # Use `stage` from fixed metadata if provided; otherwise default to span name.
         stage_value = self._fixed.get("stage", self._name)
         extras = {k: v for k, v in self._fixed.items() if k != "stage"}

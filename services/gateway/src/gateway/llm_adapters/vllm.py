@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 from core_config.constants import timeout_for_stage
 from ..prompt_messages import build_messages
-from ..http import get_http_client
+from core_http.client import get_http_client
 
 
 def _build_payload(envelope: Dict[str, Any], *, temperature: float, max_tokens: int) -> Dict[str, Any]:
@@ -19,24 +19,6 @@ def _build_payload(envelope: Dict[str, Any], *, temperature: float, max_tokens: 
         "max_tokens": int(max_tokens),
         "messages": msgs,
     }
-
-async def generate_async(
-    endpoint: str,
-    envelope: Dict[str, Any],
-    *,
-    temperature: float = 0.0,
-    max_tokens: int = 512,
-) -> str:
-    """Call vLLM /v1/chat/completions and return assistant content. Stage timeout: llm."""
-    url = endpoint.rstrip("/") + "/v1/chat/completions"
-    payload = _build_payload(envelope, temperature=temperature, max_tokens=max_tokens)
-    client = get_http_client(int(timeout_for_stage("llm") * 1000))
-    resp = await client.post(url, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    choice = (data.get("choices") or [{}])[0]
-    msg = (choice.get("message") or {})
-    return str(msg.get("content") or "")
 
 async def generate_async(endpoint: str, envelope: Dict[str, Any], *, temperature: float = 0.0, max_tokens: int = 512) -> str:
     """Async variant using the shared HTTP client (OTEL/headers applied)."""

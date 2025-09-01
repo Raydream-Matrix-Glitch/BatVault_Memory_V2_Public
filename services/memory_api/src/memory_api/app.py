@@ -5,12 +5,15 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span
 from core_observability.otel import init_tracing, instrument_fastapi_app
+from core_observability.otel import inject_trace_context
 from core_storage import ArangoStore
 from core_utils.health import attach_health_routes
 from core_utils.ids import generate_request_id, is_slug
 from typing import Dict, List, Tuple, Optional
 from functools import lru_cache
-import httpx, inspect
+import inspect
+from core_http.client import get_http_client
+from core_config.constants import timeout_for_stage
 import asyncio
 import re
 import time
@@ -32,34 +35,6 @@ instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'memo
 
 init_tracing(os.getenv("OTEL_SERVICE_NAME") or "memory_api")
 
-# ---- OTEL helpers (safe no-ops if OTEL not installed) ----------------------
-def _inject_trace_context(headers: dict | None) -> dict:
-    hdrs = dict(headers or {})
-    try:
-        from opentelemetry.propagate import inject  # type: ignore
-        inject(hdrs)
-    except Exception:
-        # Never break a request due to tracing
-        pass
-    return hdrs
-
-# ---- Bind OTEL span IDs into core_logging for consistent trace IDs ---------
-@app.middleware("http")
-async def _bind_trace_ids(request: Request, call_next):
-    try:
-        from opentelemetry import trace as _trace  # type: ignore
-        _sp = _trace.get_current_span()
-        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
-        if _ctx and getattr(_ctx, "trace_id", 0):
-            from core_logging import bind_trace_ids  # type: ignore
-            bind_trace_ids(f"{_ctx.trace_id:032x}", f"{_ctx.span_id:016x}")
-            try:
-                log_stage(logger, "observability", "trace_ctx_bound", path=str(request.url.path))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return await call_next(request)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helper: safe cache eviction
@@ -138,11 +113,8 @@ async def _ping_arango_ready() -> bool:
     """
     settings = get_settings()
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(
-                f"{settings.arango_url}/_api/version",
-                headers=_inject_trace_context({}),
-            )
+        client = get_http_client(timeout_ms=int(1000 * timeout_for_stage('enrich')))
+        r = await client.get(f"{settings.arango_url}/_api/version", headers=inject_trace_context({}))
         return r.status_code == 200
     except Exception:
         return False
@@ -321,14 +293,26 @@ async def enrich_decision(node_id: str, response: Response):
     return _json_response_with_etag(doc, safe_etag)
 
 @app.get("/api/enrich/event/{node_id}")
-def enrich_event(node_id: str, response: Response):
+async def enrich_event(node_id: str, response: Response):
+    """
+    Return a fully enriched event document.  The synchronous store call is offloaded
+    to a worker thread with a configurable timeout to avoid blocking the event loop.
+    Missing events return 404 and timeouts return 504.
+    """
     with trace_span("memory.enrich_event", node_id=node_id):
-        st = store()
-        doc = st.get_enriched_event(node_id)
+        import asyncio
+        def _work() -> Optional[dict]:
+            st = store()
+            return st.get_enriched_event(node_id)
+        try:
+            budget_s = max(0.1, float(get_settings().timeout_enrich_ms) / 1000.0)
+            doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=budget_s)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="timeout")
         if doc is None:
             raise HTTPException(status_code=404, detail="event_not_found")
         try:
-            etag = st.get_snapshot_etag()
+            etag = store().get_snapshot_etag()
         except Exception:
             etag = None
         safe_etag = etag or "unknown"
@@ -340,13 +324,24 @@ def enrich_event(node_id: str, response: Response):
         return _json_response_with_etag(doc, safe_etag)
 
 @app.get("/api/enrich/transition/{node_id}")
-def enrich_transition(node_id: str, response: Response):
-    st = store()
-    doc = st.get_enriched_transition(node_id)
+async def enrich_transition(node_id: str, response: Response):
+    """
+    Return a fully enriched transition document.  Offloads blocking store calls
+    to a worker thread and applies a timeout.  Missing transitions return 404.
+    """
+    import asyncio
+    def _work() -> Optional[dict]:
+        st = store()
+        return st.get_enriched_transition(node_id)
+    try:
+        budget_s = max(0.1, float(get_settings().timeout_enrich_ms) / 1000.0)
+        doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=budget_s)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="timeout")
     if doc is None:
         raise HTTPException(status_code=404, detail="transition_not_found")
     try:
-        etag = st.get_snapshot_etag()
+        etag = store().get_snapshot_etag()
     except Exception:
         etag = None
     safe_etag = etag or "unknown"
@@ -404,8 +399,7 @@ async def resolve_text(payload: dict, response: Response):
         and not is_slug(q)          # skip known slugs
     ):
         try:
-            from memory.embeddings_client import embed  # type: ignore
-            logger.warning("DEPRECATION: import path 'memory.embeddings_client' will be removed; use 'memory_api.embeddings_client'", extra={"service":"memory_api"})
+            from core_ml.embeddings import embed  # canonical client
             # Attempt to embed the query; returns None on failure
             embeddings = await embed([q])
             if embeddings:
@@ -469,7 +463,7 @@ async def resolve_text(payload: dict, response: Response):
     try:
         with trace_span("memory.resolve_text", q=q, use_vector=use_vector):
             # enforce 0.8s timeout, as per spec
-            doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=0.8)
+            doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=timeout_for_stage("search"))
     except asyncio.TimeoutError:
         log_stage(logger, "expand", "timeout", request_id=payload.get("request_id"))
         raise HTTPException(status_code=504, detail="timeout")
@@ -534,7 +528,7 @@ async def expand_candidates(payload: dict, response: Response):
         return st.expand_candidates(node_id, k=k), st.get_snapshot_etag()
     try:
         with trace_span("memory.expand_candidates", node_id=node_id, k=k):
-            doc, etag = await asyncio.wait_for(asyncio.to_thread(_work), timeout=0.25)
+            doc, etag = await asyncio.wait_for(asyncio.to_thread(_work), timeout=timeout_for_stage("expand"))
     except asyncio.TimeoutError:
         # Do **not** bubble a 504; honour the v2 contract by replying 200 with a
         # deterministic, empty payload.  The caller can inspect `meta.fallback_reason`

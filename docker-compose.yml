@@ -106,14 +106,14 @@ services:
     build:
       context: .
       dockerfile: ops/docker/Dockerfile.python
-      cache_from:
-        - type=local,src=.docker-cache
-      cache_to:
-        - type=local,dest=.docker-cache,mode=max
     environment:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_PROPAGATORS=tracecontext,baggage
+      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - OTEL_SERVICE_NAME=api_edge
+      - OTEL_PROPAGATORS=tracecontext,baggage
+      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - BATVAULT_HEALTH_PORT=8080
     env_file:
       - .env
@@ -143,8 +143,12 @@ services:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       - OTEL_SERVICE_NAME=gateway
+      - OTEL_PROPAGATORS=tracecontext,baggage
+      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - BATVAULT_HEALTH_PORT=8081
       - CITE_ALL_IDS=true
+      - TIMEOUT_ENRICH_MS=1200
+      - TIMEOUT_EXPAND_MS=400
     env_file:
       - .env
       - .env.local
@@ -172,7 +176,9 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
-      - OTEL_SERVICE_NAME=memory-api
+      - OTEL_SERVICE_NAME=memory_api
+      - OTEL_PROPAGATORS=tracecontext,baggage
+      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - ARANGO_VECTOR_INDEX_ENABLED=true
       - BATVAULT_HEALTH_PORT=8000
     env_file:
@@ -258,7 +264,6 @@ services:
       - --swap-space
       - "${VLLM_SWAP_GB:-4}"
       - --disable-frontend-multiprocessing
-      - --multi-step-stream-outputs
     ports:
       - "8010:8010"
     healthcheck:
@@ -341,6 +346,8 @@ services:
       - PYTHONUNBUFFERED=1
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
       - OTEL_SERVICE_NAME=ingest
+      - OTEL_PROPAGATORS=tracecontext,baggage
+      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - ARANGO_VECTOR_INDEX_ENABLED=true
       - BATVAULT_HEALTH_PORT=8083
     env_file:

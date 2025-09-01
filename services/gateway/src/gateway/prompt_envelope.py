@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
-from core_utils import jsonx
 import os
 from pathlib import Path
 from typing import Any, Dict
-import json
+
+from core_utils import jsonx
 
 from core_utils.fingerprints import canonical_json
 from core_logging import trace_span, get_logger
@@ -18,7 +17,7 @@ try:
 except Exception:  # defensive
     _schema_get_cached = None
 
-logger = get_logger("gateway")
+logger = get_logger("gateway.prompt_envelope")
 
 # Unified API path for the registry mirror
 _POLICY_REGISTRY_API_PATH = "/api/policy/registry"
@@ -79,11 +78,15 @@ def _load_policy_registry() -> Dict[str, Any]:
                 # Cache read is best-effort; fall back to local file
                 pass
 
-        # 2) Fall back to on-disk registry (dev/local)
+        # 2) Fall back to on‑disk registry (dev/local).  Always parse the
+        # file contents via jsonx to guarantee canonical key ordering and
+        # consistent numeric handling.  The built‑in json loader is avoided.
         path = _find_registry()
         if path:
             with open(path, "r", encoding="utf-8") as fp:
-                _POLICY_REGISTRY = json.load(fp)
+                # Read the file as UTF‑8 and parse with jsonx.  This raises
+                # if the file contains invalid JSON.
+                _POLICY_REGISTRY = jsonx.loads(fp.read())
         else:
             # Graceful fallback keeps Gateway operable when the
             # registry hasn’t been provisioned yet.
@@ -186,4 +189,11 @@ def build_prompt_envelope(
         pass
 
     return env
+
+try:
+    _load_policy_registry()
+except Exception:
+    # Best-effort preloading; continue without failing if the registry
+    # cannot be loaded at import time.
+    pass
 

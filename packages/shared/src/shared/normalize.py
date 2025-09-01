@@ -38,8 +38,6 @@ documents fetched from the store should already be normalised and
 should not need further processing.
 """
 
-from __future__ import annotations
-
 from datetime import timezone
 import re
 from typing import Any, Dict, List
@@ -331,6 +329,9 @@ def normalize_transition(doc: Dict[str, Any]) -> Dict[str, Any]:
         "id",
         "from",
         "to",
+        "from_title",
+        "to_title",
+        "title",
         "relation",
         "reason",
         "timestamp",

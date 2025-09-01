@@ -46,7 +46,7 @@ export function useMemoryAPI() {
       options?: Record<string, unknown>
     ) => {
       const payload = { intent, decision_ref: decisionRef, ...(options || {}) };
-      const endpoint = `${base}/v2/ask`;
+      const endpoint = `${base}/v2/ask?stream=true`;
       return startStream(endpoint, payload, getToken());
     },
     [base, startStream]
@@ -55,7 +55,7 @@ export function useMemoryAPI() {
   const query = useCallback(
     async (text: string) => {
       const payload = { text };
-      const endpoint = `${base}/v2/query`;
+      const endpoint = `${base}/v2/query?stream=true`;
       return startStream(endpoint, payload, getToken());
     },
     [base, startStream]

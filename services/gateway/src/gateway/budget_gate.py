@@ -1,11 +1,14 @@
-from __future__ import annotations
-import os, logging, hashlib
+import hashlib
 from typing import Any, Dict
 from core_config import get_settings
+from core_logging import get_logger
 
-from core_utils.fingerprints import sha256_hex, ensure_sha256_prefix
+from core_utils.fingerprints import (
+    sha256_hex,
+    ensure_sha256_prefix,
+    canonical_json,
+)
 from .logging_helpers import stage as log_stage
-from core_utils.fingerprints import canonical_json
 from core_config.constants import (
     CONTROL_CONTEXT_WINDOW,
     CONTROL_PROMPT_GUARD_TOKENS,
@@ -14,13 +17,11 @@ from core_config.constants import (
     GATE_SHRINK_JITTER_PCT,
     GATE_MAX_SHRINK_RETRIES,
 )
-from core_config import get_settings
 from core_models.models import GatePlan
 from shared.prompt_budget import gate_budget
 from gateway.prompt_messages import build_messages
-from . import selector as selector_mod
 
-logger = logging.getLogger(__name__)
+logger = get_logger("gateway.budget_gate")
 
 def _blake3_or_sha256(b: bytes) -> str:
     """
@@ -54,23 +55,25 @@ def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, mo
     except Exception:
         pass
 
-    # Derive dynamic context window and desired completion tokens from settings.
-    # When the environment does not specify overrides, fall back to control defaults.
+    # Derive dynamic context window and desired completion tokens from a single
+    # settings lookup.  Avoid repeatedly calling get_settings() during hot
+    # path execution; this ensures consistent values and improves testability.
+    _s = None
     try:
         _s = get_settings()
     except Exception:
         _s = None
-    try:
-        dynamic_context = int(
-            getattr(_s, "vllm_max_model_len", None) or CONTROL_CONTEXT_WINDOW
-        )
-    except Exception:
+    if _s is not None:
+        try:
+            dynamic_context = int(getattr(_s, "vllm_max_model_len", None) or CONTROL_CONTEXT_WINDOW)
+        except Exception:
+            dynamic_context = CONTROL_CONTEXT_WINDOW
+        try:
+            dynamic_completion = int(getattr(_s, "llm_max_tokens", None) or CONTROL_COMPLETION_TOKENS)
+        except Exception:
+            dynamic_completion = CONTROL_COMPLETION_TOKENS
+    else:
         dynamic_context = CONTROL_CONTEXT_WINDOW
-    try:
-        dynamic_completion = int(
-            getattr(_s, "llm_max_tokens", None) or CONTROL_COMPLETION_TOKENS
-        )
-    except Exception:
         dynamic_completion = CONTROL_COMPLETION_TOKENS
 
     gp_dict, trimmed_evidence = gate_budget(
@@ -86,7 +89,16 @@ def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, mo
         jitter_pct=GATE_SHRINK_JITTER_PCT,
         seed=seed_int,
     )
-    fp_bytes = canonical_json({"messages": gp_dict["messages"], "model": model_name or get_settings().vllm_model_name or "unknown", "stop": None})
+    # Compute prompt fingerprint deterministically; reuse cached settings when possible
+    model_label = model_name
+    if not model_label:
+        try:
+            model_label = getattr(_s, "vllm_model_name", None) if _s is not None else None
+        except Exception:
+            model_label = None
+    if not model_label:
+        model_label = "unknown"
+    fp_bytes = canonical_json({"messages": gp_dict["messages"], "model": model_label, "stop": None})
     prompt_fingerprint = _blake3_or_sha256(fp_bytes)
 
     try:
@@ -130,10 +142,7 @@ def authoritative_truncate(
     - Produces meta compatible with previous selector output
     """
     from .selector import evidence_prompt_tokens, rank_events
-    from core_logging import get_logger
     from core_models.models import WhyDecisionEvidence
-
-    logger = get_logger("gateway.selector")  # reuse selector logger name for continuity
 
     # Work on a deep copy so the caller keeps the original
     ev: WhyDecisionEvidence = evidence_obj.model_copy(deep=True)

@@ -107,8 +107,26 @@ export function useSSE() {
           headers,
           signal: controller.signal,
         });
-        if (!res.ok || !res.body) {
+        if (!res.ok) {
           throw new Error(`Streaming request failed: ${res.status}`);
+        }
+        // If the server didn't switch to SSE, fall back to JSON body.
+        const ct = (res.headers.get("content-type") || "").toLowerCase();
+        if (!ct.includes("text/event-stream")) {
+          try {
+            const payload = await res.json();
+            setTokens([]);
+            setFinalData(payload);
+          } catch (e: any) {
+            setError(e instanceof Error ? e : new Error(String(e)));
+            throw e;
+          } finally {
+            setIsStreaming(false);
+          }
+          return;
+        }
+        if (!res.body) {
+          throw new Error(`Streaming request missing body`);
         }
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
@@ -131,6 +149,11 @@ export function useSSE() {
               line = line.slice("data:".length).trim();
             }
             if (!line) continue;
+            // Ignore the special [DONE] sentinel emitted by the Gateway.  It marks
+            // the end of the stream but is not valid JSON.
+            if (line === "[DONE]") {
+              continue;
+            }
             try {
               const payload = JSON.parse(line);
               if (payload.token) {
@@ -190,6 +213,14 @@ export function useSSE() {
               // Silently ignore malformed JSON lines
             }
           }
+        }
+        // In case the server sent a single-line JSON without an ending newline,
+        // parse any trailing buffer so we still render the final data.
+        const leftover = buffer.trim();
+        if (leftover) {
+          try {
+            setFinalData(JSON.parse(leftover));
+          } catch {/* ignore */}
         }
         setIsStreaming(false);
       } catch (err: any) {

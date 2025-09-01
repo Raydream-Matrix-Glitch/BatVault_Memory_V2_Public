@@ -48,27 +48,6 @@ async def _refresh_loop(period_s: float) -> None:
             )
         await asyncio.sleep(max(0.1, float(period_s)))
 
-async def _refresh_loop(period_s: float) -> None:
-    cycle = 0
-    task = asyncio.current_task()
-    task_id = getattr(task, 'get_name', lambda: '')() or hex(id(task))
-    while True:
-        try:
-            flag = await _compute_load_shed()
-            _load_shed_flag.set(flag)
-            cycle += 1
-            try:
-                log_stage("load_shed", "refresh", value=flag, task_id=task_id, cycle=cycle)
-
-            except Exception:
-                pass
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # Errors already handled; continue
-            pass
-        await asyncio.sleep(period_s)
-
 def start_background_refresh(period_ms: int = 300) -> None:
     """Start the refresher loop if not already running."""
     global _refresh_task

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json
+from core_utils import jsonx as _jsonx
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -16,13 +16,13 @@ def parse_ts(ts):
 # Load decisions
 decisions = {}
 for f in DEC_DIR.glob("*.json"):
-    data = json.loads(f.read_text())
+    data = _jsonx.loads(f.read_text())
     decisions[data["id"]] = parse_ts(data["timestamp"])
 
 # Check events → decisions
 errors = []
 for f in EVT_DIR.glob("*.json"):
-    evt = json.loads(f.read_text())
+    evt = _jsonx.loads(f.read_text())
     e_ts = parse_ts(evt["timestamp"])
     for dec_id in evt.get("led_to", []):
         if dec_id not in decisions:
@@ -36,7 +36,7 @@ for f in EVT_DIR.glob("*.json"):
 
 # Check transitions → decisions
 for f in TR_DIR.glob("*.json"):
-    tr = json.loads(f.read_text())
+    tr = _jsonx.loads(f.read_text())
     tid, frm, to = tr["id"], tr["from"], tr["to"]
     if frm not in decisions or to not in decisions:
         if frm not in decisions:

@@ -1,13 +1,11 @@
-from __future__ import annotations
-
 import asyncio
-import json
 import os
 import re
 import time
-from typing import Callable, Dict
-from fastapi import HTTPException 
+from typing import Dict
 
+from core_http.client import get_http_client
+from core_config.constants import timeout_for_stage
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,10 +23,12 @@ from api_edge.rate_limit import RateLimitMiddleware
 from core_config import Settings, get_settings
 from core_logging import get_logger, log_stage
 from core_observability.otel import init_tracing, instrument_fastapi_app
+from core_observability.otel import inject_trace_context
 import core_metrics
 from core_utils.health import attach_health_routes
 from core_utils import idempotency_key
 from core_utils.ids import generate_request_id
+from core_utils import jsonx as _jsonx
 from typing import Dict
 
 # ---------------------------------------------------------------------------
@@ -61,29 +61,6 @@ instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'api_
 
 init_tracing(os.getenv("OTEL_SERVICE_NAME") or "api_edge")
 
-# ---- Bind OTEL span IDs into core_logging for consistent trace IDs ---------
-@app.middleware("http")
-async def _bind_trace_ids(request: Request, call_next):
-    try:
-        from opentelemetry import trace as _trace  # type: ignore
-        _sp = _trace.get_current_span()
-        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
-        if _ctx and getattr(_ctx, "trace_id", 0):
-            from core_logging import bind_trace_ids  # type: ignore
-            bind_trace_ids(f"{_ctx.trace_id:032x}", f"{_ctx.span_id:016x}")
-            try:
-                log_stage(logger, "observability", "trace_ctx_bound", path=str(request.url.path))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return await call_next(request)
-
-# OTEL helpers (centralized)
-def _inject_trace_context(headers: Dict[str, str] | None) -> Dict[str, str]:
-    from core_observability.otel import inject_trace_context
-    return inject_trace_context(headers)
-
 def _current_trace_id() -> str | None:
     try:
         from opentelemetry import trace as _t  # type: ignore
@@ -95,14 +72,6 @@ def _current_trace_id() -> str | None:
     except Exception:
         return None
     return None
-
-# httpx->requests shim: expose `.iter_content()` for SSE streaming compatibility
-if not hasattr(httpx.Response, "iter_content"):
-
-    def _iter_content(self, chunk_size: int = 4096):  # noqa: D401, ANN001
-        yield from self.iter_bytes()
-
-    httpx.Response.iter_content = _iter_content  # type: ignore[attr-defined]
 
 # ────────────────────────────────────────────────────────────────────────────
 # 2. Settings, logging, application instance
@@ -185,7 +154,7 @@ async def req_logger(request: Request, call_next):  # noqa: D401
         # ---- pre-request ----------------------------------------------------
         body = await request.body()
         try:
-            parsed = json.loads(body.decode("utf-8")) if body else None
+            parsed = _jsonx.loads(body.decode("utf-8")) if body else None
         except Exception:
             parsed = body.decode("utf-8", errors="ignore")
 
@@ -286,8 +255,11 @@ def metrics() -> Response:  # pragma: no cover
 async def check_gateway_ready() -> bool:
     """Returns True iff Gateway /readyz returns status: ready."""
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get("http://gateway:8081/readyz")
+        client = get_http_client(timeout_ms=int(1000*timeout_for_stage('enrich')))
+        r = await client.get(
+            "http://gateway:8081/readyz",
+            headers=inject_trace_context({}),
+        )
         return r.status_code == 200 and r.json().get("status") == "ready"
     except Exception:
         return False
@@ -312,9 +284,12 @@ attach_health_routes(
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/ops/minio/bucket", include_in_schema=False)
 async def ensure_bucket():
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        r = await client.post("http://gateway:8081/ops/minio/ensure-bucket")
-        return JSONResponse(status_code=r.status_code, content=r.json())
+    client = get_http_client(timeout_ms=int(1000 * timeout_for_stage('enrich')))
+    r = await client.post(
+        "http://gateway:8081/ops/minio/ensure-bucket",
+        headers=inject_trace_context({}),
+    )
+    return JSONResponse(status_code=r.status_code, content=r.json())
 
 # ----- Gateway pass-through routes (/v2 ask/query/schema) ---------------------
 @app.api_route("/v2/ask", methods=["POST"])
@@ -396,7 +371,7 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
     stream_flag = request.query_params.get("stream")
     is_stream = str(stream_flag).lower() in {"1", "true", "yes"}
     # Instantiate client per request.
-    client = httpx.AsyncClient(timeout=None)
+    client = get_http_client(timeout_ms=int(1000*timeout_for_stage('enrich')))
     if is_stream:
  # Streaming: forward and relay SSE (httpx 0.27: use send(..., stream=True)).
         try:
@@ -404,7 +379,7 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
                 method.upper(),
                 upstream_url,
                 content=body,
-                headers=_inject_trace_context(headers),
+                headers=inject_trace_context(headers),
             )
             upstream = await client.send(req_up, stream=True)
         except Exception as e:
@@ -483,7 +458,7 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
             method.upper(),
             upstream_url,
             content=body,
-            headers=_inject_trace_context(headers),
+            headers=inject_trace_context(headers),
         )
     except Exception as exc:
         # Upstream failure.

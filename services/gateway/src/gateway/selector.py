@@ -1,14 +1,9 @@
 from __future__ import annotations
 import datetime as dt
-from typing import Any, Dict, Set, Tuple
+from typing import Any, Dict, Set
 
-import orjson
-
+from core_utils import jsonx
 from core_models.models import WhyDecisionAnchor, WhyDecisionEvidence
-
-from core_validator import canonical_allowed_ids
-
-import time
 from core_logging import get_logger
 from shared.tokens import estimate_text_tokens
 
@@ -21,13 +16,23 @@ def bundle_size_bytes(ev: WhyDecisionEvidence) -> int:
     Note: This does NOT drive any pruning/gating logic (tokens do).
     """
     try:
-        return len(orjson.dumps(ev.model_dump(mode="python")))
-    except Exception:
-        return len(str(ev).encode("utf-8"))
+        # Use canonical JSON; compute byte size deterministically.
+        payload = ev.model_dump(mode="python", exclude_none=True)
+        s = jsonx.dumps({"ev": payload})
+        size = len(s.encode("utf-8"))
+        logger.info("selector.bundle_size_bytes", extra={"bytes": size})
+        return size
+    except Exception as e:
+        logger.warning("selector.bundle_size_bytes.error", extra={"error": str(e)})
+        return 0
 
 def evidence_prompt_tokens(ev: WhyDecisionEvidence) -> int:
     """Estimate tokens for the serialized evidence (proxy for prompt weight)."""
-    return estimate_text_tokens(orjson.dumps(ev.model_dump(mode="python")).decode())
+    # Canonical serializer → stable token estimates across services.
+    txt = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True))
+    tokens = estimate_text_tokens(txt)
+    logger.info("selector.evidence_prompt_tokens", extra={"tokens": tokens})
+    return tokens
 
 # ------------------------------------------------------------------ #
 #  helpers                                                           #
@@ -53,19 +58,6 @@ def _sim(a: str | None, b: str | None) -> float:
         return 0.0
     return len(ta & tb) / len(ta | tb)
 
-def _score(item: Dict[str, Any], anchor: WhyDecisionAnchor) -> Tuple[float, float]:
-    """
-    Score by recency (newer first) and similarity (higher first).
-    Returning negatives lets us sort ascending.
-    """
-    ts_dt = _parse_ts(item) or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-    recency_score = -ts_dt.timestamp()
-    sim_score     = -_sim(
-        item.get("summary") or item.get("description", ""), 
-        anchor.rationale
-    )
-    return (recency_score, sim_score)
-
 def rank_events(anchor: WhyDecisionAnchor, events: list[dict]) -> list[dict]:
     """Deterministically rank events for Answer/Response policies.
 
@@ -80,11 +72,29 @@ def rank_events(anchor: WhyDecisionAnchor, events: list[dict]) -> list[dict]:
             return float(_sim(txt, _anchor.rationale or ""))
         def _ts_iso(ev: dict) -> str:
             return ev.get("timestamp") or ""
-        return sorted(
+        ranked = sorted(
             list(events),
             key=lambda e: (-_sim_text(e), _ts_iso(e), e.get("id") or ""),
         )
+        logger.info(
+            "selector.rank_events",
+            extra={
+                "count": len(ranked),
+                "anchor_id": getattr(_anchor, "id", None),
+                "policy": "sim_desc__ts_iso_asc__id_asc",
+            },
+        )
+        return ranked
     except Exception:
         # Fallback: timestamp desc → id asc
-        return sorted(list(events), key=lambda e: (e.get("timestamp") or "", e.get("id") or ""), reverse=True)
+        ranked = sorted(
+            list(events),
+            key=lambda e: (e.get("timestamp") or "", e.get("id") or ""),
+            reverse=True,
+        )
+        logger.warning(
+            "selector.rank_events.fallback",
+            extra={"count": len(ranked), "policy": "ts_desc__id_asc"},
+        )
+        return ranked
 

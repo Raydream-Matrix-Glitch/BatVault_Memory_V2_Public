@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import asyncio, time
+import redis, time
+from core_utils import jsonx as _jsonx
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,7 @@ from core_metrics import counter as _metric_counter
 from core_config import get_settings
 
 # ── optional Redis cache for snapshot_etag, field-catalog, etc. ─────────────
-import redis, orjson, time
+import redis, time
 
 _CACHE_TTL = 60  # seconds
 
@@ -27,7 +28,7 @@ def _cache_get(key: str):
     val = r.get(key)
     if val is not None:
         _metric_counter("cache_hit_total", 1, service="ingest")
-        return orjson.loads(val)
+        return _jsonx.loads(val)
     _metric_counter("cache_miss_total", 1, service="ingest")
     return None
 
@@ -36,7 +37,7 @@ def _cache_set(key: str, value, ttl: int = _CACHE_TTL):
     if not r:
         return
     _metric_counter("cache_write_total", 1, service="ingest")
-    r.setex(key, ttl, orjson.dumps(value))
+    r.setex(key, ttl, _jsonx.dumps(value))
 
 # Initialize structured logger with ingest service context
 logger = get_logger("ingest.watcher")

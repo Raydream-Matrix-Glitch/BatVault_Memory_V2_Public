@@ -5,13 +5,15 @@ from core_logging import get_logger, log_stage
 from core_observability.otel import init_tracing, instrument_fastapi_app
 from core_utils.health import attach_health_routes
 from core_utils.ids import generate_request_id
-from core_config import settings            # ← unified, validated settings
+from core_config import get_settings 
 import core_metrics, time
-import httpx
+from core_http.client import get_http_client
+from core_config.constants import timeout_for_stage
 import os
 from fastapi.responses import JSONResponse, Response
 import inspect
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from core_observability.otel import inject_trace_context
 
 app = FastAPI(title="BatVault Ingest", version="0.1.0")
 
@@ -19,37 +21,8 @@ app = FastAPI(title="BatVault Ingest", version="0.1.0")
 instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'ingest')
 
 logger = get_logger("ingest")
-logger.propagate = True
+logger.propagate = False
 init_tracing(os.getenv("OTEL_SERVICE_NAME") or "ingest")
-
-# ---- OTEL helpers (safe no-ops if OTEL not installed) ----------------------
-def _inject_trace_context(headers: dict | None) -> dict:
-    hdrs = dict(headers or {})
-    try:
-        from opentelemetry.propagate import inject  # type: ignore
-        inject(hdrs)
-    except Exception:
-        # Never break a request due to tracing
-        pass
-    return hdrs
-
-# ---- Bind OTEL span IDs into core_logging for consistent trace IDs ---------
-@app.middleware("http")
-async def _bind_trace_ids(request: Request, call_next):
-    try:
-        from opentelemetry import trace as _trace  # type: ignore
-        _sp = _trace.get_current_span()
-        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
-        if _ctx and getattr(_ctx, "trace_id", 0):
-            from core_logging import bind_trace_ids  # type: ignore
-            bind_trace_ids(f"{_ctx.trace_id:032x}", f"{_ctx.span_id:016x}")
-            try:
-                log_stage(logger, "observability", "trace_ctx_bound", path=str(request.url.path))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return await call_next(request)
 
 @app.middleware("http")
 async def _request_logger(request: Request, call_next):
@@ -107,12 +80,12 @@ async def _ping_gateway_ready() -> bool:
     Kept async to allow monkey-patching with sync lambdas in unit-tests.
     """
     try:
-        async with httpx.AsyncClient(timeout=5.0) as c:
-            r = await c.get(
-                "http://gateway:8081/readyz",
-                headers=_inject_trace_context({}),
-            )
-            return r.status_code == 200 and r.json().get("status") == "ready"
+        c = get_http_client(timeout_ms=int(1000*timeout_for_stage('enrich')))
+        r = await c.get(
+            "http://gateway:8081/readyz",
+            headers=inject_trace_context({}),
+        )
+        return r.status_code == 200 and r.json().get("status") == "ready"
     except Exception:
         return False
 

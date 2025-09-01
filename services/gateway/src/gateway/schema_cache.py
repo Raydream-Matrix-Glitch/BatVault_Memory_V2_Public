@@ -4,7 +4,7 @@ from typing import Dict, Tuple, Optional
 
 from core_config import get_settings
 from core_config.constants import TTL_SCHEMA_CACHE_SEC
-from .http import fetch_json
+from core_http.client import fetch_json
 
 _CACHE: Dict[str, Tuple[dict, str, float]] = {}
 

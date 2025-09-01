@@ -1,16 +1,18 @@
 from __future__ import annotations
-
 from typing import Any, Dict, List
-import httpx, json, pathlib, re
+import pathlib
+import re
 
+from core_utils import jsonx as _jsonx
 from core_logging import get_logger, trace_span
 from ..logging_helpers import stage as log_stage
 from core_observability.otel import inject_trace_context
 from core_config import get_settings
 
-from gateway.http import get_http_client
+from core_http.client import get_http_client
+from core_config.constants import timeout_for_stage
 
-logger = get_logger("gateway")
+logger = get_logger("gateway.resolver.fallback_search")
 settings = get_settings()
 
 # ── Local fixture helper ────────────────────────────────────────────────
@@ -34,7 +36,7 @@ def _offline_fixture_search(text: str, k: int = 24) -> List[Dict[str, Any]]:
     matches: List[Dict[str, Any]] = []
     for path in repo.glob("*.json"):
         try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
+            doc = _jsonx.loads(path.read_text(encoding="utf-8"))
         except Exception:       # malformed fixture – ignore
             continue
         haystack = f"{doc.get('option','')} {doc.get('rationale','')}".lower()
@@ -70,7 +72,7 @@ async def search_bm25(
                 f"{settings.memory_api_url}/api/resolve/text",
                 json=payload,
                 headers=inject_trace_context({}),
-                timeout=0.8,
+                timeout=timeout_for_stage("search"),
             )
         if resp.status_code == 200:
             doc = resp.json()
@@ -86,8 +88,9 @@ async def search_bm25(
     except Exception:           # network failure / service down
         logger.warning("bm25_search_http_error", exc_info=True)
 
-    if not matches:             # offline back-stop
-        matches = _offline_fixture_search(text, k)
+    if not matches:
+        import asyncio
+        matches = await asyncio.to_thread(_offline_fixture_search, text, k)
         log_stage(
             "resolver",
             "bm25_offline_fallback",

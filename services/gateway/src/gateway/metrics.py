@@ -56,17 +56,6 @@ def span(name: str, **attrs: Any) -> Iterator[None]:                 # pragma: n
     with _trace_span(name, **attrs):
         yield
 
-def gateway_llm_requests(model: str, canary: str, status: str) -> None:
-    """Increment the LLM requests counter with common labels."""
-    _counter(
-        "gateway_llm_requests_total",
-        1,
-        service="gateway",
-        model=model,
-        canary=canary,
-        status=status,
-    )
-
 # ── Canonical convenience wrappers for common Gateway metrics ───────────────
 
 def gateway_llm_requests(model: str, canary: str, status: str) -> None:

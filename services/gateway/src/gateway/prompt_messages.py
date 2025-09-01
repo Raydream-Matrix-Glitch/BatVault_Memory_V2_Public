@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Any, Dict, List
-import orjson
+from core_utils import jsonx
 
 def build_messages(envelope: Dict[str, Any]) -> List[Dict[str, str]]:
     """Render the chat *messages* we send to vLLM/TGI.
@@ -33,5 +33,7 @@ def build_messages(envelope: Dict[str, Any]) -> List[Dict[str, str]]:
     )
     return [
         {"role": "system", "content": system_text},
-        {"role": "user", "content": orjson.dumps(envelope).decode()},
+        # Use the repo's canonical JSON serializer for consistency across
+        # fingerprints, logs and replay. (Avoid ad-hoc orjson usage.)
+        {"role": "user", "content": jsonx.dumps(envelope)},
     ]

@@ -14,6 +14,7 @@ export interface AuditDrawerProps {
   open: boolean;
   /** Handler to close the drawer. */
   onClose: () => void;
+  bundle_url?: string;
   /** Metadata returned with the final response. */
   meta?: MetaInfo;
   /** Evidence bundle from the final response for listing allowed/dropped IDs. */
@@ -35,6 +36,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
   meta,
   evidence,
   answer,
+  bundle_url,
 }) => {
   const [activeTab, setActiveTab] = useState<
     "trace" | "prompt" | "evidence" | "metrics" | "fingerprints"
@@ -85,6 +87,20 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
         <Button variant="secondary" onClick={onClose} className="px-2 py-1 text-sm">
           Close
         </Button>
+      </div>
+      {/* Compact meta bar */}
+      <div className="px-4 py-2 text-xs text-copy border-b border-gray-700 flex items-center justify-between">
+        <div className="flex flex-wrap gap-3 items-center">
+          <span><span className="font-semibold">Latency</span>: {meta?.latency_ms ?? "–"} ms</span>
+          <span><span className="font-semibold">Fallback</span>: {String(meta?.fallback_used ?? false)}</span>
+          <span className="hidden sm:inline">Prompt fp: {meta?.prompt_fingerprint ?? "–"}</span>
+          <span className="hidden sm:inline">Snapshot: {meta?.snapshot_etag ?? "–"}</span>
+        </div>
+        {bundle_url && (
+          <Button variant="secondary" onClick={() => window.open(bundle_url!, "_blank")} className="text-xs">
+            Open full bundle
+          </Button>
+        )}
       </div>
       {/* Tabs */}
       <div className="flex space-x-3 px-4 border-b border-gray-700 overflow-x-auto">

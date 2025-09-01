@@ -4,7 +4,7 @@ Single source of truth for Arango bootstrap.
 Waits for the server, then instantiates ArangoStore with lazy=False,
 which triggers the full schema / index setup.
 """
-import os, time, sys
+import time, sys
 from arango import ArangoClient
 from core_config import get_settings
 from core_storage.arangodb import ArangoStore

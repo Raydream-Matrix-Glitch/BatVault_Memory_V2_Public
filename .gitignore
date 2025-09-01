@@ -31,6 +31,8 @@ dist/
 # Docker
 *.local.yml
 docker-data/
+.docker-cache/
+**/.docker-cache/
 
 # Windows ADS noise
 *:Zone.Identifier

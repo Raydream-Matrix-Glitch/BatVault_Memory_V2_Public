@@ -8,12 +8,23 @@ version = "0.1.0"
 description = "Gateway and prompt/evidence coordinator"
 requires-python = ">=3.11"
 dependencies = [
+  "httpx>=0.27.0",
+  "orjson>=3.9.7",
+  "redis>=5.0.3",
+  "prometheus-client>=0.19.0",
   "fastapi>=0.112.0",
   "numpy>=1.26.4",
-  "sentence-transformers>=2.7.0",
+  "anyio>=3.7.1", 
+  "sentence-transformers>=2.7.0",    # embeddings (optional at runtime)
+  "core_config",
+  "core_logging",
+  "core_observability",
   "core_storage",
+  "core_http",
   "core_metrics",
-  "uvicorn[standard]>=0.29.0",
+  "core_utils",
+  "core_validator",
+  "shared",
   "opentelemetry-api>=1.24",
   "opentelemetry-sdk>=1.24",
   "opentelemetry-exporter-otlp-proto-http>=1.24",
@@ -21,6 +32,8 @@ dependencies = [
   "opentelemetry-instrumentation-redis>=0.46b0",
   "httpx>=0.27.0",
   "redis>=5.0.3",
+  "core_http",
+  "core_ml",
   "pydantic>=2.7.0",
   "orjson>=3.9.7",
   "minio>=7.2.7",
@@ -35,6 +48,15 @@ dependencies = [
   "core_validator",
   "shared",
   "blake3>=0.4.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "pytest-env>=0.8",
+  "httpx>=0.27.0",
+  "fakeredis>=2.21.0",
 ]
 
 [tool.setuptools.packages.find]

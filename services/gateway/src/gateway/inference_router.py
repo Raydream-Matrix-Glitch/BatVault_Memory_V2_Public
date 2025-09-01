@@ -1,8 +1,8 @@
-import json
 import random
 import time
 from typing import Any, Dict, Optional, Tuple
-
+from core_utils import jsonx  # canonical JSON serializer
+from core_utils.backoff import sleep_with_jitter
 from core_config import get_settings
 from core_logging import get_logger
 from .logging_helpers import stage as log_stage
@@ -17,11 +17,15 @@ logger.propagate = False
 last_call: Dict[str, Any] = {}
 
 def _safety_clamp(envelope: Dict[str, Any], raw_json: str, *, request_id: Optional[str] = None) -> str:
-    """Final clamp: enforce supporting_ids ⊆ allowed_ids and cap short_answer ≤320 chars.
-    If parsing fails, return the original string unchanged.
+    """Final clamp: enforce supporting_ids ⊆ allowed_ids and cap short_answer ≤ 320 characters.
+    If parsing fails, return the original string unchanged.  Uses the shared
+    JSON helpers to guarantee canonical handling.
     """
     try:
-        data = json.loads(raw_json or "{}")
+        # Always parse using the shared JSON loader; this enforces sorted keys and
+        # consistent unicode handling across services.  When the payload is not
+        # a mapping, fall through to return the original string unchanged.
+        data = _jsonx.loads(raw_json or "{}")
         if not isinstance(data, dict):
             return raw_json
         allowed = set((envelope or {}).get("allowed_ids") or [])
@@ -41,7 +45,7 @@ def _safety_clamp(envelope: Dict[str, Any], raw_json: str, *, request_id: Option
                 data["answer"]["short_answer"] = short
             else:
                 data["short_answer"] = short
-        out = json.dumps(data, separators=(",", ":"))
+        out = _jsonx.dumps(data)
         try:
             log_stage("inference", "safety_clamp", request_id=request_id, clamped=False)
         except Exception:
@@ -106,7 +110,7 @@ async def call_llm(
                 if attempt > max(0, int(retries or 0)):
                     raise
                 # jittered backoff: 50-200ms
-                await __import__("asyncio").sleep(0.05 + (0.15 * (attempt % 3)))
+                await sleep_with_jitter(attempt)
     except Exception:
         status = "error"
         raise

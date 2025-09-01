@@ -20,13 +20,6 @@ _mod = importlib.import_module("api_edge.app")
 # expose the **module object** so tests can `importlib.reload()` it
 app = _mod  # type: ignore[assignment]
 
-# ── backwards-compat: add `iter_content()` to httpx.Response ──────────
-import httpx
-if not hasattr(httpx.Response, "iter_content"):
-    def _iter_content(self: "httpx.Response", chunk_size: int = 8192):
-        yield from self.iter_bytes(chunk_size)
-    httpx.Response.iter_content = _iter_content        # type: ignore[attr-defined]
-
 __all__ = ["app"]
 
 del sys, importlib, Path, _SRC_DIR

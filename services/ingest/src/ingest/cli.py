@@ -1,7 +1,9 @@
-import sys, json, os, glob, re, time, argparse, hashlib
+import sys, os, glob, re, time, argparse, hashlib
+from core_utils import jsonx
 from importlib import resources 
 from jsonschema import Draft202012Validator
-from core_logging import get_logger, log_stage
+from core_logging import get_logger, log_stage, trace_span
+from core_observability.otel import init_tracing
 from core_utils import compute_snapshot_etag_for_files, slugify_id
 from core_storage import ArangoStore
 from core_config import get_settings
@@ -67,7 +69,12 @@ def load_schema(name: str) -> dict:
     """
     pkg = "ingest.schemas.json_v2"
     path = resources.files(pkg).joinpath(f"{name}.schema.json")
-    return json.loads(path.read_text(encoding="utf-8"))
+    # Parse the schema using the canonical jsonx loader for deterministic
+    # key ordering and float handling.  Fallback to an empty dict on error.
+    try:
+        return jsonx.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return jsonx.loads(path.read_text(encoding="utf-8"))
 
 SC_DECISION = load_schema("decision")
 SC_EVENT = load_schema("event")
@@ -85,13 +92,15 @@ def seed(path: str) -> int:
         glob.glob(os.path.join(path, "**", "*.json"), recursive=True)
     )
     if not files:
-        # strategic structured logging for fast triage
+        # strategic structured logging for fast triage.  Avoid printing to stderr
+        # here – structured logs are sufficient for triage.
         log_stage(
-            logger, "ingest", "fixture_scan_empty",
+            logger,
+            "ingest",
+            "fixture_scan_empty",
             search_path=os.path.abspath(path),
             deterministic_id=slugify_id(os.path.abspath(path)),
         )
-        print(f"No JSON files found under {path}", file=sys.stderr)
         return 1
 
     raw_decisions, raw_events, raw_transitions = {}, {}, {}
@@ -100,12 +109,15 @@ def seed(path: str) -> int:
     for p in files:
         try:
             with open(p, "r", encoding="utf-8") as fh:
-                doc = json.load(fh)
+                doc = jsonx.loads(fh.read())
         except Exception as e:
-            if getattr(e, "lineno", None):                       # surface file/line diagnostics
-                errors.append(f"{p}:{e.lineno}:{e.colno}: json error {e.msg}")
+            # Log parse errors via structured logging; capture line/column when available.
+            if getattr(e, "lineno", None):
+                msg = f"{p}:{e.lineno}:{e.colno}: json error {e.msg}"
             else:
-                errors.append(f"{p}: json error {e}")
+                msg = f"{p}: json error {e}"
+            errors.append(msg)
+            log_stage(logger, "ingest", "fixture_parse_error", path=p, error=str(e))
             continue
         # Canonicalize aliases BEFORE kind inference and schema validation
         doc, hits = canonicalize(doc)
@@ -127,7 +139,9 @@ def seed(path: str) -> int:
         else: raw_transitions[doc["id"]] = doc
 
     if errors:
-        for e in errors: print(e, file=sys.stderr)
+        # Emit validation and parse errors via structured logging; do not print to stderr.
+        for e in errors:
+            log_stage(logger, "ingest", "validation_error", error=e)
         return 2
 
     t0 = time.perf_counter()
@@ -154,7 +168,8 @@ def seed(path: str) -> int:
         if t.get("to") not in decisions:
             ri_errors.append(f"transition {t['id']} to missing decision '{t.get('to')}'")
     if ri_errors:
-        for m in ri_errors: print(m, file=sys.stderr)
+        for m in ri_errors:
+            log_stage(logger, "ingest", "ri_error", error=m)
         return 3
 
     snapshot_etag = compute_snapshot_etag_for_files(files)
@@ -173,13 +188,14 @@ def seed(path: str) -> int:
 
     # ---------- 🎯  content-addressable batch snapshot (spec §D) ----------
     from core_storage.minio_utils import ensure_bucket
-    import minio, io, gzip, orjson, datetime as _dt
+    import minio, io, gzip, datetime as _dt
+    from core_utils import jsonx
     minio_client = minio.Minio(settings.minio_endpoint,
                                access_key=settings.minio_access_key,
                                secret_key=settings.minio_secret_key,
                                secure=False)
     ensure_bucket(minio_client, "batvault-snapshots", 30)
-    blob = gzip.compress(orjson.dumps({"decisions": decisions,
+    blob = gzip.compress(jsonx.dumps({"decisions": decisions,
                                        "events": events,
                                        "transitions": transitions}))
     obj_name = f"{snapshot_etag}.json.gz"
@@ -222,7 +238,8 @@ def seed(path: str) -> int:
         removed_nodes=removed_nodes, removed_edges=removed_edges,
         latency_ms=dt_total_ms,
     )
-    print(json.dumps({"ok": True, "files": len(files), "snapshot_etag": snapshot_etag}))
+    # Emit the final summary using jsonx.dumps for stable key ordering.
+    print(jsonx.dumps({"ok": True, "files": len(files), "snapshot_etag": snapshot_etag}))
     return 0
 
 def main() -> None:
@@ -238,6 +255,11 @@ def main() -> None:
              "(e.g. --arango-url http://localhost:8529)",
     )
     args = parser.parse_args()
+    # Initialise tracing for CLI runs (no-op if OTEL not installed)
+    try:
+        init_tracing('ingest-cli')
+    except Exception:
+        pass
 
     # ------------------------------------------------------------------
     #  Strategic logging – resolved Arango URL
@@ -263,7 +285,9 @@ def main() -> None:
         )
     
     if args.command == "seed":
-        sys.exit(seed(args.dir))
+        with trace_span('ingest_cli', stage='cli', command=args.command, dir=args.dir):
+            sys.exit(seed(args.dir))
+
 
 # ------------------------------------------------------------------
 #  helpers

@@ -1,15 +1,13 @@
-# ---- Imports ---------------------------------------------------------------
-# Stdlib
 import asyncio, functools, io, os, time, inspect
-from typing import List, Optional
+from typing import List, Optional, Any
 import importlib.metadata as _md
 
-# Third-party
-import httpx as _httpx_real, orjson
+from core_utils import jsonx
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from core_utils.sse import stream_answer_with_final
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
 from core_utils.ids import compute_request_id
 
@@ -18,7 +16,7 @@ from core_config import get_settings
 from core_config.constants import (
     TTL_SCHEMA_CACHE_SEC as _SCHEMA_TTL_SEC,
 )
-from core_logging import get_logger, log_stage, bind_trace_ids, trace_span
+from core_logging import get_logger, bind_trace_ids, trace_span
 from .logging_helpers import stage as log_stage
 from core_observability.otel import init_tracing, instrument_fastapi_app
 from .metrics import (
@@ -41,19 +39,12 @@ from core_validator import canonical_allowed_ids
 from . import evidence
 from .evidence import EvidenceBuilder
 from .schema_cache import fetch_schema
-from .http import fetch_json
+from core_http.client import fetch_json
 from .load_shed import should_load_shed, start_background_refresh, stop_background_refresh
 from .builder import build_why_decision_response
 from .builder import BUNDLE_CACHE
-from gateway.sse import stream_chunks
+from core_utils.sse import stream_chunks
 from core_config.constants import TIMEOUT_SEARCH_MS, TIMEOUT_EXPAND_MS
-
-# ---- HTTPX shim ------------------------------------------------------------
-class _HTTPXShim:
-    def __getattr__(self, name: str):
-        return getattr(_httpx_real, name)
-
-httpx = _HTTPXShim()
 
 # ---- Configuration & globals ----------------------------------------------
 settings        = get_settings()
@@ -76,14 +67,6 @@ init_tracing("gateway")
 
 # ---- Proxy helpers (router / resolver) ------------------------------------
 async def route_query(*args, **kwargs):  # pragma: no cover - proxy
-    """Proxy for gateway.intent_router.route_query.
-
-    Looks up the current `route_query` implementation from
-    ``gateway.intent_router`` each time it is invoked.  This allows tests
-    to monkey-patch the router and ensures that any lingering references to
-    `gateway.app.route_query` continue to work.  Structured logging records
-    proxy invocation for debugging.
-    """
     try:
         log_stage("router_proxy", "invoke", function="route_query")
     except Exception:
@@ -101,12 +84,6 @@ async def resolve_decision_text(
     request_id: str | None = None,
     snapshot_etag: str | None = None,
 ):  # pragma: no cover - proxy
-    """Resolve a natural-language query or slug to a decision anchor.
-
-    This proxy simply defers to the implementation in ``gateway.resolver``.
-    It exists to allow tests to monkey-patch ``gateway.app.resolve_decision_text``
-    without altering core behaviour.  See ``v2_query`` for usage.
-    """
     import importlib
     resolver_mod = importlib.import_module("gateway.resolver")
     resolver_fn = getattr(resolver_mod, "resolve_decision_text")
@@ -415,6 +392,7 @@ class QueryIn(BaseModel):
 @trace_span("ask", logger=logger)
 async def ask(
     req: AskIn,
+    request: Request,
     stream: bool = Query(False),
     include_event: bool = Query(False),
 ):
@@ -422,6 +400,13 @@ async def ask(
     resp, artefacts, req_id = await build_why_decision_response(
         req, _evidence_builder
     )
+    want_stream = bool(stream) or ("text/event-stream" in (request.headers.get("accept","").lower()))
+    try:
+        log_stage("stream", "mode_selected", request_id=req_id,
+                  want_stream=want_stream,
+                  reason=("accept" if want_stream and not stream else ("flag" if stream else "off")))
+    except Exception:
+        pass
     try:
         import sys
         gw_mod = sys.modules.get("gateway.app")
@@ -445,7 +430,7 @@ async def ask(
     except Exception:
         pass
 
-    if stream:
+    if want_stream:
         short_answer: str = resp.answer.short_answer
         headers = {"Cache-Control": "no-cache", "x-request-id": req_id}
         try:
@@ -474,10 +459,24 @@ async def ask(
                 headers["x-canary"] = "true" if can else "false"
         except Exception:
             pass
+        # Emit tokens and then the full final response object; mirror snapshot ETag to headers
+        final_payload = resp.model_dump()
+        if isinstance(final_payload, dict):
+            etag = None
+            try:
+                etag = final_payload.get("meta", {}).get("snapshot_etag")
+            except Exception:
+                etag = None
+            if etag:
+                headers["x-snapshot-etag"] = etag
         return StreamingResponse(
-            _traced_stream(short_answer, include_event=include_event),
+            stream_answer_with_final(
+                short_answer,
+                final_payload,
+                include_event=include_event,
+            ),
             media_type="text/event-stream",
-            headers=headers,
+            headers=headers or {"Cache-Control": "no-cache"},
         )
     headers = {"x-request-id": req_id}
     try:
@@ -684,12 +683,6 @@ async def v2_query(
                 ev.events.append({"id": n_id})
             event_ids.add(n_id)
             added_events += 1
-
-    # Recompute allowed_ids using the canonical helper.  Convert events
-    # and transitions to plain dictionaries as needed.  The canonical
-    # function ensures the anchor appears first, followed by events in
-    # ascending timestamp order and then transitions.  Duplicate IDs are
-    # removed.
     try:
         _evs: list[dict] = []
         for _e in ev.events or []:
@@ -738,15 +731,6 @@ async def v2_query(
     resp, artefacts, req_id = await build_why_decision_response(
         ask_payload, _evidence_builder
     )
-
-    # Surface resolver path in the response meta for debugging.  When the
-    # resolver falls back to BM25 and the anchor carries a rationale the
-    # rationale is now incorporated into the deterministic short answer by
-    # the templater.  To avoid leaking implementation details the legacy
-    # ``rationale_note`` field is no longer populated (Milestone‑5 §A9).
-    # Assign to the canonical meta model via attribute assignment.  The
-    # MetaInfo model defines ``resolver_path`` as an optional field, so
-    # setting it directly will not violate the ``extra=forbid`` constraint.
     try:
         if resolver_path:
             try:
@@ -790,7 +774,14 @@ async def v2_query(
     except Exception:
         pass
 
-    if stream:
+    # Decide streaming mode based on query flag or Accept header (SSE)
+    want_stream = bool(stream) or ("text/event-stream" in (request.headers.get("accept","").lower()))
+    try:
+        log_stage("stream", "mode_selected", request_id=req_id,
+                  want_stream=want_stream,
+                  reason=("accept" if want_stream and not stream else ("flag" if stream else "off")))
+    except Exception: pass
+    if want_stream:
         headers = {"Cache-Control": "no-cache", "x-request-id": req_id}
         try:
             etag = resp.meta.get("snapshot_etag")
@@ -808,10 +799,24 @@ async def v2_query(
                 headers["x-canary"] = "true" if can else "false"
         except Exception:
             pass
+        # Emit tokens and then the full final response object; mirror snapshot ETag to headers
+        final_payload = resp.model_dump()
+        if isinstance(final_payload, dict):
+            etag = None
+            try:
+                etag = final_payload.get("meta", {}).get("snapshot_etag")
+            except Exception:
+                etag = None
+            if etag:
+                headers["x-snapshot-etag"] = etag
         return StreamingResponse(
-            _traced_stream(resp.answer.short_answer, include_event=include_event),
+            stream_answer_with_final(
+                resp.answer.short_answer,
+                final_payload,
+                include_event=include_event,
+            ),
             media_type="text/event-stream",
-            headers=headers,
+            headers=headers or {"Cache-Control": "no-cache"},
         )
 
     if routing_info:
@@ -840,18 +845,6 @@ async def v2_query(
     except Exception:
         pass
     return JSONResponse(content=resp.model_dump(), headers=headers)
-
-# ---------------------------------------------------------------------------
-# Evidence bundle download endpoints (spec §D)
-#
-# These endpoints expose the exact artefact bundle used to answer a
-# Why-Decision request.  The POST variant returns a short-lived URL
-# pointing to the bundle (not actually presigned in this test harness) and
-# the GET variant streams the JSON bundle directly.  They are part of the
-# /v2 API version and therefore defined on the ``router`` with a ``/v2``
-# prefix.  The Gateway stores bundles in an in-memory cache; these
-# endpoints surface them for download and auditing.  If the requested
-# bundle is not found a 404 is returned.
 
 @router.post("/bundles/{request_id}/download", include_in_schema=False)
 async def download_bundle(request_id: str):
@@ -900,8 +893,12 @@ async def get_bundle(request_id: str):
             content[name] = None
     try:
         # Log the size of the serialized bundle for metrics
-        log_stage("bundle", "download.served", request_id=request_id,
-                  size=len(orjson.dumps(content)))
+        log_stage(
+            "bundle",
+            "download.served",
+            request_id=request_id,
+            size=len(jsonx.dumps(content).encode("utf-8")),
+        )
     except Exception:
         pass
     return JSONResponse(content=content)
@@ -1006,16 +1003,10 @@ async def evidence_endpoint(
 # ---- Final wiring ----------------------------------------------------------
 app.include_router(router)
 
-
-# ---- Load-shed refresh tasks ----------------------------------------------
-# Launch a background task on startup to periodically refresh the
-# load-shed flag.  On shutdown, cancel the refresher to clean up the
-# asynchronous task.  Failure to start the refresher should not crash
-# the application; errors are logged via log_stage within the load_shed
-# module.
 @app.on_event("startup")
 async def _start_load_shed_refresher() -> None:
     try:
+        log_stage("init", "sse_helper_selected", sse_module="core_utils.sse")
         start_background_refresh()
     except Exception:
         pass

@@ -12,7 +12,7 @@ from gateway.redis import get_redis_pool
 from core_utils import jsonx
 from core_config import get_settings
 from core_logging import get_logger, trace_span
-from .http import fetch_json, get_http_client
+from core_http.client import fetch_json, get_http_client
 from core_models.models import (
     WhyDecisionAnchor,
     WhyDecisionEvidence,
@@ -21,6 +21,8 @@ from core_models.models import (
 from .budget_gate import authoritative_truncate
 from .selector import bundle_size_bytes
 from core_validator import canonical_allowed_ids
+
+from shared.normalize import normalise_event_amount as _normalise_event_amount
 
 
 # Configuration & constants
@@ -40,12 +42,6 @@ __all__ = [
     "WhyDecisionEvidence",
     "_collect_allowed_ids",
 ]
-
-def _normalise_event_amount(ev: dict) -> None:
-    """Back-compat wrapper: delegate to shared normalizer."""
-    from shared.normalize import normalise_event_amount as _n
-    _n(ev)
-
 
 @trace_span("resolve", logger=logger)
 async def resolve_anchor(decision_ref: str, *, intent: str | None = None):
@@ -156,16 +152,6 @@ def _extract_snapshot_etag(resp: Any) -> str:
             return v
     return "unknown"
 
-if not hasattr(trace_span, "ctx"):
-    @contextmanager
-    def _noop_ctx(_stage: str, **_kw):
-        class _Span:
-            def set_attribute(self, *_a, **_k): ...
-            def end(self): ...
-        yield _Span()
-    trace_span.ctx = _noop_ctx            # type: ignore[attr-defined]
-
-
 # EvidenceBuilder class
 class EvidenceBuilder:
     def __init__(self, *, redis_client: Optional[Any] = None):
@@ -243,7 +229,7 @@ class EvidenceBuilder:
                                 ev.snapshot_etag = parsed.get("_snapshot_etag", "unknown")
                                 if await self._is_fresh(anchor_id, ev.snapshot_etag):
                                     ev.__dict__["_retry_count"] = retry_count
-                                    with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+                                    with trace_span("bundle", anchor_id=anchor_id) as span:
                                         span.set_attribute("cache.hit", True)
                                         span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                                     return ev
@@ -261,7 +247,7 @@ class EvidenceBuilder:
                         if ev is not None:
                             if await self._is_fresh(anchor_id, ev.snapshot_etag):
                                 ev.__dict__["_retry_count"] = retry_count
-                                with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+                                with trace_span("bundle", anchor_id=anchor_id) as span:
                                     span.set_attribute("cache.hit", True)
                                     span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                                 return ev
@@ -282,7 +268,7 @@ class EvidenceBuilder:
                                 ev = None
                             if ev is not None and await self._is_fresh(anchor_id, ev.snapshot_etag):
                                 ev.__dict__["_retry_count"] = retry_count
-                                with trace_span.ctx("bundle", anchor_id=anchor_id) as span:
+                                with trace_span("bundle", anchor_id=anchor_id) as span:
                                     span.set_attribute("cache.hit", True)
                                     span.set_attribute("bundle_size_bytes", bundle_size_bytes(ev))
                                 return ev
@@ -290,7 +276,7 @@ class EvidenceBuilder:
                 logger.warning("redis read error – bypassing cache", exc_info=True)
                 self._redis = None
 
-        with trace_span.ctx("plan", anchor_id=anchor_id):
+        with trace_span("plan", anchor_id=anchor_id):
             plan = {"node_id": anchor_id, "k": 1}
             # Use configured per-stage budgets; defaults already come from constants/env.
             enrich_ms = int(settings.timeout_enrich_ms)
@@ -314,7 +300,10 @@ class EvidenceBuilder:
                     )
                     if hasattr(resp_anchor, "raise_for_status"):
                         resp_anchor.raise_for_status()
-                    anchor_json = resp_anchor.json() or {"id": anchor_id}
+                    try:
+                        anchor_json = jsonx.loads(resp_anchor.content)
+                    except Exception:
+                        anchor_json = resp_anchor.json() or {"id": anchor_id}
                     hdr_etag = _extract_snapshot_etag(resp_anchor) or "unknown"
                     try:
                         logger.info(
@@ -356,7 +345,10 @@ class EvidenceBuilder:
                             )
                             if hasattr(retry_resp, "raise_for_status"):
                                 retry_resp.raise_for_status()
-                            cand = retry_resp.json() or {}
+                            try:
+                                cand = jsonx.loads(retry_resp.content)
+                            except Exception:
+                                cand = retry_resp.json() or {}
                             if cand.get("id"):
                                 cand["id"] = anchor_id
                             if _has_meaningful_anchor(cand):
@@ -404,7 +396,10 @@ class EvidenceBuilder:
                     )
                     if hasattr(resp_neigh, "raise_for_status"):
                         resp_neigh.raise_for_status()
-                    neigh = resp_neigh.json() or {}
+                    try:
+                        neigh = jsonx.loads(resp_neigh.content)
+                    except Exception:
+                        neigh = resp_neigh.json() or {}
                     meta = neigh.get("meta") or {}
                 except Exception as exc:
                     try:
@@ -655,7 +650,7 @@ class EvidenceBuilder:
             suc = None
 
         if events:
-            with trace_span.ctx("enrich", anchor_id=anchor_id):
+            with trace_span("enrich", anchor_id=anchor_id):
                 enriched_events: list[dict] = []
                 ev_client = get_http_client(timeout_ms=int(settings.timeout_enrich_ms))
                 for ev in events:
@@ -681,7 +676,12 @@ class EvidenceBuilder:
                         eresp = await ev_client.get(path)
                         if hasattr(eresp, "raise_for_status"):
                             eresp.raise_for_status()
-                        enriched_events.append({**eresp.json(), **ev})
+                        try:
+                            parsed_ev = jsonx.loads(eresp.content)
+                        except Exception:
+                            parsed_ev = eresp.json() or {}
+                        # Merge canonical event with original fields, favouring canonical keys
+                        enriched_events.append({**parsed_ev, **ev})
                     except Exception:
                         logger.warning(
                             "event_enrich_failed",
@@ -732,9 +732,29 @@ class EvidenceBuilder:
         seen_trans: set[str] = set()
         # Only attempt hydration when there is something to process
         if anchor_trans_ids or neighbor_transitions:
-            with trace_span.ctx("transitions_enrich", anchor_id=anchor_id):
+            with trace_span("transitions_enrich", anchor_id=anchor_id):
                 try:
                     tr_client = get_http_client(timeout_ms=int(settings.timeout_enrich_ms))
+                    _title_cache: dict[str, str | None] = {}
+
+                    async def _fetch_title(decision_id: str) -> str | None:
+                        if not isinstance(decision_id, str):
+                            return None
+                        if decision_id in _title_cache:
+                            return _title_cache[decision_id]
+                        try:
+                            dresp = await tr_client.get(f"{settings.memory_api_url}/api/enrich/decision/{decision_id}")
+                            if hasattr(dresp, "raise_for_status"):
+                                dresp.raise_for_status()
+                            try:
+                                ddoc = jsonx.loads(dresp.content)
+                            except Exception:
+                                ddoc = dresp.json() or {}
+                            title = ddoc.get("title") or ddoc.get("option")
+                        except Exception:
+                            title = None
+                        _title_cache[decision_id] = title
+                        return title
                     # First hydrate and classify transitions declared on the anchor
                     for tid in anchor_trans_ids:
                         if not isinstance(tid, str) or tid in seen_trans:
@@ -746,7 +766,10 @@ class EvidenceBuilder:
                             resp = await tr_client.get(f"{settings.memory_api_url}/api/enrich/transition/{tid}")
                             if hasattr(resp, "raise_for_status"):
                                 resp.raise_for_status()
-                            tdoc = resp.json() or {}
+                            try:
+                                tdoc = jsonx.loads(resp.content)
+                            except Exception:
+                                tdoc = resp.json() or {}
                         except Exception:
                             # Final fallback: use neighbour-provided stub if available
                             tdoc = neighbor_transitions.get(tid)
@@ -762,6 +785,14 @@ class EvidenceBuilder:
                             orient = "preceding"
                         elif from_id == anchor_id:
                             orient = "succeeding"
+                        # Hydrate human titles to support templater 'Next:' pointer
+                        try:
+                            if isinstance(to_id, str):
+                                tdoc.setdefault("to_title", await _fetch_title(to_id))
+                            if isinstance(from_id, str):
+                                tdoc.setdefault("from_title", await _fetch_title(from_id))
+                        except Exception:
+                            pass
                         if orient == "preceding":
                             trans_pre_list.append(tdoc)
                         elif orient == "succeeding":
@@ -794,6 +825,13 @@ class EvidenceBuilder:
                             orient = "preceding"
                         elif from_id == anchor_id:
                             orient = "succeeding"
+                        try:
+                            if isinstance(to_id, str):
+                                tdoc.setdefault("to_title", await _fetch_title(to_id))
+                            if isinstance(from_id, str):
+                                tdoc.setdefault("from_title", await _fetch_title(from_id))
+                        except Exception:
+                            pass
                         if orient is None:
                             orient = neighbor_trans_orient.get(tid)
                         if orient == "preceding":
@@ -875,6 +913,16 @@ class EvidenceBuilder:
                         "succeeding_n": len(suc),
                     },
                 )
+                try:
+                    _first_succ = (suc or [None])[0] or {}
+                    _label = _first_succ.get("to_title") or _first_succ.get("title")
+                    if _label:
+                        logger.info("transition_titles_hydrated",
+                                    extra={"anchor_id": anchor_id,
+                                           "succeeding_id": _first_succ.get("id"),
+                                           "to_title": _label})
+                except Exception:
+                    pass
             else:
                 logger.warning(
                     "transitions_missing_while_anchor_has",

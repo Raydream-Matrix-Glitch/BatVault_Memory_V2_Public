@@ -8,8 +8,6 @@ a validated :class:`core_models.models.MetaInfo` and emits a structured
 log entry.  No I/O or side effects beyond logging are performed.
 """
 
-from __future__ import annotations
-
 from typing import Any, Dict
 
 from core_logging import get_logger, log_stage

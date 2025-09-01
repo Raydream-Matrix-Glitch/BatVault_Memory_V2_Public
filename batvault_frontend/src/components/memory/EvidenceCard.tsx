@@ -20,7 +20,7 @@ const EvidenceCard: React.FC<EvidenceCardProps> = ({ item, selected, onSelect })
   const orphan = item.orphan ?? (!item.based_on || item.based_on.length === 0);
 
   return (
-    <div
+    <div id={`evidence-${item.id}`}
       onClick={() => onSelect(item.id)}
       className={clsx(
         "cursor-pointer mb-3 p-3 rounded-md border transition-colors",
@@ -31,6 +31,9 @@ const EvidenceCard: React.FC<EvidenceCardProps> = ({ item, selected, onSelect })
       )}
     >
       <div className="font-mono text-xs text-vaultred mb-1 break-all">{item.id}</div>
+      {item.timestamp && (
+        <div className="text-[10px] font-mono text-neonCyan mb-1">{item.timestamp}</div>
+      )}
       <p className="text-sm text-copy mb-2 line-clamp-3">{snippet}</p>
       {/* Tags */}
       {item.tags && item.tags.length > 0 && (

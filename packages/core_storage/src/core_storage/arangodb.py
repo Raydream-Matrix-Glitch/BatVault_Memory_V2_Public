@@ -1,26 +1,22 @@
-from __future__ import annotations
-
 import hashlib
 import socket
 from urllib.parse import urlparse
 import os
 import re
 import time
-from typing import Any, Dict, List, Iterable, Sequence, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-
 # Import OTEL context injector so all outgoing HTTP calls carry the current trace.
 try:
     from core_observability import inject_trace_context  # type: ignore
 except Exception:
     inject_trace_context = None  # type: ignore
-from functools import cached_property
-from pydantic import BaseModel
-
 from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span
+from core_config.constants import timeout_for_stage
 import core_metrics
+from core_utils import jsonx
 
 logger = get_logger("core_storage")
 
@@ -180,7 +176,7 @@ class ArangoStore:
                     try:
                         call_span.set_attribute("analyzer", "text_en")
                         call_span.set_attribute("collection", "nodes")
-                        call_span.set_attribute("timeout_ms", 10_000)
+                        call_span.set_attribute("timeout_ms", int(1000*timeout_for_stage("enrich")))
                     except Exception:
                         pass
                     _t0 = time.perf_counter()
@@ -188,7 +184,7 @@ class ArangoStore:
                         f"{base}/_api/analyzer",
                         json=analyzer,
                         auth=auth,
-                        timeout=10.0,
+                        timeout=timeout_for_stage("enrich"),
                         headers=headers,
                     )
                     try:
@@ -208,7 +204,7 @@ class ArangoStore:
                     try:
                         call_span.set_attribute("view", "nodes_search")
                         call_span.set_attribute("collection", "nodes")
-                        call_span.set_attribute("timeout_ms", 10_000)
+                        call_span.set_attribute("timeout_ms", int(1000*timeout_for_stage("enrich")))
                     except Exception:
                         pass
                     _t0 = time.perf_counter()
@@ -216,7 +212,7 @@ class ArangoStore:
                         f"{base}/_api/view",
                         json={"name": "nodes_search", "type": "arangosearch"},
                         auth=auth,
-                        timeout=10.0,
+                        timeout=timeout_for_stage("enrich"),
                         headers=headers,
                     )
                     try:
@@ -250,7 +246,7 @@ class ArangoStore:
                 try:
                     call_span.set_attribute("view", "nodes_search")
                     call_span.set_attribute("collection", "nodes")
-                    call_span.set_attribute("timeout_ms", 10_000)
+                    call_span.set_attribute("timeout_ms", int(1000*timeout_for_stage("enrich")))
                 except Exception:
                     pass
                 _t0 = time.perf_counter()
@@ -258,7 +254,7 @@ class ArangoStore:
                     f"{base}/_api/view/nodes_search/properties",
                     json=view_props,
                     auth=auth,
-                    timeout=10.0,
+                    timeout=timeout_for_stage("enrich"),
                     headers=headers,
                 )
                 try:
@@ -359,7 +355,7 @@ class ArangoStore:
                     params=params,
                     json=payload,
                     auth=auth,
-                    timeout=10.0,
+                    timeout=timeout_for_stage("enrich"),
                     headers=hdrs,
                 )
                 try:
@@ -716,10 +712,12 @@ class ArangoStore:
         try:
             v = r.get(key)
             if v:
-                import orjson
-
+                # Cache hit – parse the bytes via jsonx to maintain canonical
+                # ordering.  This avoids mismatches between cached values and
+                # downstream services which also use jsonx.
                 core_metrics.counter("cache_hit_total", 1, service="memory_api")
-                return orjson.loads(v)
+                return jsonx.loads(v)
+            # Cache miss – increment miss counter
             core_metrics.counter("cache_miss_total", 1, service="memory_api")
         except Exception:
             return None
@@ -730,9 +728,10 @@ class ArangoStore:
         if not r:
             return
         try:
-            import orjson
-
-            r.setex(key, ttl, orjson.dumps(value))
+            # Persist cache entries using jsonx.dumps for canonical ordering.
+            # This prevents fingerprint drift due to inconsistent key ordering
+            # when reading cached data.
+            r.setex(key, ttl, jsonx.dumps(value))
         except Exception:
             return
 
@@ -975,7 +974,6 @@ class ArangoStore:
                     pass
             if not results:
                 try:
-                    import re as _re
                     terms = [t for t in re.findall(r"\w+", q.lower()) if len(t) >= 3]
                 except Exception:
                     terms = []

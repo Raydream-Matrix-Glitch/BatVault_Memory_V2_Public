@@ -33,7 +33,7 @@ def slugify_id(s: str) -> str:
 # Tag slugging helper
 # ------------------------------------------------------------------
 
-def slugify_tag(s: str) -> str:
+def slugify_tag_legacy(s: str) -> str:
     """
     Canonical slug rules for tags.  Tags differ from general identifiers in
     that they use underscores (``_``) as the canonical separator instead of
@@ -52,13 +52,11 @@ def slugify_tag(s: str) -> str:
     str
         A lower‑cased slug string using underscores.
     """
-    import unicodedata
-    # Normalise to Unicode NFKC and lowercase
-    s_norm = unicodedata.normalize("NFKC", s or "").strip().lower()
-    # Replace any sequence of non‑[a‑z0‑9] characters with an underscore
-    s_norm = re.sub(r"[^a-z0-9]+", "_", s_norm)
-    # Trim leading/trailing underscores
-    return s_norm.strip("_")
+    """
+    Deprecated slugify_tag implementation.  Forward to the canonical slugify_tag
+    defined below to avoid divergent behaviours.
+    """
+    return slugify_tag(s)
 
 
 # ------------------------------------------------------------------

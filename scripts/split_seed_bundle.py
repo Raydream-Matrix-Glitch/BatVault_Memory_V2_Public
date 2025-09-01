@@ -7,17 +7,17 @@ Creates:
   memory/fixtures/transitions/<id>.json
 """
 
-import json, sys, pathlib
+import sys, pathlib
+from core_utils import jsonx as _jsonx
 
 bundle = pathlib.Path(sys.argv[1])
 dest   = pathlib.Path(sys.argv[2])
 
-with bundle.open() as fh:
-    data = json.load(fh)
+data = _jsonx.loads(bundle.read_text())
 
 for kind in ("events", "decisions", "transitions"):
     for doc in data.get(kind, []):
         out = dest / kind / f"{doc['id']}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(doc, indent=2))
+        out.write_text(_jsonx.dumps(doc))
         print("wrote", out)

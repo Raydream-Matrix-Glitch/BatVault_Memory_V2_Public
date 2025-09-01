@@ -4,7 +4,7 @@ from core_logging import get_logger
 from core_models.models import WhyDecisionEvidence, WhyDecisionAnswer
 from core_validator import canonical_allowed_ids
 
-logger = get_logger("templater")
+logger = get_logger("gateway.templater")
 
 _ALIAS_RE = re.compile(r"^[AET]\d+$")
 
@@ -194,6 +194,10 @@ def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
     if next_sent:
         if len(lead) + len(next_sent) <= 320:
             answer = (lead + next_sent).strip()
+            try:
+                logger.info("templater.next_pointer_added", extra={"lead_len": len(lead), "next_len": len(next_sent)})
+            except Exception:
+                pass
         else:
             # Omit Next when it would be truncated mid-word
             answer = lead

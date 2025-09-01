@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, field_validator, ConfigDict, model_validator
 from core_utils import slugify_tag
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional
 import re
 
 
@@ -71,6 +71,11 @@ class MetaInfo(BaseModel):
     selector_model_id: Optional[str] = None
     latency_ms: int
     validator_error_count: int
+    # Compact, public-safe list of validator warning codes
+    validator_warnings: List[str] = Field(default_factory=list)
+    # Trace correlation for UI audit drawer
+    trace_id: Optional[str] = None
+    span_id: Optional[str] = None
     evidence_metrics: Dict[str, Any] = Field(default_factory=dict)  # {step, selector_truncation, total_neighbors_found, final_evidence_count, dropped_evidence_ids}
     load_shed: bool = False
     # Event result shaping
