@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ConfigDict, model_validator
 from core_utils import slugify_tag
 from typing import Any, Dict, List, Optional, Literal
 import re
@@ -7,10 +7,47 @@ import re
 class WhyDecisionAnchor(BaseModel):
     id: str
     title: Optional[str] = None
+    # Legacy alias used by Memory API; allowed by the validator.
+    # Keeping it here avoids extra='forbid' rejections during validation.
+    option: Optional[str] = None
     rationale: Optional[str] = None
     timestamp: Optional[str] = None
     decision_maker: Optional[str] = None
-    supported_by: Optional[List[str]] = None
+    # Arrays default to [], not null, to avoid surprising "null" in responses.
+    tags: List[str] = Field(default_factory=list)
+    supported_by: List[str] = Field(default_factory=list)
+    based_on: List[str] = Field(default_factory=list)
+    # Memory API may include a flat list of neighbour transition *IDs* on the anchor.
+    # Accept both strings and dicts; normalise strings → {"id": "<str>"} for schema hygiene.
+    transitions: List[Dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("tags", "supported_by", "based_on", mode="before")
+    @classmethod
+    def _coerce_optional_lists(cls, v):
+        # Preserve strictness but ensure None becomes []
+        return [] if v is None else v
+
+    @field_validator("transitions", mode="before")
+    @classmethod
+    def _coerce_transitions(cls, v):
+        if v is None:
+            return []
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                if isinstance(item, str):
+                    out.append({"id": item})
+                elif isinstance(item, dict):
+                    out.append(item)
+            return out
+        return []
+
+    @model_validator(mode="after")
+    def _mirror_option_to_title(self):
+        # Safety net on the Gateway side if upstream normalisation was bypassed
+        if not self.title and self.option:
+            object.__setattr__(self, "title", self.option)
+        return self
     model_config = ConfigDict(extra='forbid')
 
 class MetaInfo(BaseModel):
@@ -39,6 +76,7 @@ class MetaInfo(BaseModel):
     # Event result shaping
     events_total: Optional[int] = None
     events_truncated: Optional[bool] = None
+    snapshot_available: Optional[bool] = None
 
     # Path taken by the resolver when hydrating the anchor.  This field is
     # populated by the Gateway app for diagnostic purposes and may be

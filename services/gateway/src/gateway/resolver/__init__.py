@@ -12,7 +12,7 @@ from gateway.redis import get_redis_pool
 from ..metrics import counter as _metric_counter, histogram as _metric_histogram
 
 from core_logging import trace_span, get_logger
-from .logging_helpers import stage as log_stage
+from ..logging_helpers import stage as log_stage
 from .reranker import rerank
 from .fallback_search import search_bm25
 from core_utils import is_slug
@@ -64,8 +64,13 @@ async def _cache_setex(key: str, ttl: int, value: bytes):
 # ---------------------------------------------------------------------------#
 # Public API                                                                 #
 # ---------------------------------------------------------------------------#
-@trace_span("resolve")
-async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
+@trace_span("resolve", logger=logger)
+async def resolve_decision_text(
+    text: str,
+    *,
+    request_id: str | None = None,
+    snapshot_etag: str | None = None,
+) -> Dict[str, Any] | None:
     """
     Resolve *text* (decision slug **or** NL query) to a Decision anchor.
 
@@ -88,7 +93,13 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
             # propagate the current trace context automatically and apply stage‑based
             # timeouts and retries.  If the enrich call succeeds and returns a
             # matching ID, update the cache and metrics accordingly.
-            log_stage("resolver", "slug_short_circuit_start", decision_ref=_text)
+            log_stage(
+                "resolver",
+                "slug_short_circuit_start",
+                decision_ref=_text,
+                request_id=request_id,
+                snapshot_etag=snapshot_etag,
+            )
             data = await fetch_json(
                 "GET",
                 f"{settings.memory_api_url}/api/enrich/decision/{_text}",
@@ -97,7 +108,14 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
             if isinstance(data, dict) and data.get("id") == _text:
                 _metric_counter("resolver_slug_short_circuit_total", 1, service="resolver")
                 await _cache_setex(cache_key, CACHE_TTL, orjson.dumps(data))
-                log_stage("resolver", "slug_short_circuit_end", cache_key=cache_key, ok=True)
+                log_stage(
+                    "resolver",
+                    "slug_short_circuit_end",
+                    cache_key=cache_key,
+                    ok=True,
+                    request_id=request_id,
+                    snapshot_etag=snapshot_etag,
+                )
                 return data
         except Exception:
             # Record failures without raising; the resolver must degrade gracefully.
@@ -124,7 +142,12 @@ async def resolve_decision_text(text: str) -> Dict[str, Any] | None:
             search_fn = getattr(mod, "search_bm25")
         except Exception:
             search_fn = search_bm25
-        candidates = await search_fn(text, k=24)
+        candidates = await search_fn(
+            text,
+            k=24,
+            request_id=request_id,
+            snapshot_etag=snapshot_etag,
+        )
     except Exception:                                # network / timeout
         _metric_counter("bm25_search_error_total", 1, service="resolver")
         candidates = []

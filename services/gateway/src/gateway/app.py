@@ -1,7 +1,6 @@
 # ---- Imports ---------------------------------------------------------------
 # Stdlib
 import asyncio, functools, io, os, time, inspect
-import re
 from typing import List, Optional
 import importlib.metadata as _md
 
@@ -19,7 +18,7 @@ from core_config import get_settings
 from core_config.constants import (
     TTL_SCHEMA_CACHE_SEC as _SCHEMA_TTL_SEC,
 )
-from core_logging import get_logger, trace_span
+from core_logging import get_logger, log_stage, bind_trace_ids, trace_span
 from .logging_helpers import stage as log_stage
 from core_observability.otel import init_tracing, instrument_fastapi_app
 from .metrics import (
@@ -66,7 +65,8 @@ _EXPAND_MS      = TIMEOUT_EXPAND_MS
 # ---- Application & router --------------------------------------------------
 app    = FastAPI(title="BatVault Gateway", version="0.1.0")
 router = APIRouter(prefix="/v2")
-instrument_fastapi_app(app, service_name='gateway')
+
+instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'gateway')
 
 # ---- Evidence builder & caches --------------------------------------------
 _evidence_builder = EvidenceBuilder()
@@ -95,7 +95,12 @@ async def route_query(*args, **kwargs):  # pragma: no cover - proxy
     func = getattr(mod, "route_query")
     return await func(*args, **kwargs)
 
-async def resolve_decision_text(text: str):  # pragma: no cover - proxy
+async def resolve_decision_text(
+    text: str,
+    *,
+    request_id: str | None = None,
+    snapshot_etag: str | None = None,
+):  # pragma: no cover - proxy
     """Resolve a natural-language query or slug to a decision anchor.
 
     This proxy simply defers to the implementation in ``gateway.resolver``.
@@ -105,7 +110,7 @@ async def resolve_decision_text(text: str):  # pragma: no cover - proxy
     import importlib
     resolver_mod = importlib.import_module("gateway.resolver")
     resolver_fn = getattr(resolver_mod, "resolve_decision_text")
-    return await resolver_fn(text)
+    return await resolver_fn(text, request_id=request_id, snapshot_etag=snapshot_etag)
 
 # ---- MinIO helpers ---------------------------------------------------------
 def _minio_client_or_null():
@@ -150,6 +155,7 @@ def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
                 request_id=request_id,
                 error=str(exc),
             )
+    total_bytes = 0
     for name, blob in artefacts.items():
         client.put_object(
             settings.minio_bucket,
@@ -158,7 +164,12 @@ def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
             length=len(blob),
             content_type="application/json",
         )
-        metric_counter("artifact_bytes_total", inc=len(blob), artefact=name)
+        metric_counter("artifact_bytes_total", len(blob), artefact=name)
+        total_bytes += len(blob)
+
+    # Strategic success log for auditability and sizing telemetry
+    log_stage("artifacts", "minio_put_batch_ok",
+              request_id=request_id, count=len(artefacts), bytes_total=total_bytes)
 
 async def _minio_put_batch_async(
     request_id: str,
@@ -188,10 +199,51 @@ async def _minio_put_batch_async(
 # ---- Request logging & counters middleware ---------------------------------
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
+    try:
+        from opentelemetry import trace as _trace  # type: ignore
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, "trace_id", 0):
+            bind_trace_ids(f"{_ctx.trace_id:032x}", f"{_ctx.span_id:016x}")
+            try:
+                log_stage("observability", "trace_ctx_bound", path=str(request.url.path))
+            except Exception:
+                pass
+        else:
+            # Strategic signal: no active span (e.g., OTEL not initialized) – rare.
+            try:
+                log_stage("observability", "no_active_span", path=str(request.url.path))
+            except Exception:
+                pass
+    except Exception:
+        # Never break the request path due to tracing
+        pass
     req_id = compute_request_id(str(request.url.path), dict(request.query_params), None); t0 = time.perf_counter()
     log_stage("request", "request_start", request_id=req_id,
               path=request.url.path, method=request.method)
 
+    try:
+        from opentelemetry import trace as _trace  # type: ignore
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, "trace_id", 0):
+            log_stage("observability", "trace_ctx",
+                      request_id=req_id,
+                      trace_id=f"{_ctx.trace_id:032x}",
+                      span_id=f"{_ctx.span_id:016x}")
+        else:
+            # Fall back to IDs bound from `traceparent` if OTEL hasn't started the span yet
+            try:
+                from core_logging import current_trace_ids
+                _tid, _sid = current_trace_ids()
+                if _tid and _sid:
+                    log_stage("observability", "trace_ctx",
+                              request_id=req_id,
+                              trace_id=_tid, span_id=_sid)
+            except Exception:
+                pass
+    except Exception:
+        pass
     resp = await call_next(request)
 
     dt_s = (time.perf_counter() - t0)
@@ -200,6 +252,16 @@ async def request_logging_middleware(request: Request, call_next):
                    method=request.method, code=str(resp.status_code))
     if resp.status_code >= 500:
         metric_counter("gateway_http_5xx_total", 1)
+    # Surface a trace header for clients when we have one (from the active span).
+    try:
+        from opentelemetry import trace as _t  # type: ignore
+        _sp = _t.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, "trace_id", 0):
+            if not any(k.lower() == "x-trace-id" for k in resp.headers.keys()):
+                resp.headers["x-trace-id"] = f"{_ctx.trace_id:032x}"
+    except Exception:
+        pass
     log_stage("request", "request_end",
               request_id=req_id, latency_ms=dt_s * 1000.0, status_code=resp.status_code)
     resp.headers["x-request-id"] = req_id
@@ -299,7 +361,7 @@ async def schema_mirror(kind: str, request: Request):
 # ---- Streaming helper ------------------------------------------------------
 def _traced_stream(text: str, include_event: bool = False):
     # Keep the streaming generator inside a span for exemplar + audit timing
-    with trace_span("gateway.stream", stage="stream").ctx():
+    with trace_span("gateway.stream", logger=logger, stage="stream").ctx():
         yield from stream_chunks(text, include_event=include_event)
 
 # ---- API models ------------------------------------------------------------
@@ -350,7 +412,7 @@ class QueryIn(BaseModel):
 
 # ---- /v2/ask ---------------------------------------------------------------
 @router.post("/ask", response_model=WhyDecisionResponse)
-@trace_span("ask")
+@trace_span("ask", logger=logger)
 async def ask(
     req: AskIn,
     stream: bool = Query(False),
@@ -438,6 +500,7 @@ async def ask(
 # ---- /v2/query -------------------------------------------------------------
 @router.post("/query")
 async def v2_query(
+    request: Request,
     req: QueryIn,
     stream: bool = Query(False),
     include_event: bool = Query(False),
@@ -450,6 +513,13 @@ async def v2_query(
     q = (req.text or req.q or "").strip()
     if not q:
         raise HTTPException(status_code=400, detail="missing query text")
+    
+    # Deterministic request ID for resolver logs (align with middleware scheme)
+    try:
+        req_id = compute_request_id(str(request.url.path), dict(request.query_params), None)
+    except Exception:
+        # Conservative fallback – still deterministic for identical input
+        req_id = compute_request_id("/v2/query", {"text": q}, None)
 
     # --- Resolve the anchor FIRST so helpers can use a real node_id ---
     import importlib, sys
@@ -461,7 +531,7 @@ async def v2_query(
         if _resolver_mod is None:
             _resolver_mod = importlib.import_module("gateway.resolver")
         resolver_func = getattr(_resolver_mod, "resolve_decision_text")
-    match = await resolver_func(q)
+    match = await resolver_func(q, request_id=req_id)
     if match and isinstance(match, dict):
         anchor: dict | None = {"id": match.get("id") or match.get("anchor_id") or match.get("decision_id")}
         resolver_path = "slug"
@@ -471,7 +541,7 @@ async def v2_query(
         if _fs_mod is None:
             _fs_mod = importlib.import_module("gateway.resolver.fallback_search")
         search_fn = getattr(_fs_mod, "search_bm25")
-        matches = await search_fn(q, k=24)
+        matches = await search_fn(q, k=24, request_id=req_id, snapshot_etag=None)
         if matches:
             anchor = {"id": matches[0].get("id")}
             resolver_path = "bm25"

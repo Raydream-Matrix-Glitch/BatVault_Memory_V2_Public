@@ -53,6 +53,7 @@ __all__ = [
     "normalize_decision",
     "normalize_transition",
     "mirror_option_to_title",
+    "mirror_title_to_option",
 ]
 
 
@@ -148,6 +149,19 @@ def _filter_fields(doc: Dict[str, Any], allowed: set[str]) -> Dict[str, Any]:
     this function is shallow – nested dictionaries are not filtered.
     """
     return {k: v for k, v in doc.items() if k in allowed}
+
+def mirror_title_to_option(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Mirror the ``title`` field into ``option`` for decision documents when appropriate.
+    Complements ``mirror_option_to_title``. Update is in place.
+    """
+    if isinstance(doc, dict):
+        opt = doc.get("option")
+        if (opt is None or (isinstance(opt, str) and not opt.strip())) and isinstance(doc.get("title"), str):
+            title_val = doc.get("title")
+            if isinstance(title_val, str) and title_val.strip():
+                doc["option"] = title_val
+    return doc
 
 # ---------------------------------------------------------------------------
 # Decision‑specific helpers
@@ -274,6 +288,7 @@ def normalize_decision(doc: Dict[str, Any]) -> Dict[str, Any]:
     allowed = {
         "id",
         "option",
+        "title",          # keep mirrored or upstream-provided titles at top-level
         "rationale",
         "description",
         "timestamp",
@@ -284,9 +299,9 @@ def normalize_decision(doc: Dict[str, Any]) -> Dict[str, Any]:
         "transitions",
         "x-extra",
         "type",
-        "title",
     }
-    # Perform common normalisation then mirror option to title if missing
+    # Accept either alias at input; prefer canonical ``option``
+    doc = mirror_title_to_option(doc)
     out = _common_normalise(doc, "decision", allowed)
     return mirror_option_to_title(out)
 
@@ -298,6 +313,9 @@ def normalize_transition(doc: Dict[str, Any]) -> Dict[str, Any]:
       * id
       * from
       * to
+      * from_title
+      * to_title
+      * title
       * relation
       * reason
       * timestamp
@@ -332,7 +350,15 @@ _CURRENCY_MAP = {
 
 def _parse_amount(val: str, unit: str | None) -> float | None:
     try:
-        num = float(val.replace(",", ""))
+        # Remove thin spaces and normal spaces often used as thousands separators
+        v = val.replace("\u202f", "").replace("\u00a0", "").replace(" ", "")
+        # European style numbers may use a comma as the decimal separator.  When
+        # the value contains a single comma and no dot, treat it as a decimal
+        # point.  Otherwise strip all commas as thousands separators.
+        if "," in v and "." not in v:
+            v = v.replace(",", ".")
+        # Finally remove any remaining thousands separators
+        num = float(v.replace(",", ""))
     except Exception:
         return None
     if not unit:

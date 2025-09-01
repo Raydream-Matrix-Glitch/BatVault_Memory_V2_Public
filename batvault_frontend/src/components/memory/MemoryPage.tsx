@@ -86,27 +86,54 @@ export default function MemoryPage() {
   const handleDownloadEvidence = useCallback(async () => {
     const rid = finalData?.meta?.request_id;
     const bundleUrl = (finalData as any)?.bundle_url as string | undefined;
-    // Log the download intent
+    // Basic sanity
+    if (!rid) return;
+
+    // Attempt canonical flow: POST /v2/bundles/{rid}/download → {url, expires_in}
     try {
       console.debug("[ui.memory.bundle_download]", {
-        rid: rid ?? null,
-        presigned: !!bundleUrl,
+        rid,
+        flow: "post_then_get",
       });
+    } catch { /* ignore logging errors */ }
+
+    try {
+      const resp = await fetch(`/v2/bundles/${rid}/download`, { method: "POST" });
+      if (resp.ok) {
+        const data = await resp.json().catch(() => null) as any;
+        const url = data && typeof data.url === "string" ? data.url : undefined;
+        try {
+          console.debug("[ui.memory.bundle_download.presigned_received]", {
+            rid,
+            has_url: !!url,
+            expires_in: (data && data.expires_in) || null,
+          });
+        } catch { /* ignore logging errors */ }
+        if (url) {
+          window.open(url, "_blank");
+          return;
+        }
+      }
     } catch {
-      /* ignore logging errors */
+      // swallow and fall through to legacy fallbacks
     }
-    if (!rid) return;
+
+    // Fallback 1: legacy bundle_url on the response (if present)
     if (bundleUrl) {
-      // Open the presigned URL in a new tab/window
+      try {
+        console.debug("[ui.memory.bundle_download.fallback_bundle_url]", { rid });
+      } catch { /* ignore logging errors */ }
       window.open(bundleUrl, "_blank");
       return;
     }
-    // Otherwise fall back to fetching the bundle via the API
+
+    // Fallback 2: direct GET to the gateway/edge bundle endpoint
     try {
-      const resp = await fetch(`/api/bundles/${rid}`);
-      if (!resp.ok) {
-        throw new Error(`Failed to download bundle: ${resp.status}`);
-      }
+      console.debug("[ui.memory.bundle_download.fallback_direct_get]", { rid, path: `/v2/bundles/${rid}` });
+    } catch { /* ignore logging errors */ }
+    try {
+      const resp = await fetch(`/v2/bundles/${rid}`);
+      if (!resp.ok) throw new Error(`Failed to download bundle: ${resp.status}`);
       const blob = await resp.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");

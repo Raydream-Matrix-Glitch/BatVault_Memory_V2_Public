@@ -54,5 +54,6 @@ class MetaInputs(BaseModel):
     # Event shaping telemetry
     events_total: Optional[int] = None
     events_truncated: Optional[bool] = None
+    snapshot_available: Optional[bool] = None
 
     model_config = ConfigDict(extra="forbid")

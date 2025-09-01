@@ -56,18 +56,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-init_tracing(os.getenv("OTEL_SERVICE_NAME") or "api_edge")
+# Ensure OTEL middleware wraps all subsequent middlewares/handlers
 instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'api_edge')
 
-# ---- OTEL helpers (safe no-ops if OTEL not installed) ----------------------
-def _inject_trace_context(headers: Dict[str, str] | None) -> Dict[str, str]:
-    hdrs = dict(headers or {})
+init_tracing(os.getenv("OTEL_SERVICE_NAME") or "api_edge")
+
+# ---- Bind OTEL span IDs into core_logging for consistent trace IDs ---------
+@app.middleware("http")
+async def _bind_trace_ids(request: Request, call_next):
     try:
-        from opentelemetry.propagate import inject  # type: ignore
-        inject(hdrs)
+        from opentelemetry import trace as _trace  # type: ignore
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, "trace_id", 0):
+            from core_logging import bind_trace_ids  # type: ignore
+            bind_trace_ids(f"{_ctx.trace_id:032x}", f"{_ctx.span_id:016x}")
+            try:
+                log_stage(logger, "observability", "trace_ctx_bound", path=str(request.url.path))
+            except Exception:
+                pass
     except Exception:
         pass
-    return hdrs
+    return await call_next(request)
+
+# OTEL helpers (centralized)
+def _inject_trace_context(headers: Dict[str, str] | None) -> Dict[str, str]:
+    from core_observability.otel import inject_trace_context
+    return inject_trace_context(headers)
 
 def _current_trace_id() -> str | None:
     try:
@@ -181,6 +196,22 @@ async def req_logger(request: Request, call_next):  # noqa: D401
             parsed,
         )
         request.state.request_id = idem
+        # Observability: expose current trace/span IDs (should be non-zero if OTEL middleware wrapped us)
+        try:
+            from opentelemetry import trace as _trace  # type: ignore
+            _sp = _trace.get_current_span()
+            _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+            if _ctx and getattr(_ctx, 'trace_id', 0):
+                log_stage(
+                    logger,
+                    'observability',
+                    'trace_ctx',
+                    request_id=idem,
+                    trace_id=f"{_ctx.trace_id:032x}",
+                    span_id=f"{_ctx.span_id:016x}",
+                )
+        except Exception:
+            pass
 
         t0 = time.perf_counter()
         log_stage(

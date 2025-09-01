@@ -47,6 +47,7 @@ from shared.meta_builder import build_meta
 
 
 logger   = get_logger("gateway.builder")
+logger.propagate = False
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -326,16 +327,26 @@ async def build_why_decision_response(
     # Build a pre-envelope (the gate will strip evidence when computing overhead)
     # Warm the policy registry via unified schema cache (P1: collapse schema fetching)
     try:
-        from .schema_cache import fetch_schema as _fetch_schema
-        await _fetch_schema("/api/policy/registry")
-        try:
-            log_stage("schema", "policy_registry_warmed", request_id=req_id)
-        except Exception:
-            pass
+        from core_config import get_settings as _get_settings
+        s = _get_settings()
+        registry_url = getattr(s, "policy_registry_url", None)
+        if registry_url:
+            from .schema_cache import fetch_policy_registry as _fetch_policy_registry
+            await _fetch_policy_registry()
+            try:
+                log_stage("schema", "policy_registry_warmed", request_id=req_id, url=registry_url)
+            except Exception:
+                pass
+        else:
+            # Central registry not configured; this is expected in dev/local.
+            try:
+                log_stage("schema", "policy_registry_warm_skipped", request_id=req_id)
+            except Exception:
+                pass
     except Exception:
         # Non-fatal: fall back to local file in prompt_envelope loader
         try:
-            log_stage("schema", "policy_registry_warm_failed", request_id=req_id)
+            log_stage("schema", "policy_registry_warm_failed", request_id=req_id, url=registry_url)
         except Exception:
             pass
     pre_envelope = build_prompt_envelope(
@@ -698,6 +709,31 @@ async def build_why_decision_response(
     # patched function.  Fallback to the core implementation if not found.
     _validator_func = globals().get("validate_response", _core_validate_response)  # type: ignore[name-defined]
     ok, validator_errs = _validator_func(resp)
+    # Emit a single aggregated log of unknown keys stripped, per request
+    try:
+        _unk_anchor, _unk_event, _unk_trans = set(), set(), set()
+        for _e in (validator_errs or []):
+            _code = _e.get("code"); _det = _e.get("details") or {}; _rem = _det.get("removed_keys") or []
+            if _code == "unknown_anchor_keys_stripped":     _unk_anchor.update(_rem)
+            elif _code == "unknown_event_keys_stripped":    _unk_event.update(_rem)
+            elif _code == "unknown_transition_keys_stripped": _unk_trans.update(_rem)
+        if _unk_anchor or _unk_event or _unk_trans:
+            log_stage("validator", "unknown_fields_stripped",
+                      anchor=sorted(_unk_anchor), event=sorted(_unk_event), transition=sorted(_unk_trans))
+        # Post-validation presence telemetry to pinpoint field-loss regressions
+        try:
+            _a = getattr(resp.evidence, "anchor", None)
+            _ad = _a.model_dump(mode="python") if hasattr(_a, "model_dump") else (dict(_a) if isinstance(_a, dict) else {})
+            log_stage("validator", "anchor_fields_presence_post",
+                      request_id=req_id,
+                      has_option=bool(_ad.get("option")),
+                      has_rationale=bool(_ad.get("rationale")),
+                      has_timestamp=bool(_ad.get("timestamp")),
+                      has_decision_maker=bool(_ad.get("decision_maker")))
+        except Exception:
+            pass
+    except Exception:
+        pass
     # Post-process the short answer to replace stubs and enforce length
     ans, finalise_changed = finalise_short_answer(resp.answer, resp.evidence)
     # Recompute supporting_ids after finalising answer
@@ -773,6 +809,16 @@ async def build_why_decision_response(
 
     # Assemble canonical meta via the shared builder.  Wrap raw values into
     # MetaInputs to forbid unexpected keys and normalise the fingerprint prefix.
+    # Determine whether a snapshot is available.  A known snapshot ETag implies
+    # availability; the special "unknown" marker means no snapshot could be
+    # retrieved.  Expose this flag in the meta for downstream consumers.
+    _snapshot_available = False
+    try:
+        if snapshot_etag_fp and snapshot_etag_fp != "unknown":
+            _snapshot_available = True
+    except Exception:
+        _snapshot_available = False
+
     meta_inputs = MetaInputs(
         policy_id=_policy_id,
         prompt_id=_prompt_id,
@@ -794,6 +840,7 @@ async def build_why_decision_response(
         load_shed=should_load_shed(),
         events_total=int(_events_total),
         events_truncated=bool(_events_truncated_flag),
+        snapshot_available=_snapshot_available,
     )
 
     # Build the canonical MetaInfo once; idempotent by design.
@@ -833,6 +880,18 @@ async def build_why_decision_response(
         # In the unlikely event we cannot cache the bundle, proceed
         # without raising an error; the GET endpoint will return 404.
         pass
+
+    # Ensure resolver_path defaults to "direct" when unset.  /v2/ask bypasses the
+    # external resolver, so callers expect "direct" rather than null.  Downstream
+    # handlers (e.g., /v2/query) may override this value with "slug" or "bm25".
+    try:
+        if not getattr(meta_obj, "resolver_path", None):
+            setattr(meta_obj, "resolver_path", "direct")
+    except Exception:
+        try:
+            meta_obj["resolver_path"] = "direct"  # type: ignore[index]
+        except Exception:
+            pass
 
     resp = WhyDecisionResponse(
         intent=req.intent,

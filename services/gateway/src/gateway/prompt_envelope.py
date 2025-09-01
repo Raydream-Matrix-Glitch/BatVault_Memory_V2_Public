@@ -9,7 +9,7 @@ from typing import Any, Dict
 import json
 
 from core_utils.fingerprints import canonical_json
-from core_logging import trace_span
+from core_logging import trace_span, get_logger
 from core_utils.fingerprints import sha256_hex, ensure_sha256_prefix
 from core_config import get_settings
 try:
@@ -17,6 +17,8 @@ try:
     from .schema_cache import get_cached as _schema_get_cached
 except Exception:  # defensive
     _schema_get_cached = None
+
+logger = get_logger("gateway")
 
 # Unified API path for the registry mirror
 _POLICY_REGISTRY_API_PATH = "/api/policy/registry"
@@ -107,7 +109,7 @@ def _sha256(data: bytes) -> str:
     return ensure_sha256_prefix(sha256_hex(data))
 
 
-@trace_span("prompt")
+@trace_span("prompt", logger=logger)
 def build_prompt_envelope(
     question: str,
     evidence: Dict[str, Any],

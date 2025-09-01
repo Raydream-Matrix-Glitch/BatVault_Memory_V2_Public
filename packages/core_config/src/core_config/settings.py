@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     llm_mode: str = Field(default="off", alias="LLM_MODE")
     enable_embeddings: bool = Field(default=False, alias="ENABLE_EMBEDDINGS")
 
+    # Evidence heuristics
+    enable_day_summary_dedup: bool = Field(default=False, alias="ENABLE_DAY_SUMMARY_DEDUP")
+
     # ── API-edge rate-limiting (A-1) ─────────────────────────────────
     api_rate_limit_default: str = Field(
         default="100/minute", alias="API_RATE_LIMIT_DEFAULT"
@@ -123,6 +126,7 @@ class Settings(BaseSettings):
 
     # Policy registry
     policy_registry_path: str | None = Field(default=None, alias="POLICY_REGISTRY_PATH")
+    policy_registry_url: str | None = Field(default=None, alias="POLICY_REGISTRY_URL")
 
     # LLM metadata / adapters
     vllm_model_name: str | None = Field(default=None, alias="VLLM_MODEL_NAME")

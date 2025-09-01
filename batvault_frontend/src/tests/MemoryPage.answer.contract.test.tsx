@@ -51,8 +51,16 @@ import MemoryPage from '../components/memory/MemoryPage';
 
 describe('MemoryPage answer contract integration', () => {
   test('renders citations, chips, badge, next line and triggers bundle download', async () => {
-    // Spy on window.open for presigned bundle URL
+    // Spy on window.open and stub POST /v2/bundles/{rid}/download to return a presigned URL
     const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        url: 'https://example.com/presigned.json',
+        expires_in: 600,
+      }),
+    } as any);
+    (globalThis as any).fetch = fetchMock;
     render(<MemoryPage />);
 
     // Short answer heading and text
@@ -83,7 +91,10 @@ describe('MemoryPage answer contract integration', () => {
     // Trigger download evidence button
     const dlBtn = screen.getByRole('button', { name: /Download evidence/i });
     await userEvent.click(dlBtn);
-    expect(openSpy).toHaveBeenCalledWith('https://example.com/bundle.json', '_blank');
+    expect(fetchMock).toHaveBeenCalledWith('/v2/bundles/req-42/download', { method: 'POST' });
+    expect(openSpy).toHaveBeenCalledWith('https://example.com/presigned.json', '_blank');
+    // cleanup
+    (globalThis as any).fetch = undefined;
     openSpy.mockRestore();
   });
 });

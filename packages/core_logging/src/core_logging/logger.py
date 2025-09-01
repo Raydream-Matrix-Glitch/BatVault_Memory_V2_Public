@@ -21,6 +21,20 @@ _SNAPSHOT_ETAG: Optional[str] = None
 _TRACE_IDS: contextvars.ContextVar[tuple[Optional[str], Optional[str]]] = \
     contextvars.ContextVar("_TRACE_IDS", default=(None, None))
 
+def bind_trace_ids(trace_id: Optional[str], span_id: Optional[str]) -> None:
+    """Bind trace/span IDs into the local context for logging fallbacks."""
+    try:
+        _TRACE_IDS.set((trace_id, span_id))
+    except Exception:
+        pass
+
+def current_trace_ids() -> tuple[Optional[str], Optional[str]]:
+    """Return the currently bound (trace_id, span_id) pair, if any."""
+    try:
+        return _TRACE_IDS.get()
+    except Exception:
+        return (None, None)
+
 def set_snapshot_etag(value: Optional[str]) -> None:          # pragma: no cover
     """
     Bind *value* as the current ``snapshot_etag``.  
@@ -291,7 +305,11 @@ class _TraceSpan:
             self._span = self._otel_cm.__enter__()  # type: ignore[assignment]
             try:
                 ctx = self._span.get_span_context()  # type: ignore[attr-defined]
-                _TRACE_IDS.set((f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"))
+                # Bind only **valid** (non-zero) OTEL IDs; otherwise leave unbound
+                if getattr(ctx, "trace_id", 0):
+                    _TRACE_IDS.set((f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"))
+                else:
+                    _TRACE_IDS.set((None, None))
             except Exception:
                 _TRACE_IDS.set((None, None))
         except Exception:

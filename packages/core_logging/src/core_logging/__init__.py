@@ -4,6 +4,8 @@ from .logger import (
     log_stage,
     trace_span,
     set_snapshot_etag,
+    bind_trace_ids,
+    current_trace_ids,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "log_stage",
     "trace_span",
     "set_snapshot_etag",
+    "bind_trace_ids",
+    "current_trace_ids",
 ]

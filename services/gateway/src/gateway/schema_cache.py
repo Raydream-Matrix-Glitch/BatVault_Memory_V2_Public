@@ -50,3 +50,26 @@ async def fetch_schema(path: str) -> Tuple[dict, str]:
 
     _CACHE[key] = (data, etag, now + TTL_SCHEMA_CACHE_SEC)
     return data, etag
+
+async def fetch_policy_registry() -> Tuple[Optional[dict], str]:
+    """Warm the policy registry cache from a configured absolute URL.
+
+    If POLICY_REGISTRY_URL is unset, this is a no-op that returns (None, "").
+    On success, the fetched data is cached under the canonical key
+    "/api/policy/registry" so that get_cached() callers can reuse it
+    without issuing network I/O.
+    """
+    s = get_settings()
+    url = (getattr(s, "policy_registry_url", None) or "").strip()
+    if not url:
+        # Not configured; nothing to do.
+        return None, ""
+    data = await fetch_json("GET", url, stage="schema")
+    # Best-effort: extract an ETag-like value if present
+    etag = ""
+    if isinstance(data, dict):
+        etag = str(data.get("snapshot_etag") or data.get("etag") or "")
+    # Cache under canonical key
+    key = "/api/policy/registry"
+    _CACHE[key] = (data, etag, time.time() + TTL_SCHEMA_CACHE_SEC)
+    return data, etag

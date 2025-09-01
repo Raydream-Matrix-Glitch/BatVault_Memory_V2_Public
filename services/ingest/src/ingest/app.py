@@ -13,48 +13,73 @@ from fastapi.responses import JSONResponse, Response
 import inspect
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
-
 app = FastAPI(title="BatVault Ingest", version="0.1.0")
+
+# Ensure OTEL middleware wraps all subsequent middlewares/handlers
 instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'ingest')
+
 logger = get_logger("ingest")
 logger.propagate = True
 init_tracing(os.getenv("OTEL_SERVICE_NAME") or "ingest")
 
-# ---- OTEL server span middleware (before request logger) -------------------
+# ---- OTEL helpers (safe no-ops if OTEL not installed) ----------------------
+def _inject_trace_context(headers: dict | None) -> dict:
+    hdrs = dict(headers or {})
+    try:
+        from opentelemetry.propagate import inject  # type: ignore
+        inject(hdrs)
+    except Exception:
+        # Never break a request due to tracing
+        pass
+    return hdrs
+
+# ---- Bind OTEL span IDs into core_logging for consistent trace IDs ---------
 @app.middleware("http")
-async def _otel_server_span(request: Request, call_next):
+async def _bind_trace_ids(request: Request, call_next):
     try:
         from opentelemetry import trace as _trace  # type: ignore
-        tracer = _trace.get_tracer(os.getenv("OTEL_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "ingest")
-        name = f"HTTP {request.method} {request.url.path}"
-        try:
-            from opentelemetry.propagate import extract  # type: ignore
-            _ctx_in = extract(dict(request.headers))
-        except Exception:
-            _ctx_in = None
-        _cm = tracer.start_as_current_span(name, context=_ctx_in) if _ctx_in is not None else tracer.start_as_current_span(name)  # type: ignore
-        with _cm as span:  # type: ignore
-            span.set_attribute("http.method", request.method)
-            span.set_attribute("http.route", request.url.path)
-            resp = await call_next(request)
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, "trace_id", 0):
+            from core_logging import bind_trace_ids  # type: ignore
+            bind_trace_ids(f"{_ctx.trace_id:032x}", f"{_ctx.span_id:016x}")
             try:
-                ctx = span.get_span_context()  # type: ignore[attr-defined]
-                resp.headers["x-trace-id"] = f"{ctx.trace_id:032x}"
+                log_stage(logger, "observability", "trace_ctx_bound", path=str(request.url.path))
             except Exception:
                 pass
-            return resp
     except Exception:
-        return await call_next(request)
+        pass
+    return await call_next(request)
 
-# ── HTTP middleware: deterministic IDs, logs & TTFB histogram ──────────────
 @app.middleware("http")
 async def _request_logger(request: Request, call_next):
     idem = generate_request_id()
+    # Observability: expose current trace/span IDs (should be non-zero if OTEL middleware wrapped us)
+    try:
+        from opentelemetry import trace as _trace  # type: ignore
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, 'trace_id', 0):
+            log_stage(logger, 'observability', 'trace_ctx',
+                      request_id=idem,
+                      trace_id=f"{_ctx.trace_id:032x}",
+                      span_id=f"{_ctx.span_id:016x}")
+    except Exception:
+        pass
     t0   = time.perf_counter()
     log_stage(logger, "request", "request_start",
-              request_id=idem, path=request.url.path, method=request.method)
+              request_id=idem, path=str(request.url.path), method=request.method)
 
     resp = await call_next(request)
+
+    try:
+        from opentelemetry import trace as _trace  # type: ignore
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, 'trace_id', 0):
+            resp.headers["x-trace-id"] = f"{_ctx.trace_id:032x}"
+    except Exception:
+        pass
 
     dt_s = (time.perf_counter() - t0)
     core_metrics.histogram("ingest_ttfb_seconds", dt_s)
@@ -83,7 +108,10 @@ async def _ping_gateway_ready() -> bool:
     """
     try:
         async with httpx.AsyncClient(timeout=5.0) as c:
-            r = await c.get("http://gateway:8081/readyz")
+            r = await c.get(
+                "http://gateway:8081/readyz",
+                headers=_inject_trace_context({}),
+            )
             return r.status_code == 200 and r.json().get("status") == "ready"
     except Exception:
         return False

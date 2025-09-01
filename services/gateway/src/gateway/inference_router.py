@@ -10,6 +10,8 @@ from . import llm_adapters
 from .metrics import gateway_llm_requests, gateway_llm_latency_ms
 
 logger = get_logger("gateway.inference")
+# Disable propagation to avoid duplicate log entries in the root logger.
+logger.propagate = False
 
 # Exposed for headers in /v2/* responses
 last_call: Dict[str, Any] = {}

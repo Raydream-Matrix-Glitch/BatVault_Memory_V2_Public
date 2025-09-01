@@ -246,31 +246,27 @@ def _normalise_transition(tr: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict
 
 
 def _normalise_anchor(anchor: WhyDecisionAnchor) -> Tuple[WhyDecisionAnchor, List[Dict[str, Any]]]:
-    """Normalise the anchor object (decision)."""
+    """
+    Normalise the anchor object (decision).
+
+    This helper scrubs unknown keys, normalises tags and timestamps, and
+    validates the result against the ``WhyDecisionAnchor`` schema.  The
+    anchor model forbids unknown fields (``extra='forbid'``), so we
+    deliberately avoid attaching transport‑only keys such as ``type`` or
+    ``x-extra`` here.  Adding those keys would cause ``model_validate``
+    to fail and force the validator to drop important fields when falling
+    back to a minimal anchor.  Upstream services remain responsible for
+    adding ``type`` and ``x-extra`` to transport envelopes when required.
+    """
     errors: List[Dict[str, Any]] = []
     data = anchor.model_dump(mode="python") if isinstance(anchor, WhyDecisionAnchor) else dict(anchor)
-    # Accept both "title" and legacy "option"
-    allowed_keys = [
-        "id",
-        "title",
-        "option",
-        "rationale",
-        "timestamp",
-        "decision_maker",
-        "tags",
-        "supported_by",
-        "based_on",
-        "transitions",
-        "x-extra",
-        "type",
-    ]
+    # Keep only fields defined on WhyDecisionAnchor.
+    allowed_keys = list(WhyDecisionAnchor.model_fields.keys())
     cleaned, removed_keys = _strip_unknown_keys(data, allowed_keys)
     if removed_keys:
-        errors.append({"code": "unknown_anchor_keys_stripped", "details": {"id": data.get("id"), "removed_keys": removed_keys}})
-    if (cleaned.get("type") or "").lower() != "decision":
-        cleaned["type"] = "decision"
-    if "x-extra" not in cleaned or cleaned.get("x-extra") is None:
-        cleaned["x-extra"] = {}
+        errors.append({"code": "unknown_anchor_keys_stripped",
+                       "details": {"id": data.get("id"), "removed_keys": removed_keys}})
+    # Normalise tags and timestamp; emit errors only when a change is made.
     raw_tags = cleaned.get("tags")
     if raw_tags is None:
         raw_tags_list: List[str] = []
@@ -288,22 +284,47 @@ def _normalise_anchor(anchor: WhyDecisionAnchor) -> Tuple[WhyDecisionAnchor, Lis
         if norm and norm not in seen_tags:
             normalised_tags.append(norm)
             seen_tags.add(norm)
-    # Only emit an error when tags are provided and need normalisation.  When tags are absent,
-    # assign an empty list silently.
     if cleaned.get("tags") != normalised_tags:
-        if raw_tags is not None:
-            errors.append({"code": "tags_not_normalized", "details": {"id": data.get("id"), "original": raw_tags, "normalised": normalised_tags}})
+        errors.append({
+            "code": "tags_normalised",
+            "details": {
+                "id": cleaned.get("id"),
+                "original": raw_tags_list,
+                "normalised": normalised_tags,
+            },
+        })
         cleaned["tags"] = normalised_tags
     ts = cleaned.get("timestamp")
     if ts:
         norm_ts, changed = _ensure_iso(ts)
         if changed:
+            errors.append({
+                "code": "timestamp_normalised",
+                "details": {
+                    "id": cleaned.get("id"),
+                    "original": ts,
+                    "normalised": norm_ts,
+                },
+            })
             cleaned["timestamp"] = norm_ts
-            errors.append({"code": "timestamp_normalised", "details": {"id": data.get("id"), "original": ts, "normalised": norm_ts}})
+    # Validate the cleaned anchor.  Because we’ve removed unknown keys, this
+    # should succeed.  If it does fail (e.g. due to type mismatch), build a
+    # fallback anchor retaining all cleaned fields rather than just id/title.
     try:
         new_anchor = WhyDecisionAnchor.model_validate(cleaned)
     except Exception:
-        new_anchor = WhyDecisionAnchor(id=data.get("id"), title=data.get("option") or data.get("title"))
+        new_anchor = WhyDecisionAnchor(
+            id=cleaned.get("id"),
+            title=cleaned.get("title") or cleaned.get("option"),
+            option=cleaned.get("option"),
+            rationale=cleaned.get("rationale"),
+            timestamp=cleaned.get("timestamp"),
+            decision_maker=cleaned.get("decision_maker"),
+            tags=cleaned.get("tags") or [],
+            supported_by=cleaned.get("supported_by") or [],
+            based_on=cleaned.get("based_on") or [],
+            transitions=cleaned.get("transitions") or [],
+        )
     return new_anchor, errors
 
 

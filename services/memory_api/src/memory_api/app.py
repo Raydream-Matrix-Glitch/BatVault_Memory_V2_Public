@@ -25,37 +25,41 @@ import core_storage.arangodb as arango_mod  # noqa: F401
 
 settings = get_settings()
 logger = get_logger("memory_api")
-logger.propagate = True
+logger.propagate = False
 app = FastAPI(title="BatVault Memory_API", version="0.1.0")
-init_tracing(os.getenv("OTEL_SERVICE_NAME") or "memory_api")
-
+# Ensure OTEL middleware wraps all subsequent middlewares/handlers
 instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'memory_api')
 
-# ---- OTEL server span middleware (before request logger) -------------------
+init_tracing(os.getenv("OTEL_SERVICE_NAME") or "memory_api")
+
+# ---- OTEL helpers (safe no-ops if OTEL not installed) ----------------------
+def _inject_trace_context(headers: dict | None) -> dict:
+    hdrs = dict(headers or {})
+    try:
+        from opentelemetry.propagate import inject  # type: ignore
+        inject(hdrs)
+    except Exception:
+        # Never break a request due to tracing
+        pass
+    return hdrs
+
+# ---- Bind OTEL span IDs into core_logging for consistent trace IDs ---------
 @app.middleware("http")
-async def _otel_server_span(request: Request, call_next):
+async def _bind_trace_ids(request: Request, call_next):
     try:
         from opentelemetry import trace as _trace  # type: ignore
-        tracer = _trace.get_tracer(os.getenv("OTEL_SERVICE_NAME") or os.getenv("SERVICE_NAME") or "memory_api")
-        name = f"HTTP {request.method} {request.url.path}"
-        try:
-            from opentelemetry.propagate import extract  # type: ignore
-            _ctx_in = extract(dict(request.headers))
-        except Exception:
-            _ctx_in = None
-        _cm = tracer.start_as_current_span(name, context=_ctx_in) if _ctx_in is not None else tracer.start_as_current_span(name)  # type: ignore
-        with _cm as span:  # type: ignore
-            span.set_attribute("http.method", request.method)
-            span.set_attribute("http.route", request.url.path)
-            resp = await call_next(request)
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, "trace_id", 0):
+            from core_logging import bind_trace_ids  # type: ignore
+            bind_trace_ids(f"{_ctx.trace_id:032x}", f"{_ctx.span_id:016x}")
             try:
-                ctx = span.get_span_context()  # type: ignore[attr-defined]
-                resp.headers["x-trace-id"] = f"{ctx.trace_id:032x}"
+                log_stage(logger, "observability", "trace_ctx_bound", path=str(request.url.path))
             except Exception:
                 pass
-            return resp
     except Exception:
-        return await call_next(request)
+        pass
+    return await call_next(request)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helper: safe cache eviction
@@ -79,11 +83,33 @@ def _clear_store_cache() -> None:  # pragma: no cover – trivial utility
 @app.middleware("http")
 async def _request_logger(request: Request, call_next):
     idem = generate_request_id()
+    # Observability: expose current trace/span IDs (should be non-zero if OTEL middleware wrapped us)
+    try:
+        from opentelemetry import trace as _trace  # type: ignore
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, 'trace_id', 0):
+            log_stage(logger, 'observability', 'trace_ctx',
+                      request_id=idem,
+                      trace_id=f"{_ctx.trace_id:032x}",
+                      span_id=f"{_ctx.span_id:016x}")
+    except Exception:
+        pass
     t0   = time.perf_counter()
     log_stage(logger, "request", "request_start",
               request_id=idem, path=request.url.path, method=request.method)
 
     resp = await call_next(request)
+
+    # Bubble the active trace id to clients for audit drawers
+    try:
+        from opentelemetry import trace as _trace  # type: ignore
+        _sp = _trace.get_current_span()
+        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+        if _ctx and getattr(_ctx, 'trace_id', 0):
+            resp.headers["x-trace-id"] = f"{_ctx.trace_id:032x}"
+    except Exception:
+        pass
 
     dt_s = (time.perf_counter() - t0)
     core_metrics.histogram("memory_api_ttfb_seconds", dt_s)
@@ -113,7 +139,10 @@ async def _ping_arango_ready() -> bool:
     settings = get_settings()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{settings.arango_url}/_api/version")
+            r = await client.get(
+                f"{settings.arango_url}/_api/version",
+                headers=_inject_trace_context({}),
+            )
         return r.status_code == 200
     except Exception:
         return False
@@ -268,11 +297,12 @@ async def enrich_decision(node_id: str, response: Response):
         # ``async``.
         return store().get_enriched_decision(node_id)
 
-    # Execute the enrichment in a thread with a 0.6 s timeout as per the
-    # Milestone‑4 contract.  Timeouts surface as HTTP 504 responses.
+    # Execute the enrichment in a thread with a configurable timeout.
+    # Default comes from TIMEOUT_ENRICH_MS; 504 on timeout.
     try:
         with trace_span("memory.enrich_decision", node_id=node_id):
-            doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=0.6)
+            budget_s = max(0.1, float(get_settings().timeout_enrich_ms) / 1000.0)
+            doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=budget_s)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=504, detail="timeout")
     # Missing decisions must return a 404 error.
@@ -446,7 +476,7 @@ async def resolve_text(payload: dict, response: Response):
     except Exception as e:
         # Unit-test friendly fallback: return empty contract (no DB required)
         log_stage(logger, "resolver", "fallback_empty", error=type(e).__name__)
-        doc = {"query": q}
+        doc = {"query": q, "meta": {"fallback_reason": "db_unavailable"}}
     try:
         etag = store().get_snapshot_etag()
     except Exception:
@@ -456,6 +486,7 @@ async def resolve_text(payload: dict, response: Response):
     # Also surface the snapshot in the body for simpler audit drawers
     doc.setdefault("meta", {})
     doc["meta"]["snapshot_etag"] = etag or "unknown"
+    doc["meta"]["snapshot_available"] = bool((etag or "") and (etag or "") != "unknown")
     # Convenience flag: was vector search even available?
     doc["meta"]["vector_enabled"] = (os.getenv("ENABLE_EMBEDDINGS", "").lower() == "true")
     # Ensure contract keys present (normalize to input)
@@ -518,14 +549,15 @@ async def expand_candidates(payload: dict, response: Response):
         }
         etag = None
     except Exception as e:
-        # Unit-test friendly fallback: return empty neighbors (no DB required)
+        # Unit-test friendly fallback: return empty neighbors (no DB required).  When
+        # an unexpected exception occurs (e.g., database unavailable), the caller
+        # should be able to inspect a fallback_reason in the response meta.  We
+        # categorise all unexpected errors as "db_unavailable".
         log_stage(logger, "expand", "fallback_empty", error=type(e).__name__)
-        # Legacy shape for neighbours comes from older store
-        # {"events": [], "transitions": []}
         doc  = {"node_id": None,
                 "neighbors": {"events": [], "transitions": []},
-                "meta": {}}
-        etag = None                      # <- guarantee *etag* exists downstream
+                "meta": {"fallback_reason": "db_unavailable"}}
+        etag = None 
 
     # ---- 🔒 Contract normalisation (Milestone-2) ---- #
     #
@@ -587,6 +619,11 @@ async def expand_candidates(payload: dict, response: Response):
     if not isinstance(result["meta"], dict):
         result["meta"] = {}
     result["meta"]["snapshot_etag"] = safe_etag
+    # Flag snapshot availability explicitly.  If the ETag could not be
+    # retrieved from Arango this flag will be False.  Downstream callers
+    # differentiate between a missing snapshot and the legacy "unknown"
+    # marker.
+    result["meta"]["snapshot_available"] = bool(safe_etag and safe_etag != "unknown")
     result["meta"]["ok"] = True
     result["meta"]["neighbor_count"] = len(result.get("neighbors") or [])
     result["meta"]["k"] = k

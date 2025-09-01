@@ -52,7 +52,13 @@ def _offline_fixture_search(text: str, k: int = 24) -> List[Dict[str, Any]]:
     return matches[:k]
 
 # ── Primary search with graceful fallback ──────────────────────────────
-async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
+async def search_bm25(
+    text: str,
+    k: int,
+    *,
+    request_id: str | None = None,
+    snapshot_etag: str | None = None,
+) -> List[Dict[str, Any]]:
     """Try Memory-API BM25; if that fails (or returns zero hits), fall back to the local fixtures."""
     payload = {"q": text, "limit": k, "use_vector": False}
     matches: List[Dict[str, Any]] = []
@@ -69,17 +75,27 @@ async def search_bm25(text: str, k: int) -> List[Dict[str, Any]]:
         if resp.status_code == 200:
             doc = resp.json()
             matches = doc.get("matches", [])
-            log_stage("resolver", "bm25_search_complete",
-                      match_count=len(matches),
-                      vector_used=doc.get("vector_used"))
+            log_stage(
+                "resolver",
+                "bm25_search_complete",
+                match_count=len(matches),
+                vector_used=doc.get("vector_used"),
+                request_id=request_id,
+                snapshot_etag=snapshot_etag,
+            )
     except Exception:           # network failure / service down
         logger.warning("bm25_search_http_error", exc_info=True)
 
     if not matches:             # offline back-stop
         matches = _offline_fixture_search(text, k)
-        log_stage("resolver", "bm25_offline_fallback",
-                  match_count=len(matches),
-                  vector_used=False)
+        log_stage(
+            "resolver",
+            "bm25_offline_fallback",
+            match_count=len(matches),
+            vector_used=False,
+            request_id=request_id,
+            snapshot_etag=snapshot_etag,
+        )
     return matches
 
 # Back-compat alias

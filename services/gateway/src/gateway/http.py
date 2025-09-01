@@ -23,10 +23,19 @@ def get_http_client(timeout_ms: Optional[int] = None) -> httpx.AsyncClient:
     to stage-based values via `timeout_for_stage("enrich")` unless explicitly provided.
     """
     global _client
+    # Compute separate connect/read/write timeouts. Read dominates; connect is capped.
+    base_sec = float(timeout_ms) / 1000.0 if timeout_ms is not None else timeout_for_stage("enrich")
+    connect_sec = min(0.4, max(0.1, base_sec * 0.4))
+    read_sec    = base_sec
+    write_sec   = max(0.2, min(base_sec, 1.0))
+    pool_sec    = max(0.2, min(base_sec, 1.0))
+    to = httpx.Timeout(connect=connect_sec, read=read_sec, write=write_sec, pool=pool_sec)
+    limits = httpx.Limits(max_keepalive_connections=32, max_connections=128)
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=timeout_for_stage("enrich"))
-    if timeout_ms is not None:
-        _client.timeout = float(timeout_ms) / 1000.0
+        _client = httpx.AsyncClient(timeout=to, limits=limits)
+    else:
+        # Update timeouts dynamically for the shared client
+        _client.timeout = to
     return _client
 
 async def fetch_json(

@@ -14,6 +14,7 @@ dependencies = [
   "core_metrics",
   "core_config",
   "core_logging",
+  "core_observability",
   "core_utils",
   "slowapi>=0.1.7",
   "redis>=5.0.3",

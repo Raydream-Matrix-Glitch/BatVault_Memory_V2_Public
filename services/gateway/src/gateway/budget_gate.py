@@ -14,6 +14,7 @@ from core_config.constants import (
     GATE_SHRINK_JITTER_PCT,
     GATE_MAX_SHRINK_RETRIES,
 )
+from core_config import get_settings
 from core_models.models import GatePlan
 from shared.prompt_budget import gate_budget
 from gateway.prompt_messages import build_messages
@@ -36,6 +37,14 @@ def _blake3_or_sha256(b: bytes) -> str:
     return ensure_sha256_prefix(sha256_hex(b))
 
 def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, model_name: str|None=None) -> tuple[GatePlan, Any]:
+    """
+    Deterministically budget a prompt and evidence bundle based on the supplied
+    envelope and evidence object.  This variant dynamically computes the
+    context window and completion budget from configuration instead of
+    relying on hard‑coded constants.  Environment variables such as
+    ``VLLM_MAX_MODEL_LEN`` and ``LLM_MAX_TOKENS`` may override the default
+    control model parameters, allowing larger or smaller budgets per model.
+    """
     # Deterministic seed from canonical envelope
     seed_bytes = canonical_json({"intent": envelope.get("intent"), "question": envelope.get("question")})
     seed_int = int(hashlib.sha256(seed_bytes).hexdigest()[0:8], 16)
@@ -44,14 +53,34 @@ def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, mo
         setattr(evidence_obj, "_request_id", request_id)
     except Exception:
         pass
+
+    # Derive dynamic context window and desired completion tokens from settings.
+    # When the environment does not specify overrides, fall back to control defaults.
+    try:
+        _s = get_settings()
+    except Exception:
+        _s = None
+    try:
+        dynamic_context = int(
+            getattr(_s, "vllm_max_model_len", None) or CONTROL_CONTEXT_WINDOW
+        )
+    except Exception:
+        dynamic_context = CONTROL_CONTEXT_WINDOW
+    try:
+        dynamic_completion = int(
+            getattr(_s, "llm_max_tokens", None) or CONTROL_COMPLETION_TOKENS
+        )
+    except Exception:
+        dynamic_completion = CONTROL_COMPLETION_TOKENS
+
     gp_dict, trimmed_evidence = gate_budget(
         render_fn=build_messages,
         truncate_fn=authoritative_truncate,
         envelope=envelope,
         evidence_obj=evidence_obj,
-        context_window=CONTROL_CONTEXT_WINDOW,
+        context_window=dynamic_context,
         guard_tokens=CONTROL_PROMPT_GUARD_TOKENS,
-        desired_completion_tokens=CONTROL_COMPLETION_TOKENS,
+        desired_completion_tokens=dynamic_completion,
         max_retries=GATE_MAX_SHRINK_RETRIES,
         shrink_factor=GATE_COMPLETION_SHRINK_FACTOR,
         jitter_pct=GATE_SHRINK_JITTER_PCT,

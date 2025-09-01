@@ -63,10 +63,12 @@ async def embed(texts: Iterable[str]) -> Optional[List[List[float]]]:
     start = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
+            from core_observability.otel import inject_trace_context
+            _hdrs = inject_trace_context({"Accept": "application/json"})
             resp = await client.post(
                 f"{_endpoint}/embeddings",
                 json={"input": batch},
-                headers={"Accept": "application/json"},
+                headers=_hdrs,
             )
             resp.raise_for_status()
             j = resp.json()
