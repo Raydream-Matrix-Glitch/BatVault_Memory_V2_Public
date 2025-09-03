@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import os
+# Neither hashlib nor os are used directly in this module.  The fingerprint helpers
+# from core_utils.fingerprints provide SHA‑256 hashing, and environment
+# configuration is obtained via core_config.  Removing these unused imports
+# simplifies the dependency surface.
 from pathlib import Path
 from typing import Any, Dict
 

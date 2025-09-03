@@ -16,12 +16,18 @@ RUN pip install \
       -e packages/core_logging \
       -e packages/core_metrics \
       -e packages/core_storage \
-      -e packages/shared
+      -e packages/shared \
+      -e packages/core_utils
 
 # 3) copy the bootstrap script last (keeps cache hits high)
 COPY ops/bootstrap.py ./ops/bootstrap.py
 
-# make the source importable without pip installs in prod
-ENV PYTHONPATH="/app/packages"
+
+COPY sitecustomize.py ./sitecustomize.py
+
+# Ensure root is on sys.path so sitecustomize.py runs and injects all */src paths.
+# We only need /app here; sitecustomize will append packages/*/src and services/*/src
+# deterministically (and before site-packages) for the current container filesystem.
+ENV PYTHONPATH="/app"
 
 CMD ["python", "ops/bootstrap.py"]

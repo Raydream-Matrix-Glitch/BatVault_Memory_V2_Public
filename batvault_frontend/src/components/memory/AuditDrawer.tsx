@@ -1,6 +1,9 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import Tab from "./ui/Tab";
 import Button from "./ui/Button";
+import { logEvent } from "../../utils/logger";
+// Import a handful of FontAwesome icons to visually reinforce each audit tab.
+import { FaStream, FaFileAlt, FaDatabase, FaChartBar, FaFingerprint } from 'react-icons/fa';
 import type {
   MetaInfo,
   EvidenceBundle,
@@ -38,12 +41,57 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
   answer,
   bundle_url,
 }) => {
+
+  // Lazy prompt artifacts loaded from the bundle when not present in meta
+  const [bundlePrompt, setBundlePrompt] = useState<{ envelope?: any; rendered?: string; raw?: any } | null>(null);
+  const [bundleLoading, setBundleLoading] = useState(false);
+  const effectivePromptEnvelope = meta?.prompt_envelope ?? bundlePrompt?.envelope;
+  const effectiveRenderedPrompt = meta?.rendered_prompt ?? bundlePrompt?.rendered;
+  const effectiveRawLLM        = meta?.raw_llm_json     ?? bundlePrompt?.raw;
+  const loadPromptFromBundle = useCallback(async () => {
+    if (!meta?.request_id) return;
+    setBundleLoading(true);
+    try { logEvent("ui.audit.load_bundle", { rid: meta.request_id, kind: "prompt_artifacts" }); } catch {}
+    try {
+      const resp = await fetch(`/v2/bundles/${meta.request_id}`);
+      if (!resp.ok) throw new Error(`bundle get failed: ${resp.status}`);
+      const data = await resp.json().catch(() => null) as any;
+      if (data) {
+        // Prefer new gateway keys; fall back to legacy names to be safe.
+        const envStr =
+          data["envelope.json"] ??
+          data["prompt_envelope.json"] ??
+          undefined;
+        const env = envStr ? JSON.parse(envStr) : undefined;
+        const rend = data["rendered_prompt.txt"] ?? undefined;
+        const rawStr =
+          data["llm_raw.json"] ??
+          data["raw_llm.json"] ??
+          undefined;
+        const raw = rawStr ? JSON.parse(rawStr) : undefined;
+        setBundlePrompt({ envelope: env, rendered: rend, raw });
+        try { logEvent("ui.audit.load_bundle.ok", { rid: meta.request_id }); } catch {}
+      }
+    } catch (e: any) {
+      try { logEvent("ui.audit.load_bundle.err", { rid: meta?.request_id ?? null, message: String(e?.message || e) }); } catch {}
+    } finally {
+      setBundleLoading(false);
+    }
+  }, [meta?.request_id]);
   const [activeTab, setActiveTab] = useState<
     "trace" | "prompt" | "evidence" | "metrics" | "fingerprints"
   >("trace");
   const [showEnvelope, setShowEnvelope] = useState(false);
   const [showRendered, setShowRendered] = useState(false);
   const [showRaw, setShowRaw] = useState(false);
+
+  useEffect(() => {
+    try {
+      logEvent("ui.audit_tab_changed", { tab: activeTab, rid: meta?.request_id ?? null });
+    } catch {
+      /* ignore logging errors */
+    }
+  }, [activeTab, meta?.request_id]);
 
   // Helper to copy text to clipboard and notify the user silently.
   const copyToClipboard = async (text: string) => {
@@ -70,8 +118,11 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
 
   // Flatten allowed and dropped IDs for evidence tab
   const allowed = evidence?.allowed_ids ?? [];
-  const dropped = meta?.dropped_evidence_ids ?? [];
-  const selectorScores = meta?.selector_scores ?? {};
+  // Prefer top-level fields; fall back to evidence_metrics (what the gateway emits today)
+  const dropped = meta?.dropped_evidence_ids ?? (meta as any)?.evidence_metrics?.dropped_evidence_ids ?? [];
+  const selectorScores = meta?.selector_scores ?? (meta as any)?.evidence_metrics?.selector_scores ?? {};
+  const preceding = (evidence as any)?.transitions?.preceding ?? [];
+  const succeeding = (evidence as any)?.transitions?.succeeding ?? [];
 
   // Determine classes for drawer visibility. Increase width to accommodate all tabs
   // and ensure it doesn't cut off the last tab. On small screens, it still slides
@@ -96,19 +147,57 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
           <span className="hidden sm:inline">Prompt fp: {meta?.prompt_fingerprint ?? "–"}</span>
           <span className="hidden sm:inline">Snapshot: {meta?.snapshot_etag ?? "–"}</span>
         </div>
-        {bundle_url && (
-          <Button variant="secondary" onClick={() => window.open(bundle_url!, "_blank")} className="text-xs">
+        {(meta?.request_id || bundle_url) && (
+          <Button variant="secondary" onClick={async () => {
+            const { openEvidenceBundle } = await import("../../utils/bundle");
+            await openEvidenceBundle(meta?.request_id, bundle_url || undefined);
+          }} className="text-xs">
             Open full bundle
           </Button>
         )}
       </div>
       {/* Tabs */}
       <div className="flex space-x-3 px-4 border-b border-gray-700 overflow-x-auto">
-        <Tab active={activeTab === "trace"} onClick={() => setActiveTab("trace")}>Trace</Tab>
-        <Tab active={activeTab === "prompt"} onClick={() => setActiveTab("prompt")}>Prompt</Tab>
-        <Tab active={activeTab === "evidence"} onClick={() => setActiveTab("evidence")}>Evidence</Tab>
-        <Tab active={activeTab === "metrics"} onClick={() => setActiveTab("metrics")}>Metrics</Tab>
-        <Tab active={activeTab === "fingerprints"} onClick={() => setActiveTab("fingerprints")}>Fingerprints</Tab>
+        <Tab
+          active={activeTab === "trace"}
+          onClick={() => setActiveTab("trace")}
+          className="flex items-center gap-1"
+        >
+          <FaStream className="w-3 h-3" />
+          <span>Trace</span>
+        </Tab>
+        <Tab
+          active={activeTab === "prompt"}
+          onClick={() => setActiveTab("prompt")}
+          className="flex items-center gap-1"
+        >
+          <FaFileAlt className="w-3 h-3" />
+          <span>Prompt</span>
+        </Tab>
+        <Tab
+          active={activeTab === "evidence"}
+          onClick={() => setActiveTab("evidence")}
+          className="flex items-center gap-1"
+        >
+          <FaDatabase className="w-3 h-3" />
+          <span>Evidence</span>
+        </Tab>
+        <Tab
+          active={activeTab === "metrics"}
+          onClick={() => setActiveTab("metrics")}
+          className="flex items-center gap-1"
+        >
+          <FaChartBar className="w-3 h-3" />
+          <span>Metrics</span>
+        </Tab>
+        <Tab
+          active={activeTab === "fingerprints"}
+          onClick={() => setActiveTab("fingerprints")}
+          className="flex items-center gap-1"
+        >
+          <FaFingerprint className="w-3 h-3" />
+          <span>Fingerprint</span>
+        </Tab>
       </div>
       <div className="overflow-y-auto p-4 space-y-4" style={{ height: "calc(100% - 100px)" }}>
         {/* Trace tab */}
@@ -132,10 +221,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
                 <h3 className="text-lg font-semibold text-vaultred">Envelope</h3>
                 <Button
                   variant="secondary"
-                  onClick={() =>
-                    meta?.prompt_envelope &&
-                    copyToClipboard(JSON.stringify(meta.prompt_envelope, null, 2))
-                  }
+                  onClick={() => effectivePromptEnvelope && copyToClipboard(JSON.stringify(effectivePromptEnvelope, null, 2))}
                   className="text-xs"
                 >
                   Copy
@@ -148,9 +234,14 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
               >
                 {showEnvelope ? "Hide" : "Show"}
               </Button>
-              {showEnvelope && !!meta?.prompt_envelope && (
+              {!effectivePromptEnvelope && meta?.request_id && (
+                <Button variant="secondary" onClick={loadPromptFromBundle} className="text-xs" disabled={bundleLoading}>
+                  {bundleLoading ? "Loading…" : "Load from bundle"}
+                </Button>
+              )}
+              {showEnvelope && !!effectivePromptEnvelope && (
                 <pre className="bg-darkbg border border-gray-700 rounded p-2 text-xs overflow-x-auto whitespace-pre-wrap">
-                  {JSON.stringify(meta.prompt_envelope, null, 2)}
+                  {JSON.stringify(effectivePromptEnvelope, null, 2)}
                 </pre>
               )}
             </div>
@@ -159,9 +250,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
                 <h3 className="text-lg font-semibold text-vaultred">Rendered prompt</h3>
                 <Button
                   variant="secondary"
-                  onClick={() =>
-                    meta?.rendered_prompt && copyToClipboard(meta.rendered_prompt)
-                  }
+                  onClick={() => effectiveRenderedPrompt && copyToClipboard(effectiveRenderedPrompt as any)}
                   className="text-xs"
                 >
                   Copy
@@ -174,9 +263,14 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
               >
                 {showRendered ? "Hide" : "Show"}
               </Button>
-              {showRendered && meta?.rendered_prompt && (
+              {!effectiveRenderedPrompt && meta?.request_id && (
+                <Button variant="secondary" onClick={loadPromptFromBundle} className="text-xs" disabled={bundleLoading}>
+                  {bundleLoading ? "Loading…" : "Load from bundle"}
+                </Button>
+              )}
+              {showRendered && !!effectiveRenderedPrompt && (
                 <pre className="bg-darkbg border border-gray-700 rounded p-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono">
-                  {meta.rendered_prompt}
+                  {effectiveRenderedPrompt as any}
                 </pre>
               )}
             </div>
@@ -186,8 +280,8 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
                 <Button
                   variant="secondary"
                   onClick={() =>
-                    meta?.raw_llm_json &&
-                    copyToClipboard(JSON.stringify(meta.raw_llm_json, null, 2))
+                    effectiveRawLLM &&
+                    copyToClipboard(JSON.stringify(effectiveRawLLM, null, 2))
                   }
                   className="text-xs"
                 >
@@ -201,9 +295,14 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
               >
                 {showRaw ? "Hide" : "Show"}
               </Button>
-              {showRaw && !!meta?.raw_llm_json && (
+              {!effectiveRawLLM && meta?.request_id && (
+                <Button variant="secondary" onClick={loadPromptFromBundle} className="text-xs" disabled={bundleLoading}>
+                  {bundleLoading ? "Loading…" : "Load from bundle"}
+                </Button>
+              )}
+              {showRaw && !!effectiveRawLLM && (
                 <pre className="bg-darkbg border border-gray-700 rounded p-2 text-xs overflow-x-auto whitespace-pre-wrap">
-                  {JSON.stringify(meta.raw_llm_json, null, 2)}
+                  {JSON.stringify(effectiveRawLLM, null, 2)}
                 </pre>
               )}
             </div>
@@ -219,7 +318,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
             {allowed.length > 0 ? (
               <ul className="list-disc list-inside text-xs text-copy space-y-1 mb-4">
                 {allowed.map((id) => (
-                  <li key={id}>{id}</li>
+                  <li key={id} className="font-mono break-all">{id}</li>
                 ))}
               </ul>
             ) : (
@@ -232,7 +331,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
                 </div>
                 <ul className="list-disc list-inside text-xs text-copy space-y-1 mb-4">
                   {dropped.map((id) => (
-                    <li key={id}>{id}</li>
+                    <li key={id} className="font-mono break-all">{id}</li>
                   ))}
                 </ul>
               </>
@@ -250,21 +349,49 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
                   <tbody>
                     {Object.entries(selectorScores).map(([id, score]) => (
                       <tr key={id} className="border-t border-gray-700">
-                        <td className="pr-4 py-1 break-all">{id}</td>
-                        <td className="py-1">{score.toFixed(3)}</td>
+                        <td className="pr-4 py-1 break-all font-mono">{id}</td>
+                        <td className="py-1 font-mono">{score.toFixed(3)}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
             )}
-           {/* Cited evidence IDs from the short answer */}
+            {/* Transitions (preceding/succeeding) */}
+            {(preceding.length > 0 || succeeding.length > 0) && (
+              <div className="mt-4">
+                <h4 className="text-sm font-semibold text-vaultred mb-1">Transitions</h4>
+                <div className="grid grid-cols-2 gap-4 text-xs">
+                  <div>
+                    <div className="font-semibold mb-1">Preceding ({preceding.length})</div>
+                    {preceding.length ? (
+                      <ul className="list-disc list-inside space-y-1">
+                        {preceding.map((t: any) => (
+                          <li key={t.id} className="font-mono break-all">{t.id}</li>
+                        ))}
+                      </ul>
+                    ) : <div className="opacity-70">None</div>}
+                  </div>
+                  <div>
+                    <div className="font-semibold mb-1">Succeeding ({succeeding.length})</div>
+                    {succeeding.length ? (
+                      <ul className="list-disc list-inside space-y-1">
+                        {succeeding.map((t: any) => (
+                          <li key={t.id} className="font-mono break-all">{t.id}</li>
+                        ))}
+                      </ul>
+                    ) : <div className="opacity-70">None</div>}
+                  </div>
+                </div>
+              </div>
+            )}
+            {/* Cited evidence IDs from the short answer */}
             {answer?.supporting_ids && answer.supporting_ids.length > 0 && (
               <div className="mt-4">
                 <h4 className="text-sm font-semibold text-vaultred mb-1">Cited in short answer</h4>
                 <ul className="list-disc list-inside text-xs text-copy space-y-1">
                   {answer.supporting_ids.map((cid) => (
-                    <li key={cid}>{cid}</li>
+                    <li key={cid} className="font-mono break-all">{cid}</li>
                   ))}
                 </ul>
               </div>
@@ -273,78 +400,40 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
         )}
         {/* Metrics tab */}
         {activeTab === "metrics" && (
-          <div className="space-y-2 text-sm text-copy">
-            <div>
-              <span className="font-semibold">Latency</span>: {meta?.latency_ms ?? "–"} ms
-            </div>
-            <div>
-              <span className="font-semibold">Retries</span>: {meta?.retries ?? "–"}
-            </div>
-            <div>
-              <span className="font-semibold">Routing confidence</span>: {meta?.routing_confidence !== undefined ? meta.routing_confidence.toFixed(3) : "–"}
-            </div>
-            {meta?.function_calls && meta.function_calls.length > 0 && (
-              <div>
-                <span className="font-semibold">Function calls</span>: {meta.function_calls.join(", ")}
-              </div>
-            )}
-            {meta?.fallback_used !== undefined && (
-              <div>
-                <span className="font-semibold">Fallback used</span>: {meta.fallback_used ? "yes" : "no"}
-              </div>
-            )}
-            {meta?.fallback_reason && (
-              <div>
-                <span className="font-semibold">Fallback reason</span>: {meta.fallback_reason}
-              </div>
-            )}
-            {meta?.cache_hit !== undefined && (
-              <div>
-                <span className="font-semibold">Cache hit</span>: {meta.cache_hit ? "yes" : "no"}
-              </div>
-            )}
-            {/* Evidence bundling metrics (M3/M5) */}
-            {meta?.total_neighbors_found !== undefined && (
-              <div>
-                <span className="font-semibold">Total neighbors found</span>: {meta.total_neighbors_found}
-              </div>
-            )}
-            {meta?.final_evidence_count !== undefined && (
-              <div>
-                <span className="font-semibold">Final evidence count</span>: {meta.final_evidence_count}
-              </div>
-            )}
-            {meta?.selector_truncation !== undefined && (
-              <div>
-                <span className="font-semibold">Selector truncation</span>: {meta.selector_truncation ? "yes" : "no"}
-              </div>
-            )}
-            {(meta?.bundle_size_bytes !== undefined || meta?.max_prompt_bytes !== undefined) && (
-              <div>
-                <span className="font-semibold">Bundle size</span>: {meta?.bundle_size_bytes ?? "–"} bytes
-                {meta?.max_prompt_bytes !== undefined && <> &nbsp; <span className="font-semibold">Budget</span>: {meta.max_prompt_bytes} bytes</>}
-                {meta?.bundle_size_bytes !== undefined && meta?.max_prompt_bytes !== undefined && (
-                  <div className="mt-1 text-xs">
-                    Usage: {Math.min(100, Math.round((meta.bundle_size_bytes / meta.max_prompt_bytes) * 100))}%
-                  </div>
-                )}
-              </div>
-            )}
-            {/* Fallback completeness from current evidence object */}
-            {evidence && (
-              <div>
-                <span className="font-semibold">Evidence count</span>: {evidence.events.length + 1}
-              </div>
-            )}
+          <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm text-copy">
+            <>
+              <div className="font-semibold">Latency</div>
+              <div>{meta?.latency_ms ?? "–"} ms</div>
+              <div className="font-semibold">Retries</div>
+              <div>{meta?.retries ?? "–"}</div>
+              <div className="font-semibold">Fallback used</div>
+              <div>{meta?.fallback_used ? "yes" : "no"}</div>
+              <div className="font-semibold">Fallback reason</div>
+              <div>{meta?.fallback_reason ?? "–"}</div>
+              <div className="font-semibold">Bundle size</div>
+              <div>{meta?.bundle_size_bytes ?? "–"} bytes</div>
+              <div className="font-semibold">Evidence count</div>
+              <div>{evidence ? evidence.events.length + 1 : "–"}</div>
+              <div className="font-semibold">Prompt tokens</div>
+              <div>{(meta as any)?.prompt_tokens ?? "–"}</div>
+              <div className="font-semibold">Evidence tokens</div>
+              <div>{(meta as any)?.evidence_tokens ?? "–"}</div>
+              <div className="font-semibold">Max tokens</div>
+              <div>{(meta as any)?.max_tokens ?? "–"}</div>
+              <div className="font-semibold">Selector</div>
+              <div>{(meta as any)?.selector_model_id ?? "–"}</div>
+              <div className="font-semibold">Load shed</div>
+              <div>{(meta as any)?.load_shed ? "yes" : "no"}</div>
+            </>
           </div>
-       )}
-        {/* Fingerprints tab */}
+        )}
+        {/* Fingerprint tab */}
         {activeTab === "fingerprints" && (
           <div className="space-y-3 text-sm text-copy break-all">
             {/* Request ID row */}
             <div className="flex items-center">
               <span className="font-semibold mr-1">Request ID:</span>
-              <span className="ml-1">{meta?.request_id ?? "–"}</span>
+              <span className="ml-1 font-mono">{meta?.request_id ?? "–"}</span>
               {meta?.request_id && (
                 <Button
                   variant="secondary"
@@ -358,7 +447,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
             {/* Plan fingerprint row */}
             <div className="flex items-center">
               <span className="font-semibold mr-1">Plan fingerprint:</span>
-              <span className="ml-1">{meta?.plan_fingerprint ?? "–"}</span>
+              <span className="ml-1 font-mono">{meta?.plan_fingerprint ?? "–"}</span>
               {meta?.plan_fingerprint && (
                 <Button
                   variant="secondary"
@@ -369,11 +458,11 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
                 </Button>
               )}
             </div>
-           
+
             {/* Prompt fingerprint row */}
             <div className="flex items-center">
               <span className="font-semibold mr-1">Prompt fingerprint:</span>
-              <span className="ml-1">
+              <span className="ml-1 font-mono">
                 {meta?.prompt_fingerprint ?? meta?.prompt_envelope_fingerprint ?? "–"}
               </span>
               {(meta?.prompt_fingerprint || meta?.prompt_envelope_fingerprint) && (
@@ -393,7 +482,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
             {/* Snapshot etag row */}
             <div className="flex items-center">
               <span className="font-semibold mr-1">Snapshot etag:</span>
-              <span className="ml-1">{meta?.snapshot_etag ?? "–"}</span>
+              <span className="ml-1 font-mono">{meta?.snapshot_etag ?? "–"}</span>
               {meta?.snapshot_etag && (
                 <Button
                   variant="secondary"

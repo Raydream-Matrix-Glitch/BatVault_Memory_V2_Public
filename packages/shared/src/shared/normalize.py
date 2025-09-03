@@ -40,7 +40,10 @@ should not need further processing.
 
 from datetime import timezone
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from core_models.models import WhyDecisionEvidence
 
 from core_utils import slugify_tag
 
@@ -410,3 +413,74 @@ def normalise_event_amount(ev: dict) -> None:
                 if currency:
                     ev.setdefault("normalized_currency", currency)
                 return
+
+# ---------------------------------------------------------------------------
+# Evidence pre‑processing helpers
+# ---------------------------------------------------------------------------
+
+def dedup_and_normalise_events(ev: "WhyDecisionEvidence") -> None:
+    """
+    Deduplicate and normalise events on a ``WhyDecisionEvidence`` object.
+
+    Steps performed:
+      1. Remove duplicate IDs, preserving the first occurrence.
+      2. Collapse near‑identical events occurring on the same day by
+         constructing a canonical key from date+summary with digits,
+         currency symbols and punctuation stripped.
+      3. Attach ``normalized_amount`` and ``normalized_currency`` via
+         :func:`normalise_event_amount`.
+
+    The input evidence object is modified in place; nothing is returned.
+    """
+    try:
+        events = list(ev.events or [])  # type: ignore[attr-defined]
+    except Exception:
+        return
+    # Step 1: deduplicate by event ID
+    seen_ids: set[str] = set()
+    deduped: list[dict] = []
+    for item in events:
+        eid = None
+        try:
+            eid = item.get("id")  # type: ignore[assignment]
+        except Exception:
+            pass
+        if eid and eid in seen_ids:
+            continue
+        if eid:
+            seen_ids.add(eid)
+        deduped.append(item)
+    events = deduped
+    # Step 2: deduplicate near‑identical events on the same day
+    try:
+        import re as _re
+        grouped: set[tuple] = set()
+        uniq: list[dict] = []
+        for item in events:
+            try:
+                ts = item.get("timestamp") or ""
+                date_part = ts.split("T")[0] if isinstance(ts, str) else str(ts)[:10]
+                summary = item.get("summary") or item.get("description") or ""
+                if not isinstance(summary, str):
+                    summary = str(summary)
+                key_text = _re.sub(r"[\\d$¥€£,\\.\\s]+", "", summary).lower()
+                dedup_key = (date_part, key_text)
+            except Exception:
+                dedup_key = (item.get("timestamp"), item.get("id"))
+            if dedup_key in grouped:
+                continue
+            grouped.add(dedup_key)
+            uniq.append(item)
+        events = uniq
+    except Exception:
+        pass
+    # Step 3: normalise monetary amounts
+    for item in events:
+        try:
+            normalise_event_amount(item)
+        except Exception:
+            pass
+    try:
+        ev.events = events  # type: ignore[attr-defined]
+    except Exception:
+        pass

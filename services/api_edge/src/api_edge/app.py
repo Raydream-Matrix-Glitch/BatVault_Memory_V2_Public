@@ -22,7 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from api_edge.rate_limit import RateLimitMiddleware
 from core_config import Settings, get_settings
 from core_logging import get_logger, log_stage
-from core_observability.otel import init_tracing, instrument_fastapi_app
+from core_observability.otel import setup_tracing, instrument_fastapi_app
 from core_observability.otel import inject_trace_context
 import core_metrics
 from core_utils.health import attach_health_routes
@@ -56,10 +56,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Initialise tracing before wrapping the application so spans have real IDs
+setup_tracing(os.getenv('OTEL_SERVICE_NAME') or 'api_edge')
 # Ensure OTEL middleware wraps all subsequent middlewares/handlers
 instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'api_edge')
-
-init_tracing(os.getenv("OTEL_SERVICE_NAME") or "api_edge")
 
 def _current_trace_id() -> str | None:
     try:
@@ -338,6 +338,11 @@ async def proxy_bundle_get(request: Request, request_id: str):
     """Proxy GET /v2/bundles/{request_id} to the Gateway."""
     return await _proxy_to_gateway(request, method="GET", path=f"/v2/bundles/{request_id}")
 
+@app.get("/v2/bundles/{request_id}.tar")
+async def proxy_bundle_tar(request: Request, request_id: str):
+    """Proxy GET /v2/bundles/{request_id}.tar to the Gateway."""
+    return await _proxy_to_gateway(request, method="GET", path=f"/v2/bundles/{request_id}.tar")
+
 async def _proxy_to_gateway(request: Request, *, method: str, path: str):
     """
     Internal helper to forward API Edge requests to the Gateway.
@@ -390,11 +395,6 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
                 )
             except Exception:
                 pass
-            # Ensure client is closed on failure.
-            try:
-                await client.aclose()
-            except Exception:
-                pass
             return JSONResponse(status_code=502, content={"detail": "upstream_error"})
         status_code = getattr(upstream, "status_code", 500)
         etag = upstream.headers.get("x-snapshot-etag")
@@ -410,16 +410,10 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
                     bytes_streamed += len(chunk)
                     yield chunk
             finally:
-                # Close upstream response and client once streaming is done.
                 try:
                     await upstream.aclose()
                 except Exception:
                     pass
-                try:
-                    await client.aclose()
-                except Exception:
-                    pass
-                # Log stream metrics at INFO level.
                 try:
                     logger.info(
                         "gateway_proxy_stream",
@@ -462,10 +456,6 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
         )
     except Exception as exc:
         # Upstream failure.
-        try:
-            await client.aclose()
-        except Exception:
-            pass
         logger.warning(
             "gateway_proxy_error",
             extra={
@@ -476,11 +466,10 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
         )
         return JSONResponse(status_code=502, content={"detail": "upstream_error"})
     finally:
-        # Close client after non-streaming call.
-        try:
-            await client.aclose()
-        except Exception:
-            pass
+        # Do not close the shared HTTP client after the request.  The client
+        # instance is process‑wide and closing it here would affect other
+        # concurrent requests.
+        pass
     # Propagate snapshot etag and tracing headers when present.
     extra_headers: Dict[str, str] = {}
     try:

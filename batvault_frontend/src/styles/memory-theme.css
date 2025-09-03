@@ -1,0 +1,144 @@
+/* src/styles/memory-theme.css
+   Theme & Atmosphere for BatVault • Memory
+   - Shared dark radial glow + vignette
+   - Rounded-rectangle segmented toggle
+   - "Neural tree" breathing silhouette
+   - Neon cyan seam for Memory card
+   - Live beacon + section hairlines
+*/
+
+/* Global background helpers (used by MemoryLayout) */
+.memory-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.memory-bg__radial {
+  /* soft cyan radial glow matching Origins/Collective */
+  background:
+    radial-gradient(60% 60% at 50% 20%, rgba(24,247,255,0.10) 0%, rgba(24,247,255,0.0) 70%),
+    radial-gradient(40% 30% at 80% 10%, rgba(255,0,48,0.05) 0%, rgba(255,0,48,0.0) 60%);
+}
+
+.memory-bg__vignette::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(120% 120% at 50% 50%, rgba(0,0,0,0.0) 0%, rgba(0,0,0,0.35) 70%, rgba(0,0,0,0.6) 100%);
+}
+
+/* Breathing "neural tree" silhouette */
+@keyframes breathe {
+  0%, 100% { transform: translate(-50%, -50%) scale(1.00); opacity: 0.12; }
+  50%      { transform: translate(-50%, -50%) scale(1.02); opacity: 0.16; }
+}
+.neural-tree {
+  position: absolute;
+  left: 50%;
+  top: 46%;
+  transform: translate(-50%, -50%);
+  width: min(1100px, 82vw);
+  filter: blur(44px);
+  opacity: 0.14;
+  animation: breathe 6s ease-in-out infinite;
+}
+
+.live-dot {
+  position: relative;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background: #00e0e0; /* neon cyan */
+  box-shadow:
+    0 0 8px rgba(0,224,224,0.9),
+    0 0 16px rgba(0,224,224,0.55);
+}
+@keyframes beaconPulse {
+  0%, 100% { transform: scale(1); opacity: 0.8; }
+  50%      { transform: scale(1.25); opacity: 1; }
+}
+.live-dot--pulse { animation: beaconPulse 3s ease-in-out infinite; }
+
+/* Neon cyan seam for cards */
+.card-neon--cyan {
+  border: 1px solid rgba(24,247,255,0.55);
+  border-radius: 14px; /* 12–16px */
+  box-shadow:
+    0 0 0 1px rgba(24,247,255,0.35),
+    0 0 20px rgba(24,247,255,0.25),
+    0 0 36px rgba(24,247,255,0.15);
+  background: rgba(7, 18, 26, 0.85);
+  backdrop-filter: blur(8px);
+}
+
+/* Section headers: cyan hairline with 8px gap */
+.section-hairline {
+  height: 1px;
+  background: linear-gradient(90deg, rgba(24,247,255,0.6), rgba(24,247,255,0.0));
+  margin-bottom: 8px; /* 8px gap to label */
+}
+
+/* -------- Segmented toggle (Structured / Natural) as rounded rectangles ------- */
+.segmented-pill {
+  display: inline-flex;
+  gap: 8px;
+  background: rgba(255,255,255,0.04);
+  padding: 6px;
+  border-radius: 12px; /* rounded rectangle container */
+  border: 1px solid rgba(255,255,255,0.06);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35);
+}
+.segmented-pill > button {
+  padding: 6px 14px;
+  border-radius: 10px; /* rounded rectangles (not full pills) */
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.18));
+  border: 1px solid rgba(255,255,255,0.06);
+  box-shadow:
+    0 1px 2px rgba(0,0,0,0.35),
+    inset 0 0 16px rgba(0,0,0,0.25);
+  color: #cbd5e1; /* slate-300 */
+  transition: transform 120ms ease, box-shadow 150ms ease, color 120ms ease, background 150ms ease;
+}
+.segmented-pill > button:hover { transform: translateY(-1px); }
+.segmented-pill > button[aria-pressed="true"],
+.segmented-pill > button.is-active {
+  color: #e11d48; /* vault red */
+  border-color: rgba(239,68,68,0.45);
+  box-shadow:
+    0 0 0 1px rgba(239,68,68,0.35),
+    0 0 12px rgba(239,68,68,0.25),
+    inset 0 0 18px rgba(239,68,68,0.08);
+  background: radial-gradient(120% 120% at 50% 50%, rgba(239,68,68,0.15), rgba(0,0,0,0.22));
+}
+
+/* -------- Dark, playful validation hint (below the input) ------- */
+.validation-pop {
+  position: relative;
+  display: inline-block;
+  max-width: 520px;
+  font-size: 12px;
+  line-height: 1.25;
+  color: #e2e8f0; /* slate-200 */
+  background: linear-gradient(180deg, rgba(8,11,14,0.95), rgba(10,14,18,0.95));
+  border: 1px solid rgba(239,68,68,0.55);
+  border-radius: 8px;
+  padding: 8px 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45), 0 0 18px rgba(239,68,68,0.15);
+}
+.validation-pop::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  left: 18px;
+  width: 10px; height: 10px;
+  transform: rotate(45deg);
+  background: inherit;
+  border-left: 1px solid rgba(239,68,68,0.55);
+  border-top: 1px solid rgba(239,68,68,0.55);
+}

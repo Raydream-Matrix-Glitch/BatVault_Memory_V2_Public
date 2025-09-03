@@ -4,15 +4,15 @@ from __future__ import annotations
 import asyncio, hashlib, random
 import re
 
-from typing import Any, Dict, Optional, Tuple
-from contextlib import contextmanager
-from .metrics import counter as _ctr
+from typing import Any, Optional
 
+from .metrics import counter as _ctr
 from gateway.redis import get_redis_pool
 from core_utils import jsonx
 from core_config import get_settings
 from core_logging import get_logger, trace_span
 from core_http.client import fetch_json, get_http_client
+from core_observability.otel import inject_trace_context
 from core_models.models import (
     WhyDecisionAnchor,
     WhyDecisionEvidence,
@@ -21,7 +21,6 @@ from core_models.models import (
 from .budget_gate import authoritative_truncate
 from .selector import bundle_size_bytes
 from core_validator import canonical_allowed_ids
-
 from shared.normalize import normalise_event_amount as _normalise_event_amount
 
 
@@ -296,7 +295,8 @@ class EvidenceBuilder:
                 nonlocal anchor_json, hdr_etag
                 try:
                     resp_anchor = await enrich_client.get(
-                        f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}"
+                        f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}",
+                        headers=inject_trace_context({}),
                     )
                     if hasattr(resp_anchor, "raise_for_status"):
                         resp_anchor.raise_for_status()
@@ -341,7 +341,8 @@ class EvidenceBuilder:
                         try:
                             await asyncio.sleep(random.uniform(0.02, 0.05))
                             retry_resp = await enrich_client.get(
-                                f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}"
+                                f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}",
+                                headers=inject_trace_context({}),
                             )
                             if hasattr(retry_resp, "raise_for_status"):
                                 retry_resp.raise_for_status()
@@ -392,7 +393,9 @@ class EvidenceBuilder:
                 nonlocal neigh, meta
                 try:
                     resp_neigh = await expand_client.post(
-                        f"{settings.memory_api_url}/api/graph/expand_candidates", json=plan
+                        f"{settings.memory_api_url}/api/graph/expand_candidates",
+                        json=plan,
+                        headers=inject_trace_context({}),
                     )
                     if hasattr(resp_neigh, "raise_for_status"):
                         resp_neigh.raise_for_status()
@@ -673,7 +676,7 @@ class EvidenceBuilder:
                         continue
                     path = f"{settings.memory_api_url}/api/enrich/event/{eid}"
                     try:
-                        eresp = await ev_client.get(path)
+                        eresp = await ev_client.get(path, headers=inject_trace_context({}))
                         if hasattr(eresp, "raise_for_status"):
                             eresp.raise_for_status()
                         try:
@@ -743,7 +746,10 @@ class EvidenceBuilder:
                         if decision_id in _title_cache:
                             return _title_cache[decision_id]
                         try:
-                            dresp = await tr_client.get(f"{settings.memory_api_url}/api/enrich/decision/{decision_id}")
+                            dresp = await tr_client.get(
+                                f"{settings.memory_api_url}/api/enrich/decision/{decision_id}",
+                                headers=inject_trace_context({}),
+                            )
                             if hasattr(dresp, "raise_for_status"):
                                 dresp.raise_for_status()
                             try:
@@ -763,7 +769,10 @@ class EvidenceBuilder:
                         tdoc: dict | None = None
                         # Attempt primary fetch
                         try:
-                            resp = await tr_client.get(f"{settings.memory_api_url}/api/enrich/transition/{tid}")
+                            resp = await tr_client.get(
+                                f"{settings.memory_api_url}/api/enrich/transition/{tid}",
+                                headers=inject_trace_context({}),
+                            )
                             if hasattr(resp, "raise_for_status"):
                                 resp.raise_for_status()
                             try:
@@ -808,7 +817,10 @@ class EvidenceBuilder:
                         seen_trans.add(tid)
                         tdoc: dict | None = None
                         try:
-                            resp = await tr_client.get(f"{settings.memory_api_url}/api/enrich/transition/{tid}")
+                            resp = await tr_client.get(
+                                f"{settings.memory_api_url}/api/enrich/transition/{tid}",
+                                headers=inject_trace_context({}),
+                            )
                             if hasattr(resp, "raise_for_status"):
                                 resp.raise_for_status()
                             tdoc = resp.json() or {}
@@ -870,7 +882,10 @@ class EvidenceBuilder:
                 if isinstance(_to_id, str) and _to_id and needs_title:
                     try:
                         _dec_client = get_http_client(timeout_ms=int(settings.timeout_enrich_ms))
-                        dresp = await _dec_client.get(f"{settings.memory_api_url}/api/enrich/decision/{_to_id}")
+                        dresp = await _dec_client.get(
+                            f"{settings.memory_api_url}/api/enrich/decision/{_to_id}",
+                            headers=inject_trace_context({}),
+                        )
                         if hasattr(dresp, "raise_for_status"):
                             dresp.raise_for_status()
                         ddoc = dresp.json() or {}
@@ -1100,9 +1115,12 @@ class EvidenceBuilder:
             client = get_http_client(timeout_ms=50)
             url = f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}"
             try:
-                resp = await client.get(url, headers={"x-cache-etag-check": "1"})
+                resp = await client.get(
+                    url,
+                    headers=inject_trace_context({"x-cache-etag-check": "1"}),
+                )
             except Exception:
-                resp = await client.get(url)
+                resp = await client.get(url, headers=inject_trace_context({}))
             return _extract_snapshot_etag(resp) == cached_etag
         except Exception:
             try:

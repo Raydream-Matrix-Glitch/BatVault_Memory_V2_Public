@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-from typing import Optional
+# Optional was previously imported but never referenced.  Remove unused import.
 
 from core_logging import get_logger
 from .logging_helpers import stage as log_stage
@@ -14,6 +14,8 @@ _logger = get_logger("gateway.load_shed")
 # Cached flag (async-safe)
 _load_shed_flag: ContextVar[bool] = ContextVar("_load_shed_flag", default=False)
 _refresh_task: asyncio.Task | None = None
+_last_log_state: Optional[bool] = None
+_last_log_cycle: int = 0
 
 async def _refresh_loop(period_s: float) -> None:
     """
@@ -39,9 +41,28 @@ async def _refresh_loop(period_s: float) -> None:
                 val = (await res) if hasattr(res, "__await__") else res
             flag = bool(str(val or "").strip() == "1")
             _load_shed_flag.set(flag)
-            log_stage("load_shed", "refresh_cycle",
-                task_id=task_id, cycle=cycle, enabled=flag
-            )
+
+            # Export a simple gauge for dashboards (1.0 when shedding).
+            try:
+                from .metrics import gauge as _gauge  # local import, avoids hard dep at import time
+                _gauge("gateway_load_shed_enabled", 1.0 if flag else 0.0)
+            except Exception:
+                pass
+
+            # Throttle logs: only on state change, or every N cycles (default 60).
+            global _last_log_state, _last_log_cycle
+            try:
+                heartbeat_cycles = int(os.getenv("LOAD_SHED_HEARTBEAT_CYCLES", "60"))
+            except Exception:
+                heartbeat_cycles = 60
+
+            should_log = (flag != _last_log_state) or ((cycle - _last_log_cycle) >= heartbeat_cycles)
+            if should_log:
+                log_stage("load_shed", "refresh_cycle",
+                    task_id=task_id, cycle=cycle, enabled=flag
+                )
+                _last_log_state = flag
+                _last_log_cycle = cycle
         except Exception as e:
             log_stage("load_shed", "refresh_error",
                 task_id=task_id, cycle=cycle, error=str(e)

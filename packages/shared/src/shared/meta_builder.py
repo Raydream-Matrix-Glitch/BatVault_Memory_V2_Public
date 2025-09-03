@@ -59,6 +59,8 @@ def build_meta(inputs: MetaInputs, *, request_id: str) -> MetaInfo:
     # Assemble a dict for construction; we do not modify the original inputs.
     data: Dict[str, Any] = inputs.model_dump(mode="python")
     data["prompt_fingerprint"] = prompt_fp
+    # Surface the request id in the public-safe meta block for the UI.
+    data["request_id"] = request_id
 
     # Instantiate MetaInfo; Pydantic validates and forbids extras.
     meta = MetaInfo(**data)

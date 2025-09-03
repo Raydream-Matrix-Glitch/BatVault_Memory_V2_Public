@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 from core_config.constants import timeout_for_stage
 from ..prompt_messages import build_messages
 from core_http.client import get_http_client
+from core_observability.otel import inject_trace_context
 
 
 def _build_payload(envelope: Dict[str, Any], *, temperature: float, max_tokens: int) -> Dict[str, Any]:
@@ -25,7 +26,7 @@ async def generate_async(endpoint: str, envelope: Dict[str, Any], *, temperature
     url = endpoint.rstrip("/") + "/v1/chat/completions"
     payload = _build_payload(envelope, temperature=temperature, max_tokens=max_tokens)
     client = get_http_client(timeout_ms=int(timeout_for_stage('llm')*1000))
-    r = await client.post(url, json=payload)
+    r = await client.post(url, json=payload, headers=inject_trace_context({}))
     r.raise_for_status()
     data = r.json()
     return str(((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")

@@ -1,24 +1,14 @@
+
 # Web framework & ASGI server
 fastapi>=0.112.0
 uvicorn[standard]>=0.29.0
 anyio>=4.3.0
-
-# HTTP client
 httpx>=0.27.0
-aiohttp>=3.8,<4
 
 # Database / storage drivers
 python-arango>=7.9.1
-importlib-metadata>=6.0
 redis>=5.0.3
 minio>=7.2.7
-
-# -----------------------------------------------------------------------------
-# MinIO’s admin helper (`minioadmin`) started importing Argon2 primitives
-# in v7.2.6.  The library is *not* pulled in automatically, so we make the
-# dependency explicit for every runtime target (ingest, gateway, API-edge,
-# etc.) to prevent import-time failures in seed pipelines and CI.
-# -----------------------------------------------------------------------------
 argon2-cffi>=23.2          # required by minioadmin → crypto.py
 argon2-cffi-bindings>=21.2
 cffi>=1.16
@@ -32,18 +22,12 @@ orjson>=3.9
 
 # Utilities
 python-dateutil>=2.9
-numpy>=1.26
+
+# OpenTelemetry API and SDK are required to emit and propagate traces.
 opentelemetry-api>=1.24
-sentence-transformers>=2.7
 opentelemetry-sdk>=1.24
-opentelemetry-exporter-otlp>=1.24
-six>=1.16
+opentelemetry-exporter-otlp-proto-http>=1.24
+opentelemetry-instrumentation-fastapi>=0.46b0
 
-# ─── API-Edge runtime deps ─────────────────────────────────────────────
-slowapi>=0.1.7               # rate-limiting middleware
+# ─── API‑Edge runtime deps ─────────────────────────────────────────────
 prometheus_client>=0.19      # /metrics endpoint
-
-# Observability
-# Prometheus metric exporter – still in beta, use the 0.* line.
-# 0.57b0 (2025-07-29) is the latest build compatible with Python ≥ 3.9.
-opentelemetry-exporter-prometheus>=0.57b0

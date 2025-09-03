@@ -1,14 +1,14 @@
 from __future__ import annotations
 import time, uuid, os, re
-from typing import Any, Mapping, Tuple, Dict, List
+from typing import Any, Tuple, Dict  # Mapping and List are unused
 
 from core_utils import jsonx
 from core_config import get_settings
 
 import importlib.metadata as _md
-from core_logging import get_logger
+from core_logging import get_logger, trace_span
 from .logging_helpers import stage as log_stage
-from core_utils.fingerprints import canonical_json
+# canonical_json is not used in this module; remove unused import
 from core_models.models import (
     WhyDecisionAnchor,
     WhyDecisionAnswer,
@@ -22,15 +22,12 @@ from core_models.meta_inputs import MetaInputs
 
 from gateway.budget_gate import run_gate
 from shared.normalize import normalise_event_amount as _normalise_event_amount  # promoted helper
+from shared import dedup_and_normalise_events as _shared_dedup_and_normalise_events
 from gateway import selector as _selector
 from gateway.inference_router import last_call as _llm_last_call
 from .prompt_envelope import build_prompt_envelope
-from .templater import deterministic_short_answer
 from .templater import finalise_short_answer
 from core_validator import validate_response as _core_validate_response
-# Import the public canonical helper from core_validator.  This avoids
-# depending on a private underscore‑prefixed function which may change in
-# future releases.
 from core_validator import canonical_allowed_ids
 from gateway.inference_router import call_llm as llm_call
 import gateway.templater as templater
@@ -158,58 +155,7 @@ def _dedup_and_normalise_events(ev: WhyDecisionEvidence) -> None:
 
     The input evidence object is modified in place; no value is returned.
     """
-    try:
-        events = list(ev.events or [])
-    except Exception:
-        return
-    # Step 1: deduplicate by event ID
-    seen_ids: set[str] = set()
-    deduped: list[dict] = []
-    for item in events:
-        try:
-            eid = item.get("id")
-        except Exception:
-            eid = None
-        if eid and eid in seen_ids:
-            continue
-        if eid:
-            seen_ids.add(eid)
-        deduped.append(item)
-    events = deduped
-    # Step 2: deduplicate near‑identical events on the same day
-    try:
-        import re as _re
-        grouped: set[tuple] = set()
-        uniq: list[dict] = []
-        for item in events:
-            try:
-                ts = item.get("timestamp") or ""
-                date_part = ts.split("T")[0] if isinstance(ts, str) else str(ts)[:10]
-                summary = item.get("summary") or item.get("description") or ""
-                if not isinstance(summary, str):
-                    summary = str(summary)
-                # Remove digits, currency symbols and punctuation; collapse whitespace
-                key_text = re.sub(r"[\d$¥€£,\.\s]+", "", summary).lower()
-                dedup_key = (date_part, key_text)
-            except Exception:
-                dedup_key = (item.get("timestamp"), item.get("id"))
-            if dedup_key in grouped:
-                continue
-            grouped.add(dedup_key)
-            uniq.append(item)
-        events = uniq
-    except Exception:
-        pass
-    # Step 3: normalise monetary amounts
-    for item in events:
-        try:
-            _normalise_event_amount(item)
-        except Exception:
-            pass
-    try:
-        ev.events = events
-    except Exception:
-        pass
+    return _shared_dedup_and_normalise_events(ev)
 
 class _LruTTLCache:
     def __init__(self, max_items: int = 200, ttl_seconds: int = 600):
@@ -261,6 +207,7 @@ from .load_shed import should_load_shed
 
 
 # ───────────────────── main entry-point ─────────────────────────
+@trace_span("builder", logger=logger)
 async def build_why_decision_response(
     req: "AskIn",                          # forward-declared (defined in app.py)
     evidence_builder,                      # EvidenceBuilder instance (singleton passed from app.py)
@@ -311,11 +258,12 @@ async def build_why_decision_response(
             ev.transitions.succeeding = None  # type: ignore
     except Exception:
         pass
-    arte["evidence_pre.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True))
+    arte["evidence_pre.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)).encode()
 
     # ── deterministic plan stub (needed for audit contract) ────────────
     plan_dict = {"node_id": ev.anchor.id, "k": 1}
-    arte["plan.json"] = jsonx.dumps(plan_dict)
+    # Store the deterministic plan stub as bytes for artefacts persistence.
+    arte["plan.json"] = jsonx.dumps(plan_dict).encode()
 
     # ---- Gate: single budgeting authority (renders messages + max_tokens) ----
     # We compute canonical allowed_ids first to give the gate a stable envelope,
@@ -349,7 +297,7 @@ async def build_why_decision_response(
                   error=str(e), request_id=getattr(req, "request_id", None))
         raise
     # Persist the final evidence with empty collections omitted
-    arte["evidence_final.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True))
+    arte["evidence_post.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)).encode()
     try:
         log_stage("builder", "evidence_final_persisted",
                   request_id=req_id,
@@ -364,22 +312,32 @@ async def build_why_decision_response(
         s = _get_settings()
         registry_url = getattr(s, "policy_registry_url", None)
         if registry_url:
-            from .schema_cache import fetch_policy_registry as _fetch_policy_registry
-            await _fetch_policy_registry()
-            try:
-                log_stage("schema", "policy_registry_warmed", request_id=req_id, url=registry_url)
-            except Exception:
-                pass
+            from .schema_cache import (
+                fetch_policy_registry as _fetch_policy_registry,
+                get_cached as _get_cached,
+            )
+            # See if we already have a cached policy registry; if not, fetch it.
+            _cached, _ = _get_cached("/api/policy/registry")
+            if _cached is None:
+                await _fetch_policy_registry()
+                try:
+                    log_stage("schema", "policy_registry_warmed", request_id=req_id, url=registry_url)
+                except Exception:
+                    pass
+            else:
+                try:
+                    log_stage("schema", "policy_registry_cache_hit", request_id=req_id)
+                except Exception:
+                    pass
         else:
-            # Central registry not configured; this is expected in dev/local.
             try:
                 log_stage("schema", "policy_registry_warm_skipped", request_id=req_id)
             except Exception:
                 pass
     except Exception:
-        # Non-fatal: fall back to local file in prompt_envelope loader
         try:
-            log_stage("schema", "policy_registry_warm_failed", request_id=req_id, url=registry_url)
+            # Do not reference registry_url here – it may not be set on exceptions.
+            log_stage("schema", "policy_registry_warm_failed", request_id=req_id)
         except Exception:
             pass
     pre_envelope = build_prompt_envelope(
@@ -422,7 +380,7 @@ async def build_why_decision_response(
             ev.transitions.succeeding = None  # type: ignore
     except Exception:
         pass
-    arte["evidence_post.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True))
+    arte["evidence_post.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)).encode()
     # ── Events Policy E: show a few, keep all (response up to 10; count & truncate flags) ──
     try:
         _full_events_for_policy = list(ev.events or [])
@@ -491,11 +449,17 @@ async def build_why_decision_response(
         settings = get_settings()
         # Spec: “LLM does one thing only … and only when llm_mode != off”
         # Values: off|on|auto (treat auto as on here; routing still handles load-shed)
-        use_llm = (settings.llm_mode or "off").lower() != "off"
+        from .load_shed import should_load_shed
+        use_llm = ((settings.llm_mode or "off").lower() != "off") and (not should_load_shed())
         # Strategic log (B5 envelope): makes the gate visible in traces & audit
         try:
-            log_stage("prompt", "llm_gate", llm_mode=settings.llm_mode, use_llm=use_llm)
-
+            log_stage("prompt", "llm_gate",
+                      llm_mode=settings.llm_mode,
+                      load_shed=should_load_shed(),
+                      use_llm=use_llm)
+            if not use_llm and should_load_shed():
+                # Strategic breadcrumb for the Audit Drawer
+                log_stage("llm", "shed", reason="load_shed_flag", request_id=req_id)
         except Exception:
             pass
         # If the LLM is explicitly disabled by config, record that clearly and mark fallback.
@@ -541,7 +505,7 @@ async def build_why_decision_response(
                 raw_json = None
             # No explicit retry loop here; llm_call delegates retries.
             retry_count = max_retries
-        # Determine whether this is a fallback: if we didn't call the LLM
+        # Determine whether this is a fallback: if the LLM did not run
         # (use_llm is false) or summarise_json returned no result.
         if raw_json is None:
             # The LLM did not run or returned no result.  Always mark this as a fallback
@@ -559,22 +523,39 @@ async def build_why_decision_response(
                     # Fall back to a local sanitiser and an empty last_call
                     imported_last_call = {}
                     def sanitize_fn(reason: str | None) -> str:
+                        """
+                        Local sanitiser used when the gateway.llm module cannot be imported.
+                        Empty or unknown reasons indicate the model was unavailable; return
+                        ``llm_unavailable`` in that case.  Preserve HTTP-related reasons
+                        as ``http_error`` for observability.
+                        """
                         if not reason:
-                            return "no_raw_json"
+                            return "llm_unavailable"
                         r = str(reason).strip().lower()
-                        allowed = {"llm_off", "endpoint_unreachable", "timeout",
-                                   "http_error", "parse_error", "stub_answer",
-                                   "no_raw_json"}
+                        allowed = {
+                            "llm_off",
+                            "endpoint_unreachable",
+                            "timeout",
+                            "http_error",
+                            "parse_error",
+                            "stub_answer",
+                            "no_raw_json",
+                            "llm_unavailable",
+                        }
                         if r in allowed:
                             return r
-                        return "http_error" if "http" in r else "no_raw_json"
-                error_code = imported_last_call.get('error_code') if isinstance(imported_last_call, dict) else None
+                        return "http_error" if "http" in r else "llm_unavailable"
+                error_code = imported_last_call.get("error_code") if isinstance(imported_last_call, dict) else None
                 fallback_reason = sanitize_fn(error_code)
-                # Strategic log: immediate fallback decision (+ environment for audit)
+                # Strategic log: immediate fallback decision (+ environment for audit).
+                # When no error code is present default to ``llm_unavailable`` so
+                # clients know the model was unreachable (replaces “no_raw_json”).
                 try:
-                    log_stage("llm", "fallback_decision",
+                    log_stage(
+                        "llm",
+                        "fallback_decision",
                         request_id=req_id,
-                        reason=(_llm_last_call.get("error_code") or "no_raw_json"),
+                        reason=(_llm_last_call.get("error_code") or "llm_unavailable"),
                         openai_disabled=getattr(s, "openai_disabled", False),
                         canary_pct=getattr(s, "canary_pct", 0),
                         control=getattr(s, "control_model_endpoint", ""),
@@ -583,9 +564,11 @@ async def build_why_decision_response(
                 except Exception:
                     pass
                 if not fallback_reason:
-                    fallback_reason = "no_raw_json"
+                    # Default to a clear unavailability marker rather than the opaque
+                    # legacy “no_raw_json”.
+                    fallback_reason = "llm_unavailable"
             else:
-                # No LLM expected; if no explicit reason already set assign llm_off
+                # No LLM expected; if no explicit reason already set assign ``llm_off``
                 if not fallback_reason:
                     fallback_reason = "llm_off"
             # Same richer supporting_ids logic for the “no raw_json” branch
@@ -801,8 +784,29 @@ async def build_why_decision_response(
                   snapshot_etag=snapshot_etag_fp)
 
     # ── persist artefacts ───────────────────────────────────────────
-    arte["envelope.json"] = jsonx.dumps(envelope)
-    arte["validator_report.json"] = jsonx.dumps({"errors": errs})
+    arte["envelope.json"] = jsonx.dumps(envelope).encode()
+    # Build a concise validator report summarising unknown keys removed.
+    _unk_anchor_r: set[str] = set()
+    _unk_event_r: set[str] = set()
+    _unk_trans_r: set[str] = set()
+    for _ve in (errs or []):
+        _code = _ve.get("code")
+        _det = _ve.get("details") or {}
+        _rem = _det.get("removed_keys") or []
+        if _code == "unknown_anchor_keys_stripped":
+            _unk_anchor_r.update(_rem)
+        elif _code == "unknown_event_keys_stripped":
+            _unk_event_r.update(_rem)
+        elif _code == "unknown_transition_keys_stripped":
+            _unk_trans_r.update(_rem)
+    _validator_report: Dict[str, Any] = {}
+    if _unk_event_r:
+        _validator_report["unknown_event_keys_removed"] = sorted(_unk_event_r)
+    if _unk_trans_r:
+        _validator_report["unknown_transition_keys_removed"] = sorted(_unk_trans_r)
+    if _unk_anchor_r:
+        _validator_report["unknown_anchor_keys_removed"] = sorted(_unk_anchor_r)
+    arte["validator_report.json"] = jsonx.dumps(_validator_report).encode()
     arte.setdefault("llm_raw.json", b"{}")
 
     # Determine gateway version with environment override
@@ -972,5 +976,27 @@ async def build_why_decision_response(
         bundle_url=bundle_url,
     )
     arte["response.json"]         = resp.model_dump_json().encode()
-    arte["validator_report.json"] = jsonx.dumps({"errors": errs}).encode("utf-8")
+    # Duplicate the concise report for the final bundle so downstream consumers
+    # receive a lean summary of unknown keys removed.
+    _unk_anchor_f: set[str] = set()
+    _unk_event_f: set[str] = set()
+    _unk_trans_f: set[str] = set()
+    for _ve in (errs or []):
+        _code = _ve.get("code")
+        _det = _ve.get("details") or {}
+        _rem = _det.get("removed_keys") or []
+        if _code == "unknown_anchor_keys_stripped":
+            _unk_anchor_f.update(_rem)
+        elif _code == "unknown_event_keys_stripped":
+            _unk_event_f.update(_rem)
+        elif _code == "unknown_transition_keys_stripped":
+            _unk_trans_f.update(_rem)
+    _validator_report_f: Dict[str, Any] = {}
+    if _unk_event_f:
+        _validator_report_f["unknown_event_keys_removed"] = sorted(_unk_event_f)
+    if _unk_trans_f:
+        _validator_report_f["unknown_transition_keys_removed"] = sorted(_unk_trans_f)
+    if _unk_anchor_f:
+        _validator_report_f["unknown_anchor_keys_removed"] = sorted(_unk_anchor_f)
+    arte["validator_report.json"] = jsonx.dumps(_validator_report_f).encode("utf-8")
     return resp, arte, req_id

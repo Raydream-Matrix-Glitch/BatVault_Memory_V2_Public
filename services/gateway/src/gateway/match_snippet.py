@@ -2,7 +2,7 @@ from __future__ import annotations
 import re
 import html
 import hashlib
-from typing import Iterable, Optional, Dict, Any
+from typing import Optional, Dict, Any
 
 from core_logging import get_logger
 from .logging_helpers import stage as log_stage
@@ -78,7 +78,25 @@ def make_snippet(query: str, match: Dict[str, Any]) -> str:
 def build_match_snippet(match: Dict[str, Any], query: str) -> str:
     """Compatibility shim for older imports.
 
-    Old code calls ``build_match_snippet(match, query)``; the new
-    implementation exposes :func:`make_snippet(query, match)`.
-    This wrapper preserves the old name and argument order.
-    return make_snippet(query, match)"""
+    Old code calls ``build_match_snippet(match, query)`` with arguments
+    ``(match, query)``.  Internally our canonical implementation exposes
+    :func:`make_snippet(query, match)` (note the argument order).  This
+    wrapper preserves the legacy call signature and forwards to
+    :func:`make_snippet` with the correct ordering.
+
+    Parameters
+    ----------
+    match: Dict[str, Any]
+        The match object containing at least an ``id`` and primary text fields.
+    query: str
+        The query string used to highlight matching terms.
+
+    Returns
+    -------
+    str
+        A short HTML-safe snippet highlighting occurrences of query terms.
+    """
+    # Delegate to the canonical make_snippet implementation, swapping
+    # the argument order to match the new API.  This maintains backward
+    # compatibility without duplicating logic.
+    return make_snippet(query, match)

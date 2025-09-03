@@ -6,22 +6,11 @@ export interface CardProps {
   children: React.ReactNode;
 }
 
-/**
- * A dark panel with subtle border and neon glows. Use this to group
- * related content on the Memory page.
- */
-const Card: React.FC<CardProps> = ({ className, children }) => {
-  return (
-    <div
-      className={clsx(
-        // glassy backdrop with subtle red border and neon glow
-        "bg-surface border border-vaultred/30 rounded-md p-4 shadow-neon-red backdrop-blur-md",
-        className
-      )}
-    >
-      {children}
-    </div>
-  );
-};
+/** Soft-glow panel with a thin cyan seam, matching Collective’s login panel. */
+const Card: React.FC<CardProps> = ({ className, children }) => (
+  <div className={clsx("card-neon--cyan p-6 md:p-8 relative", className)}>
+    {children}
+  </div>
+);
 
 export default Card;

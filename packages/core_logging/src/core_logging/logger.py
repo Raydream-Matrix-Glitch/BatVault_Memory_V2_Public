@@ -307,7 +307,13 @@ class _TraceSpan:
                 ctx = self._span.get_span_context()  # type: ignore[attr-defined]
                 # Bind only **valid** (non-zero) OTEL IDs; otherwise leave unbound
                 if getattr(ctx, "trace_id", 0):
-                    _TRACE_IDS.set((f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"))
+                    # Capture the current context before overwriting it so it can be restored on exit.
+                    try:
+                        # _TRACE_IDS.set returns a Token that can be used to restore the previous value.
+                        self._trace_token = _TRACE_IDS.set((f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"))
+                    except Exception:
+                        # If contextvars are not supported use a no-op sentinel.
+                        self._trace_token = None
             except Exception:
                 pass
         except Exception:
@@ -330,8 +336,16 @@ class _TraceSpan:
             if self._otel_cm:
                 self._otel_cm.__exit__(exc_type, exc, tb)  # type: ignore[union-attr]
         finally:
+            # Restore any previously bound trace ids on exit.  When a token
+            # exists (set during __enter__), reset will revert to the prior
+            # context rather than clearing unconditionally.  If no token
+            # exists (e.g. OTEL span not recording), this is a no-op.
             try:
-                _TRACE_IDS.set((None, None))
+                if self._trace_token is not None:
+                    _TRACE_IDS.reset(self._trace_token)  # type: ignore[arg-type]
+                else:
+                    # When no token was set, fall back to clearing the ids.
+                    _TRACE_IDS.set((None, None))
             except Exception:
                 pass
 

@@ -104,13 +104,25 @@ _ALLOWED_FALLBACKS = {
     "http_error",
     "parse_error",
     "stub_answer",
-    "no_raw_json",
+    "no_raw_json",     # historic placeholder (no longer emitted)
+    "llm_unavailable", # new default when the model is unreachable
 }
 def _sanitize_reason(reason: str | None) -> str:
+    """
+    Normalise the raw error reason from an LLM invocation to a stable set
+    of fallback codes.  Empty or unknown reasons indicate the model was
+    unreachable and default to ``llm_unavailable``.  HTTP errors are
+    preserved as ``http_error`` for observability.
+    """
+    # No reason → model unavailable (previously “no_raw_json”)
     if not reason:
-        return "no_raw_json"
+        return "llm_unavailable"
     r = str(reason).strip().lower()
-    return r if r in _ALLOWED_FALLBACKS else ("http_error" if "http" in r else "no_raw_json")
+    # Pass through known reasons unchanged
+    if r in _ALLOWED_FALLBACKS:
+        return r
+    # Preserve HTTP semantics; otherwise treat as unavailable
+    return "http_error" if "http" in r else "llm_unavailable"
 
 async def _invoke_adapter(endpoint: str,
                           envelope: Dict[str, Any],

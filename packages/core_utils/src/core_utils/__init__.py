@@ -14,5 +14,6 @@ __all__ = [
     "generate_request_id",
     "slugify_tag",
     "stream_answer_with_final","stream_chunks",
+    "jsonx",
 ]
 

@@ -4,7 +4,7 @@ from fastapi.responses import JSONResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span
-from core_observability.otel import init_tracing, instrument_fastapi_app
+from core_observability.otel import setup_tracing, instrument_fastapi_app
 from core_observability.otel import inject_trace_context
 from core_storage import ArangoStore
 from core_utils.health import attach_health_routes
@@ -30,10 +30,10 @@ settings = get_settings()
 logger = get_logger("memory_api")
 logger.propagate = False
 app = FastAPI(title="BatVault Memory_API", version="0.1.0")
+# Initialise tracing before wrapping the application so spans have real IDs
+setup_tracing(os.getenv('OTEL_SERVICE_NAME') or 'memory_api')
 # Ensure OTEL middleware wraps all subsequent middlewares/handlers
 instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'memory_api')
-
-init_tracing(os.getenv("OTEL_SERVICE_NAME") or "memory_api")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

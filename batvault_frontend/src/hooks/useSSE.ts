@@ -31,7 +31,10 @@ export function useSSE() {
       // development. They short‑circuit network calls when the payload
       // contains sentinel values. Keep these in sync with tests.
       // ----------------------------------------------------------------------
-      if ((body as any).decision_ref === "mockaudit" || (body as any).text === "mockaudit") {
+      if (
+        (body as any).anchor_id === "mockaudit" ||
+        (body as any).decision_ref === "mockaudit" || (body as any).text === "mockaudit"
+      ) {
         setTimeout(() => {
           setTokens([]);
           setFinalData({

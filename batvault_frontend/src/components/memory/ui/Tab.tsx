@@ -16,10 +16,10 @@ const Tab: React.FC<TabProps> = ({ active, onClick, className, children }) => (
   <button
     onClick={onClick}
     className={clsx(
-      "px-3 py-2 border-b-2 font-medium transition-colors",
+      "px-3 py-1 font-medium transition-colors rounded-md",
       active
-        ? "border-vaultred text-vaultred"
-        : "border-transparent text-copy hover:text-vaultred hover:border-vaultred",
+        ? "bg-black/50 text-vaultred border border-vaultred/50"
+        : "text-copy border border-transparent hover:text-vaultred hover:border-vaultred/30 hover:bg-black/40",
       className
     )}
   >

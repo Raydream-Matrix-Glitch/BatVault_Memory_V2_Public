@@ -55,6 +55,8 @@ class MetaInfo(BaseModel):
     Canonical, JSON-first meta block (single source of truth).
     Exactly one occurrence per field; validated before serialization.
     """
+    # Request identifier for correlating bundles and presigns
+    request_id: Optional[str] = None
     policy_id: str
     prompt_id: str
     prompt_fingerprint: str  # "sha256:<hex>"

@@ -65,8 +65,9 @@ USER appuser
 # Import local modules without installing them.
 # Also include the current service's src folder so `python -m <svc>.__main__`
 # works consistently for all src-layout services.
-# Make all service packages importable from one shared image.
-ENV PYTHONPATH="/app:/app/packages:/app/services/api_edge/src:/app/services/gateway/src:/app/services/ingest/src:/app/services/memory_api/src:/app/services"
+# Provide import shim and allow it to inject every */src dir deterministically.
+COPY sitecustomize.py ./sitecustomize.py
+ENV PYTHONPATH="/app"
 
 # -------- metrics ----------------------------------------------------------
 # Prometheus reader for OTEL metrics (harmless locally without a collector)

@@ -1,10 +1,9 @@
 import sys, os, glob, re, time, argparse, hashlib
-from core_utils import jsonx
 from importlib import resources 
 from jsonschema import Draft202012Validator
-from core_logging import get_logger, log_stage, trace_span
-from core_observability.otel import init_tracing
-from core_utils import compute_snapshot_etag_for_files, slugify_id
+from core_logging import get_logger, log_stage, trace_span, log_event
+from core_observability.otel import setup_tracing
+from core_utils import compute_snapshot_etag_for_files, slugify_id, jsonx
 from core_storage import ArangoStore
 from core_config import get_settings
 from .pipeline.normalize import normalize_decision, normalize_event, normalize_transition, derive_backlinks
@@ -14,6 +13,7 @@ from .catalog.field_catalog import build_field_catalog, build_relation_catalog
 
 
 logger = get_logger("ingest-cli")
+log_event(logger, "json_parser_selected", parser="core_utils.jsonx", fallback=False)
 settings = get_settings()
 
 # ------------------------------------------------------------------
@@ -197,7 +197,7 @@ def seed(path: str) -> int:
     ensure_bucket(minio_client, "batvault-snapshots", 30)
     blob = gzip.compress(jsonx.dumps({"decisions": decisions,
                                        "events": events,
-                                       "transitions": transitions}))
+                                       "transitions": transitions}).encode("utf-8"))
     obj_name = f"{snapshot_etag}.json.gz"
     minio_client.put_object("batvault-snapshots", obj_name,
                             io.BytesIO(blob), length=len(blob),
@@ -257,7 +257,7 @@ def main() -> None:
     args = parser.parse_args()
     # Initialise tracing for CLI runs (no-op if OTEL not installed)
     try:
-        init_tracing('ingest-cli')
+        setup_tracing('ingest-cli')
     except Exception:
         pass
 

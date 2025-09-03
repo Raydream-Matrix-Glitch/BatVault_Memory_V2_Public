@@ -270,3 +270,109 @@ def inject_trace_context(headers: Optional[Dict[str, str]] = None) -> Dict[str, 
     if _tid and not any(k.lower() == "x-trace-id" for k in hdrs.keys()):
         hdrs["x-trace-id"] = _tid
     return hdrs
+
+# ---------------------------------------------------------------------------
+# Unified tracing setup
+# ---------------------------------------------------------------------------
+_tracing_setup_done: bool = False
+
+def _normalize_http_endpoint(ep: str) -> str:
+    # Ensure HTTP exporter endpoints include the '/v1/traces' suffix.
+    try:
+        if ep.endswith("/v1/traces"):
+            return ep
+        # Strip trailing slashes and append standard path
+        return ep.rstrip("/") + "/v1/traces"
+    except Exception:
+        return ep
+
+def setup_tracing(service_name: str) -> None:
+    """
+    Configure a global OpenTelemetry tracer provider with HTTP OTLP exporter.
+
+    This helper is idempotent: repeated calls do nothing after the first.
+    It builds a Resource containing service.name and optional deployment.environment,
+    installs a TracerProvider with a BatchSpanProcessor and OTLP HTTP exporter,
+    registers it globally, and emits a one‑time structured log line indicating
+    whether OTEL is active and which protocol/endpoint is used.
+
+    If the OTLP exporter cannot be imported or created, a provider is still
+    registered (with no exporter) so that spans acquire non‑zero IDs.  In that
+    case the emitted log line reports ``otel_present`` as ``false``.
+    """
+    global _tracing_setup_done
+    if _tracing_setup_done:
+        return
+    _tracing_setup_done = True
+    otel_present = False
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318")
+    # Build the base provider and attempt to attach an HTTP exporter
+    try:
+        from opentelemetry import trace as _trace  # type: ignore
+        from opentelemetry.sdk.resources import Resource  # type: ignore
+        from opentelemetry.sdk.trace import TracerProvider  # type: ignore
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor  # type: ignore
+        # Import the HTTP OTLP exporter; may fail if dependency is missing
+        try:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (  # type: ignore
+                OTLPSpanExporter,
+            )
+        except Exception:
+            OTLPSpanExporter = None  # type: ignore
+
+        # Build resource with service name and optional deployment environment
+        attrs = {"service.name": service_name}
+        try:
+            env = (
+                os.getenv("DEPLOYMENT_ENVIRONMENT")
+                or os.getenv("OTEL_DEPLOYMENT_ENVIRONMENT")
+                or os.getenv("DEPLOYMENT")
+                or None
+            )
+            if env:
+                attrs["deployment.environment"] = env
+        except Exception:
+            pass
+        res = Resource.create(attrs)
+        tp = TracerProvider(resource=res)
+        # Attempt to construct and attach the exporter
+        if OTLPSpanExporter is not None:
+            try:
+                exporter = OTLPSpanExporter(endpoint=_normalize_http_endpoint(endpoint))
+                tp.add_span_processor(BatchSpanProcessor(exporter))
+                otel_present = True
+            except Exception:
+                # Failed to instantiate exporter; proceed without exporting spans
+                otel_present = False
+        # Register the provider globally regardless of exporter availability
+        try:
+            _trace.set_tracer_provider(tp)
+            # Prefer W3C trace context propagation globally
+            try:
+                from opentelemetry.propagate import set_global_textmap  # type: ignore
+                from opentelemetry.propagators.tracecontext import (  # type: ignore
+                    TraceContextTextMapPropagator,
+                )
+                set_global_textmap(TraceContextTextMapPropagator())
+            except Exception:
+                pass
+        except Exception:
+            # Could not register provider; do not blow up
+            pass
+    except Exception:
+        # opentelemetry isn't installed; nothing more to do
+        otel_present = False
+    # Emit a one‑shot observability log indicating tracing status
+    try:
+        from core_logging import get_logger, log_stage  # type: ignore
+        _ob_logger = get_logger(service_name or os.getenv("OTEL_SERVICE_NAME") or "app")
+        log_stage(
+            _ob_logger,
+            "observability",
+            "tracing_setup",
+            otel_present=otel_present,
+            protocol="http",
+            endpoint=endpoint,
+        )
+    except Exception:
+        pass

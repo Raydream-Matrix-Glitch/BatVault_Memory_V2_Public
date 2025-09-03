@@ -1,36 +1,38 @@
 import asyncio, functools, io, os, time, inspect
 from typing import List, Optional, Any
-import importlib.metadata as _md
+# importlib.metadata was previously imported to expose version information on the API,
+# but the value was never referenced.  Remove the unused import to avoid confusion.
 
 from core_utils import jsonx
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from core_utils.sse import stream_answer_with_final
+from core_utils.sse import stream_answer_with_final, stream_chunks
+from core_storage.artifact_index import build_bundle_and_meta, upload_bundle_and_meta
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
-from core_utils.ids import compute_request_id
+from core_utils.ids import compute_request_id, generate_request_id
 
 # Internal packages
 from core_config import get_settings
-from core_config.constants import (
-    TTL_SCHEMA_CACHE_SEC as _SCHEMA_TTL_SEC,
-)
+# TTL_SCHEMA_CACHE_SEC is unused in this module; it can be imported directly by
+# consumers that need it.  Avoid bringing unused constants into this scope.
 from core_logging import get_logger, bind_trace_ids, trace_span
 from .logging_helpers import stage as log_stage
-from core_observability.otel import init_tracing, instrument_fastapi_app
+from core_observability.otel import setup_tracing, instrument_fastapi_app
 from .metrics import (
     counter as metric_counter,
     histogram as metric_histogram,
-    gauge   as metric_gauge,
 )
 from core_models.models import (
     WhyDecisionAnswer, WhyDecisionEvidence,
     WhyDecisionResponse
 )
-from core_utils.fingerprints import canonical_json
+# canonical_json is unused here; rely on the builder and other modules to handle
+# canonical JSON processing.
 from core_utils.health import attach_health_routes
-from core_utils.ids import generate_request_id
+# generate_request_id is unused; compute_request_id provides the required request
+# identifier in this module.
 from core_storage.minio_utils import ensure_bucket as ensure_minio_bucket
 from core_validator import validate_response
 # Import the public canonical helper rather than the private underscore version.
@@ -39,16 +41,17 @@ from core_validator import canonical_allowed_ids
 from . import evidence
 from .evidence import EvidenceBuilder
 from .schema_cache import fetch_schema
-from core_http.client import fetch_json
+# fetch_json is unused in this module; schema retrieval goes through schema_cache.
 from .load_shed import should_load_shed, start_background_refresh, stop_background_refresh
 from .builder import build_why_decision_response
 from .builder import BUNDLE_CACHE
-from core_utils.sse import stream_chunks
 from core_config.constants import TIMEOUT_SEARCH_MS, TIMEOUT_EXPAND_MS
 
 # ---- Configuration & globals ----------------------------------------------
 settings        = get_settings()
-logger          = get_logger("gateway"); logger.propagate = True
+logger          = get_logger("gateway"); logger.propagate = False
+
+_LOG_NO_ACTIVE_SPAN = os.getenv('GATEWAY_DEBUG_NO_ACTIVE_SPAN') == '1'
 
 _SEARCH_MS      = TIMEOUT_SEARCH_MS
 _EXPAND_MS      = TIMEOUT_EXPAND_MS
@@ -57,13 +60,47 @@ _EXPAND_MS      = TIMEOUT_EXPAND_MS
 app    = FastAPI(title="BatVault Gateway", version="0.1.0")
 router = APIRouter(prefix="/v2")
 
+# Initialise tracing before wrapping the application so spans have real IDs
+setup_tracing(os.getenv('OTEL_SERVICE_NAME') or 'gateway')
+# Ensure OTEL middleware wraps all subsequent middlewares/handlers
 instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'gateway')
+
+# ---------------------------------------------------------------------------
+# Startup hooks
+# ---------------------------------------------------------------------------
+
+# Warm the policy registry once at startup.  The registry contains prompt
+# policy definitions used for envelope construction.  Warming it here
+# prevents repeated synchronous file I/O on the hot request path and
+# ensures deterministic performance.  Any errors are logged but do not
+# prevent startup.
+@app.on_event("startup")
+async def _warm_policy_registry() -> None:  # pragma: no cover - startup hook
+    try:
+        from gateway.schema_cache import fetch_policy_registry  # local import to avoid circular
+        from core_config import get_settings as _get_settings
+        s = _get_settings()
+        registry_url = getattr(s, "policy_registry_url", None)
+        if registry_url:
+            await fetch_policy_registry()
+            try:
+                log_stage("schema", "policy_registry_warmed", url=registry_url)
+            except Exception:
+                pass
+        else:
+            try:
+                log_stage("schema", "policy_registry_warm_skipped")
+            except Exception:
+                pass
+    except Exception as exc:
+        try:
+            log_stage("schema", "policy_registry_warm_failed", error=str(exc))
+        except Exception:
+            pass
+        return
 
 # ---- Evidence builder & caches --------------------------------------------
 _evidence_builder = EvidenceBuilder()
-
-# ---- Tracing init (kept as-is) --------------------------------------------
-init_tracing("gateway")
 
 # ---- Proxy helpers (router / resolver) ------------------------------------
 async def route_query(*args, **kwargs):  # pragma: no cover - proxy
@@ -110,6 +147,55 @@ def minio_client():
 
 _bucket_prepared: bool = False
 
+def _minio_get_batch(request_id: str) -> dict[str, bytes] | None:
+    """Fetch all artefacts for a request from MinIO as a {name: bytes} dict.
+
+    Returns None when MinIO is not configured or nothing found under the prefix.
+    Emits strategic logs but never raises to keep call sites simple.
+    """
+    client = minio_client()
+    if client is None:
+        log_stage("artifacts", "minio_get_noop_enabled", request_id=request_id)
+        return None
+    try:
+        prefix = f"{request_id}/"
+        # list_objects is a generator
+        objects = list(client.list_objects(settings.minio_bucket, prefix=prefix, recursive=True))
+        if not objects:
+            log_stage("artifacts", "minio_get_empty", request_id=request_id, prefix=prefix)
+            return None
+        out: dict[str, bytes] = {}
+        for obj in objects:
+            try:
+                resp = client.get_object(settings.minio_bucket, obj.object_name)
+                try:
+                    data = resp.read()
+                finally:
+                    resp.close()
+                    resp.release_conn()
+                # normalise to just the filename part (after the request_id/ prefix)
+                name = obj.object_name[len(prefix):] if obj.object_name.startswith(prefix) else obj.object_name
+                out[name] = data
+            except Exception as exc:
+                # carry on; partial bundles are acceptable but we log them
+                log_stage("artifacts", "minio_get_object_failed",
+                          request_id=request_id, object=obj.object_name, error=str(exc))
+        return out or None
+    except Exception as exc:
+        log_stage("artifacts", "minio_get_batch_failed", request_id=request_id, error=str(exc))
+        return None
+
+def _load_bundle_dict(request_id: str) -> dict[str, bytes] | None:
+    """Load the bundle either from the hot in-memory cache or MinIO.
+
+    Returns a {filename: bytes} mapping, or None when neither source has it.
+    """
+    bundle = BUNDLE_CACHE.get(request_id)
+    if bundle:
+        return bundle
+    # Fallback to object storage
+    return _minio_get_batch(request_id)
+
 def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
     client = minio_client()
     if client is None:
@@ -148,6 +234,14 @@ def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
     log_stage("artifacts", "minio_put_batch_ok",
               request_id=request_id, count=len(artefacts), bytes_total=total_bytes)
 
+    # Build and upload a compact bundle and sidecar meta so MinIO shows size/last-modified
+    try:
+        bundle_bytes, meta_bytes = build_bundle_and_meta(artefacts)
+        upload_bundle_and_meta(client, settings.minio_bucket, request_id, bundle_bytes, meta_bytes)
+    except Exception as exc:
+        # Non-fatal, emit structured warning and continue
+        log_stage("artifacts", "index_build_or_upload_failed", request_id=request_id, error=str(exc))
+
 async def _minio_put_batch_async(
     request_id: str,
     artefacts: dict[str, bytes],
@@ -157,20 +251,27 @@ async def _minio_put_batch_async(
     timeout_sec = timeout_sec or settings.minio_async_timeout
     loop = asyncio.get_running_loop()
     try:
+        import contextvars  # local import to avoid cost on cold paths
+        ctx = contextvars.copy_context()
+        func = functools.partial(_minio_put_batch, request_id, artefacts)
+        wrapped = lambda: ctx.run(func)
         await asyncio.wait_for(
-            loop.run_in_executor(
-                None, functools.partial(_minio_put_batch, request_id, artefacts)
-            ),
+            loop.run_in_executor(None, wrapped),
             timeout=timeout_sec,
         )
     except asyncio.TimeoutError:
-        log_stage("artifacts", "minio_put_batch_timeout",
-            request_id=request_id, timeout_ms=int(timeout_sec * 1000),
+        log_stage(
+            "artifacts",
+            "minio_put_batch_timeout",
+            request_id=request_id,
+            timeout_ms=int(timeout_sec * 1000),
         )
     except Exception as exc:
         log_stage(
-            "artifacts", "minio_put_batch_failed",
-            request_id=request_id, error=str(exc),
+            "artifacts",
+            "minio_put_batch_failed",
+            request_id=request_id,
+            error=str(exc),
         )
 
 # ---- Request logging & counters middleware ---------------------------------
@@ -188,8 +289,18 @@ async def request_logging_middleware(request: Request, call_next):
                 pass
         else:
             # Strategic signal: no active span (e.g., OTEL not initialized) – rare.
+            # Suppress noisy breadcrumbs for health and metrics endpoints.
             try:
-                log_stage("observability", "no_active_span", path=str(request.url.path))
+                _p = str(request.url.path)
+                # Only log when not hitting health/ready/metrics paths
+                if not (
+                    _p.endswith("/health")
+                    or _p.endswith("/healthz")
+                    or _p.endswith("/ready")
+                    or _p.endswith("/readyz")
+                    or _p.endswith("/metrics")
+                ):
+                    (log_stage("observability", "no_active_span", path=_p) if _LOG_NO_ACTIVE_SPAN else None)
             except Exception:
                 pass
     except Exception:
@@ -256,24 +367,27 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         req_id = compute_request_id(str(request.url.path), dict(request.query_params), body)
     except Exception:
         req_id = compute_request_id(str(request.url.path), None, None)
-    logger.warning(
-        "request_validation_error",
-        extra={
-            "service": "gateway",
-            "stage": "validation",
-            "errors": exc.errors(),
-            "url": str(request.url),
-            "method": request.method,
-            "request_id": req_id,
-        },
-    )
+    try:
+        logger.warning(
+            "request_validation_error",
+            extra={
+                "service": "gateway",
+                "stage": "validation",
+                "errors": jsonx.sanitize(exc.errors()),
+                "url": str(request.url),
+                "method": request.method,
+                "request_id": req_id,
+            },
+        )
+    except Exception:
+        pass
     return JSONResponse(
         status_code=422,
         content={
             "error": {
                 "code": "VALIDATION_FAILED",
                 "message": "Request validation failed",
-                "details": {"errors": exc.errors()},
+                "details": {"errors": jsonx.sanitize(exc.errors())},
                 "request_id": req_id,
 
             },
@@ -281,6 +395,33 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         },
         headers={},  # snapshot_etag is not meaningful here
     )
+# Catch-all exception handler to avoid leaking non-serialisable objects into JSON responses
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    try:
+        body = await request.body()
+    except Exception:
+        body = b""
+    try:
+        req_id = compute_request_id(str(request.url.path), dict(request.query_params), body)
+    except Exception:
+        req_id = generate_request_id()
+    try:
+        log_stage("request", "unhandled_exception", request_id=req_id, error=str(exc), error_type=exc.__class__.__name__)
+    except Exception:
+        pass
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL",
+                "message": "Unexpected error",
+                "details": jsonx.sanitize({"type": exc.__class__.__name__, "message": str(exc)}),
+                "request_id": req_id,
+            },
+            "request_id": req_id,
+        },
+     )
 
 # ---- Ops & metrics endpoints ----------------------------------------------
 @app.get("/metrics", include_in_schema=False)          # pragma: no cover
@@ -298,7 +439,7 @@ def ensure_bucket():
 async def _readiness() -> dict[str, str]:
     return {
         "status": "ready" if await _ping_memory_api() else "degraded",
-        "request_id": compute_request_id("/readyz", None, None),
+        "request_id": generate_request_id(),
     }
 
 attach_health_routes(
@@ -425,11 +566,6 @@ async def ask(
     except Exception:
         pass
 
-    try:
-        await _minio_put_batch_async(req_id, artefacts)
-    except Exception:
-        pass
-
     if want_stream:
         short_answer: str = resp.answer.short_answer
         headers = {"Cache-Control": "no-cache", "x-request-id": req_id}
@@ -460,7 +596,7 @@ async def ask(
         except Exception:
             pass
         # Emit tokens and then the full final response object; mirror snapshot ETag to headers
-        final_payload = resp.model_dump()
+        final_payload = jsonx.sanitize(resp.model_dump(mode="python"))
         if isinstance(final_payload, dict):
             etag = None
             try:
@@ -746,8 +882,6 @@ async def v2_query(
     except Exception:
         pass
 
-    await _minio_put_batch_async(req_id, artefacts)
-
     # Apply final validation on the assembled response.  This ensures that
     # post-routing modifications still conform to the Why-Decision contract.
     try:
@@ -800,7 +934,7 @@ async def v2_query(
         except Exception:
             pass
         # Emit tokens and then the full final response object; mirror snapshot ETag to headers
-        final_payload = resp.model_dump()
+        final_payload = jsonx.sanitize(resp.model_dump(mode="python"))
         if isinstance(final_payload, dict):
             etag = None
             try:
@@ -847,22 +981,56 @@ async def v2_query(
     return JSONResponse(content=resp.model_dump(), headers=headers)
 
 @router.post("/bundles/{request_id}/download", include_in_schema=False)
-async def download_bundle(request_id: str):
-    """Return a pseudo‑presigned URL for downloading a decision bundle.
+async def download_bundle(request_id: str, format: str = Query("json", pattern="^(json|tar)$")):
+    """Return a presigned URL for the archived bundle when possible.
 
-    This route returns a JSON object containing a relative URL to the
-    bundle along with an expiration time in seconds.  In production
-    environments a true presigned link would be generated via MinIO or S3;
-    within this implementation we return the direct GET endpoint.  A log
-    entry is emitted with the download.presigned tag for observability.
+    Attempts to generate a real presigned GET for `<request_id>.bundle.tar.gz` in MinIO.
+    Falls back to the internal `/v2/bundles/{request_id}.tar` proxy if MinIO
+    is unavailable, not publicly reachable, or the object is missing.
     """
+    expires_sec = 600
+    # Prefer the exec-friendly TAR proxy by default
+    url = f"/v2/bundles/{request_id}.tar"
     try:
-        log_stage("bundle", "download.presigned", request_id=request_id)
+        client = minio_client()
+        if client is not None:
+            try:
+                from datetime import timedelta as _td  # local import
+                _ = client.stat_object(settings.minio_bucket, f"{request_id}.bundle.tar.gz")
+                # If a public endpoint is configured, build a *public* client for presigning
+                pub_client = None
+                try:
+                    pub = (getattr(settings, "minio_public_endpoint", None) or "").strip()
+                    if pub:
+                        from urllib.parse import urlparse as _uparse
+                        _pu = _uparse(pub if "://" in pub else f"http://{pub}")
+                        from minio import Minio as _Minio  # type: ignore
+                        pub_client = _Minio(
+                            endpoint=_pu.netloc,
+                            access_key=settings.minio_access_key,
+                            secret_key=settings.minio_secret_key,
+                            secure=_pu.scheme == "https",
+                            region=settings.minio_region,
+                        )
+                except Exception as _exc:
+                    log_stage("bundle", "download.public_client_init_failed", request_id=request_id, error=str(_exc))
+                if pub_client:
+                    url = pub_client.presigned_get_object(
+                        settings.minio_bucket,
+                        f"{request_id}.bundle.tar.gz",
+                        expires=_td(seconds=expires_sec),
+                    )
+                    log_stage("bundle", "download.presigned_minio_public", request_id=request_id)
+                else:
+                    # No public endpoint configured → keep internal proxy URL (works through API Edge)
+                    log_stage("bundle", "download.fallback_proxy_used", request_id=request_id)
+            except Exception as exc:
+                # Soft-fail to the internal endpoint
+                log_stage("bundle", "download.presigned_minio_failed", request_id=request_id, error=str(exc))
     except Exception:
+        # leave url as fallback
         pass
-    return JSONResponse(
-        content={"url": f"/v2/bundles/{request_id}", "expires_in": 600}
-    )
+    return JSONResponse(content={"url": url, "expires_in": expires_sec})
 
 @router.get("/bundles/{request_id}", include_in_schema=False)
 async def get_bundle(request_id: str):
@@ -875,7 +1043,7 @@ async def get_bundle(request_id: str):
     download.served tag for auditability.  Returns 404 if the bundle
     identifier is unknown.
     """
-    bundle = BUNDLE_CACHE.get(request_id)
+    bundle = _load_bundle_dict(request_id)
     if not bundle:
         raise HTTPException(status_code=404, detail="bundle not found")
     content: dict[str, Any] = {}
@@ -901,7 +1069,71 @@ async def get_bundle(request_id: str):
         )
     except Exception:
         pass
-    return JSONResponse(content=content)
+    try:
+        anchor_id = None
+        try:
+            resp_json = content.get("response.json")
+            if isinstance(resp_json, str):
+                import json as _json
+                _obj = _json.loads(resp_json)
+                anchor_id = (_obj.get("evidence", {}).get("anchor") or {}).get("id")
+        except Exception:
+            anchor_id = None
+        from datetime import datetime as _dt, timezone as _tz
+        date_str = _dt.now(_tz.utc).strftime("%Y%m%d")
+        base = anchor_id or request_id
+        filename = f"evidence-{base}-{date_str}.json"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    except Exception:
+        headers = {}
+    return JSONResponse(content=content, headers=headers)
+
+@router.get("/bundles/{request_id}.tar", include_in_schema=False)
+async def get_bundle_tar(request_id: str):
+    """Return the artefact bundle as a TAR archive (exec-friendly).
+    Pull from hot cache; fall back to MinIO when needed."""
+    bundle = _load_bundle_dict(request_id)
+    if not bundle:
+        raise HTTPException(status_code=404, detail="bundle not found")
+
+    import tarfile, io, json as _json
+    buf = io.BytesIO()
+    with tarfile.open(mode="w", fileobj=buf) as tar:
+        # individual artefacts
+        for name, blob in bundle.items():
+            data = blob if isinstance(blob, (bytes, bytearray)) else str(blob).encode()
+            ti = tarfile.TarInfo(name=name)
+            ti.size = len(data); ti.mtime = int(time.time())
+            tar.addfile(ti, io.BytesIO(data))
+        # MANIFEST.json
+        manifest = {"request_id": request_id, "files": sorted(list(bundle.keys()))}
+        mbytes = _json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        ti = tarfile.TarInfo(name="MANIFEST.json")
+        ti.size = len(mbytes); ti.mtime = int(time.time())
+        tar.addfile(ti, io.BytesIO(mbytes))
+        # README.txt
+        readme = (
+            "BatVault evidence bundle\n"
+            "========================\n"
+            f"request_id: {request_id}\n\n"
+            "Contains deterministic artefacts used to generate the answer:\n"
+            "- evidence_pre.json / evidence_post.json\n"
+            "- envelope.json (prompt inputs & fingerprints)\n"
+            "- llm_raw.json (if available)\n"
+            "- response.json (final answer)\n"
+            "- validator_report.json\n"
+            "\nOpen MANIFEST.json for the file list.\n"
+        ).encode("utf-8")
+        ti = tarfile.TarInfo(name="README.txt")
+        ti.size = len(readme); ti.mtime = int(time.time())
+        tar.addfile(ti, io.BytesIO(readme))
+    buf.seek(0)
+
+    from datetime import datetime as _dt, timezone as _tz
+    date_str = _dt.now(_tz.utc).strftime("%Y%m%d")
+    filename = f"evidence-{request_id}-{date_str}.tar"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=buf.getvalue(), headers=headers, media_type="application/x-tar")
 
 # ---- Legacy evidence endpoint ---------------------------------------------
 @app.get("/evidence/{decision_ref}")

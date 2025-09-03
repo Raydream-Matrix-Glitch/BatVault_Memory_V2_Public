@@ -2,7 +2,7 @@
 
 from fastapi import FastAPI, Request
 from core_logging import get_logger, log_stage
-from core_observability.otel import init_tracing, instrument_fastapi_app
+from core_observability.otel import setup_tracing, instrument_fastapi_app
 from core_utils.health import attach_health_routes
 from core_utils.ids import generate_request_id
 from core_config import get_settings 
@@ -22,7 +22,7 @@ instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'inge
 
 logger = get_logger("ingest")
 logger.propagate = False
-init_tracing(os.getenv("OTEL_SERVICE_NAME") or "ingest")
+setup_tracing(os.getenv("OTEL_SERVICE_NAME") or "ingest")
 
 @app.middleware("http")
 async def _request_logger(request: Request, call_next):

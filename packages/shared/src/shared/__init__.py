@@ -53,3 +53,6 @@ __all__ += ["plan_budget", "gate_budget"]
 # meta builder
 from .meta_builder import build_meta
 __all__ += ["build_meta"]
+
+from .normalize import dedup_and_normalise_events
+__all__ += ["dedup_and_normalise_events"]

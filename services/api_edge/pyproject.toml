@@ -20,7 +20,10 @@ dependencies = [
   "core_http",
   "core_observability",
   "core_utils",
-  "shared", 
+  "shared",
+  "opentelemetry-sdk>=1.24",
+  "opentelemetry-exporter-otlp-proto-http>=1.24",
+  "opentelemetry-instrumentation-fastapi>=0.46b0", 
 ]
 
 [project.optional-dependencies]

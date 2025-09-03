@@ -7,15 +7,36 @@ name = "gateway"
 version = "0.1.0"
 description = "Gateway and prompt/evidence coordinator"
 requires-python = ">=3.11"
+
 dependencies = [
-  "httpx>=0.27.0",
-  "orjson>=3.9.7",
-  "redis>=5.0.3",
-  "prometheus-client>=0.19.0",
+  # Web framework & ASGI middleware
   "fastapi>=0.112.0",
-  "numpy>=1.26.4",
-  "anyio>=3.7.1", 
-  "sentence-transformers>=2.7.0",    # embeddings (optional at runtime)
+  "pydantic>=2.7.0",
+
+  # Concurrency and networking
+  "anyio>=3.7.1",
+  "httpx>=0.27.0",
+  "redis>=5.0.3",
+
+  # Metrics and serialization
+  "prometheus-client>=0.19.0",
+  "orjson>=3.9.7",
+
+  # Storage and cryptography – required by MinIO and its admin helpers
+  "minio>=7.2.7",
+  "argon2-cffi>=23.2",
+  "argon2-cffi-bindings>=21.2",
+  "cffi>=1.16",
+  "pycryptodome>=3.15.0",
+
+  # Observability & tracing
+  "opentelemetry-api>=1.24",
+  "opentelemetry-sdk>=1.24",
+  "opentelemetry-exporter-otlp-proto-http>=1.24",
+  "opentelemetry-instrumentation-fastapi>=0.46b0",
+  "opentelemetry-instrumentation-redis>=0.46b0",
+
+  # Internal packages
   "core_config",
   "core_logging",
   "core_observability",
@@ -25,29 +46,7 @@ dependencies = [
   "core_utils",
   "core_validator",
   "shared",
-  "opentelemetry-api>=1.24",
-  "opentelemetry-sdk>=1.24",
-  "opentelemetry-exporter-otlp-proto-http>=1.24",
-  "opentelemetry-instrumentation-fastapi>=0.46b0",
-  "opentelemetry-instrumentation-redis>=0.46b0",
-  "httpx>=0.27.0",
-  "redis>=5.0.3",
-  "core_http",
   "core_ml",
-  "pydantic>=2.7.0",
-  "orjson>=3.9.7",
-  "minio>=7.2.7",
-  "argon2-cffi>=23.2",
-  "argon2-cffi-bindings>=21.2",
-  "cffi>=1.16",
-  "pycryptodome>=3.15.0",
-  "core_config",
-  "core_logging",
-  "core_observability",
-  "core_utils",
-  "core_validator",
-  "shared",
-  "blake3>=0.4.1",
 ]
 
 [project.optional-dependencies]

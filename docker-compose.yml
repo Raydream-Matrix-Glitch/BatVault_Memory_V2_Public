@@ -108,13 +108,15 @@ services:
       dockerfile: ops/docker/Dockerfile.python
     environment:
       - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_PROPAGATORS=tracecontext,baggage
       - OTEL_TRACES_SAMPLER=parentbased_always_on
       - OTEL_SERVICE_NAME=api_edge
       - OTEL_PROPAGATORS=tracecontext,baggage
       - OTEL_TRACES_SAMPLER=parentbased_always_on
       - BATVAULT_HEALTH_PORT=8080
+      - OTEL_LOG_LEVEL=error
     env_file:
       - .env
       - .env.local
@@ -141,7 +143,8 @@ services:
     image: batvault/python-svc:dev
     environment:
       - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_SERVICE_NAME=gateway
       - OTEL_PROPAGATORS=tracecontext,baggage
       - OTEL_TRACES_SAMPLER=parentbased_always_on
@@ -149,6 +152,7 @@ services:
       - CITE_ALL_IDS=true
       - TIMEOUT_ENRICH_MS=1200
       - TIMEOUT_EXPAND_MS=400
+      - OTEL_LOG_LEVEL=error
     env_file:
       - .env
       - .env.local
@@ -175,12 +179,14 @@ services:
     image: batvault/python-svc:dev
     environment:
       - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_SERVICE_NAME=memory_api
       - OTEL_PROPAGATORS=tracecontext,baggage
       - OTEL_TRACES_SAMPLER=parentbased_always_on
       - ARANGO_VECTOR_INDEX_ENABLED=true
       - BATVAULT_HEALTH_PORT=8000
+      - OTEL_LOG_LEVEL=error
     env_file:
       - .env
       - .env.local
@@ -344,12 +350,14 @@ services:
     image: batvault/python-svc:dev
     environment:
       - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4317}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_SERVICE_NAME=ingest
       - OTEL_PROPAGATORS=tracecontext,baggage
       - OTEL_TRACES_SAMPLER=parentbased_always_on
       - ARANGO_VECTOR_INDEX_ENABLED=true
       - BATVAULT_HEALTH_PORT=8083
+      - OTEL_LOG_LEVEL=error
     env_file:
       - .env
       - .env.local

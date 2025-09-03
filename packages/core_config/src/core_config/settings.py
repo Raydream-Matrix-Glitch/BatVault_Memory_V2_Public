@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     minio_region: str = Field(default="us-east-1", alias="MINIO_REGION")
     minio_retention_days: int = Field(default=14, alias="MINIO_RETENTION_DAYS")
     minio_secure: bool = Field(default=False, alias="MINIO_SECURE")
+    minio_public_endpoint: str | None = Field(default=None, alias="MINIO_PUBLIC_ENDPOINT")
     # non-blocking MinIO uploads (§Tech-Spec A, “performance budgets”)
     minio_async_timeout: int = Field(default=3, alias="MINIO_ASYNC_TIMEOUT")
     memory_api_url: str = Field(

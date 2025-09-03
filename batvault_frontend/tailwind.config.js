@@ -17,6 +17,13 @@ module.exports = {
         "neon-red": "0 0 8px rgba(255, 0, 48, 0.6)",
         "neon-cyan": "0 0 8px rgba(0, 224, 224, 0.6)",
       },
+
+      maxWidth: {
+        content: "1040px",
+      },
+      spacing: {
+        gutter: "24px",
+      },
     },
   },
   plugins: [

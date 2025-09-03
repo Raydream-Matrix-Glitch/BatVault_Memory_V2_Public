@@ -6,6 +6,7 @@
 
 export interface EvidenceItem {
   id: string;
+  type?: 'EVENT' | 'DECISION' | 'TRANSITION';
   summary?: string;
   timestamp?: string;
   rationale?: string;
@@ -13,6 +14,10 @@ export interface EvidenceItem {
   tags?: string[];
   based_on?: string[];
   decision_maker?: string;
+  from?: string;
+  to?: string;
+  relation?: string;
+  reason?: string;
 }
 
 export interface EvidenceBundle {
@@ -155,6 +160,7 @@ export interface SchemaRelation {
 
 export interface EvidenceItem {
   id: string;
+  type?: 'EVENT' | 'DECISION' | 'TRANSITION';
   summary?: string;
   timestamp?: string;
   rationale?: string;

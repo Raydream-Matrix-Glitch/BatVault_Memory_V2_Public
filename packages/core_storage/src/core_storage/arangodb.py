@@ -312,18 +312,28 @@ class ArangoStore:
             }
 
         def _ivf_payload() -> dict:
+            # Build IVF index parameters.  Include numProbes only when the
+            # IVF_NUMPROBES environment variable is explicitly set, because
+            # older ArangoDB versions return HTTP 400 for unknown attributes.
+            params = {
+                "dimension": dim,
+                "metric": metric,
+                "indexType": "ivf",
+                "nLists": int(os.getenv("IVF_NLISTS", 1024)),
+            }
+            num_probes_env = os.getenv("IVF_NUMPROBES")
+            if num_probes_env is not None:
+                try:
+                    params["numProbes"] = int(num_probes_env)
+                except Exception:
+                    # Ignore invalid values; omitting numProbes is always safe
+                    pass
             return {
                 "type": "vector",
                 "name": "nodes_embedding_ivf",
                 "fields": ["embedding"],
                 "inBackground": True,
-                "params": {
-                    "dimension": dim,
-                    "metric": metric,
-                    "indexType": "ivf",
-                    "nLists": int(os.getenv("IVF_NLISTS", 1024)),
-                    "numProbes": int(os.getenv("IVF_NUMPROBES", 1)),
-                },
+                "params": params,
             }
 
         # Prepare both payloads; env var selects which to try first.
@@ -395,18 +405,23 @@ class ArangoStore:
                 log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_exists", **common)
                 return
 
-            # If IVF-specific params show up in the error body on the first try, fall back.
+            # Some ArangoDB versions don't accept 'numProbes' or other IVF
+            # tuning parameters – retry IVF without unknown attributes.  We
+            # perform a case‑insensitive search on the error message to
+            # determine whether to retry.  On retry we strip the offending
+            # keys ('numProbes', 'nLists') and recompute the logging payload.
             body_txt = resp.text[:500]
             if attempt == 0 and "nLists" in body_txt:
                 continue
 
-            # Some ArangoDB versions don't accept 'numProbes' – retry IVF without it.
-            if "numProbes" in body_txt and payload["params"].get("indexType") == "ivf" and "unexpected attribute" in body_txt:
+            err = body_txt.lower()
+            if (
+                payload["params"].get("indexType") == "ivf"
+                and ("numprobes" in err or "nlists" in err or "unexpected attribute" in err)
+            ):
                 try:
                     _p2 = dict(payload)
-                    _p2["params"] = dict(payload["params"])
-                    _p2["params"].pop("numProbes", None)
-                    # Propagate trace context on the retry as well
+                    _p2["params"] = {k: v for k, v in payload["params"].items() if k not in {"numProbes", "nLists"}}
                     hdrs = inject_trace_context({}) if inject_trace_context else {}
                     resp2 = httpx.post(
                         url,
@@ -417,7 +432,11 @@ class ArangoStore:
                         headers=hdrs,
                     )
                     if resp2.status_code in (200, 201):
-                        log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created", **common)
+                        # Update common logging metadata to reflect the actual index parameters
+                        common_retry = dict(common)
+                        common_retry["nLists"] = _p2["params"].get("nLists")
+                        common_retry["numProbes"] = _p2["params"].get("numProbes")
+                        log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created", **common_retry)
                         return
                 except Exception:
                     pass

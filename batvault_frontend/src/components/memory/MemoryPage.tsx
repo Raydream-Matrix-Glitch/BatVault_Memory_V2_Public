@@ -1,16 +1,16 @@
-import React, { useMemo, useState, useEffect, useCallback } from "react";
+import React, { useMemo, useState, useEffect, useCallback, useRef } from "react";
 import Card from "./ui/Card";
 import QueryPanel from "./QueryPanel";
-import TokenStreamLine from "./ui/TokenStreamLine";
 import EvidenceList from "./EvidenceList";
 import { useMemoryAPI } from "../../hooks/useMemoryAPI";
 import type { EvidenceItem, EvidenceBundle } from "../../types/memory";
 import AuditDrawer from "./AuditDrawer";
 import Button from "./ui/Button";
-import TagCloud from "./TagCloud";
 import { logEvent } from "../../utils/logger";
 import GraphView from "./GraphView";
-import { motion } from "framer-motion";
+import TagFilter from "./ui/TagFilter";
+import { useAliasResolver } from "../../hooks/useAliasResolver";
+import EmptyResult from "./EmptyResult";
 
 /**
  * Root container for the Memory page.
@@ -31,14 +31,41 @@ export default function MemoryPage() {
     query,
   } = useMemoryAPI();
 
+  // --- UI-only validation message just below the QueryPanel input ---
+  const [emptyHint, setEmptyHint] = useState<string | null>(null);
+  const queryPanelHostRef = useRef<HTMLDivElement>(null);
+
+  // Hook to resolve decision slugs to human‑friendly titles. Cached
+  // internally to avoid repeated fetches.
+  const resolveAlias = useAliasResolver();
+
+  // Store the resolved next decision title (from succeeding transition)
+  const [nextTitle, setNextTitle] = useState<string | undefined>(undefined);
+
   // Track which evidence item is currently selected (for graph/audit integration).
   const [selectedEvidenceId, setSelectedEvidenceId] = useState<string | undefined>(undefined);
 
   // Control the visibility of the audit drawer. It becomes available once finalData is present.
   const [auditOpen, setAuditOpen] = useState(false);
 
-  // Track a tag filter selected from the tag cloud. Undefined means no filter.
-  const [tagFilter, setTagFilter] = useState<string | undefined>(undefined);
+  // Tag filtering: multi-select + AND/OR mode.
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const toggleTag = useCallback((tag: string) => {
+    setSelectedTags((prev) => (prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]));
+  }, []);
+
+  // Allow other components (or the empty-state CTA) to switch users to the Natural path.
+  const switchToNatural = useCallback(() => {
+    try {
+      logEvent("ui.memory.switch_to_natural_clicked", { rid: finalData?.meta?.request_id ?? null });
+    } catch { /* ignore */ }
+    try {
+      // Broadcast a custom event QueryPanel can optionally listen to.
+      window.dispatchEvent(new CustomEvent("bv:switchToNatural"));
+      // Try to focus the shared input if present.
+      (document.getElementById("memory-input") as HTMLInputElement | null)?.focus();
+    } catch { /* ignore */ }
+  }, [finalData]);
 
   // Strategic structured logging for audit drawer interactions.
   const handleOpenAudit = () => {
@@ -48,6 +75,20 @@ export default function MemoryPage() {
   };
 
   const rawShortAnswer = finalData?.answer?.short_answer;
+  // Render-time split: if the short answer (or streaming tokens) contains
+  // an inline "Next:" sentence, render it on a new line with a spacer.
+  const streamingText = isStreaming ? tokens.join("") : undefined;
+  const { mainAnswer, nextFromShort } = useMemo(() => {
+    const src = (streamingText ?? rawShortAnswer) || "";
+    const match = src.match(/\bNext:\s*(.*)$/i);
+    if (!match) {
+      return { mainAnswer: src, nextFromShort: undefined };
+    }
+    const before = src.slice(0, match.index).trim();
+    const nextTxt = match[1].trim();
+    try { logEvent("ui.short_answer.next_split", { rid: finalData?.meta?.request_id ?? null }); } catch {}
+    return { mainAnswer: before, nextFromShort: nextTxt };
+  }, [streamingText, rawShortAnswer, finalData]);
   const shortAnswer = useMemo(() => {
     if (!rawShortAnswer) return undefined;
     try {
@@ -56,98 +97,106 @@ export default function MemoryPage() {
     } catch { return rawShortAnswer; }
   }, [rawShortAnswer]);
 
-  // Extract supplementary answer fields for UI enhancements
-  const citationIds: string[] = finalData?.answer?.supporting_ids ?? [];
-  const anchorMaker: string | undefined = finalData?.evidence?.anchor?.decision_maker;
-  const anchorTs: string | undefined = finalData?.evidence?.anchor?.timestamp;
-  const fallbackUsed: boolean | undefined = finalData?.meta?.fallback_used;
-  const badgeLabel: string = fallbackUsed ? "Deterministic" : "LLM-polished";
-  const nextTarget = finalData?.evidence?.transitions?.succeeding?.[0];
-  const nextLabel: string | undefined =
-    (nextTarget && (nextTarget as any).id) ||
-    (nextTarget && (nextTarget as any).summary) ||
-    (nextTarget && (nextTarget as any).snippet) ||
-    undefined;
+  // Compute the slug/id of the next succeeding transition (if any). Prefer
+  // the `to` field if present, otherwise fall back to the transition id.
+  const nextSlug: string | undefined = useMemo(() => {
+    const nxt: any = (finalData as any)?.evidence?.transitions?.succeeding?.[0];
+    if (!nxt) return undefined;
+    return (nxt.to as string) || (nxt.id as string) || undefined;
+  }, [finalData]);
 
-  // Log when anchor maker/date chips are present
+  // Disable native browser validation bubbles inside QueryPanel so we can show our own hint.
   useEffect(() => {
-    if ((anchorMaker || anchorTs) && finalData?.meta?.request_id) {
+    const host = queryPanelHostRef.current;
+    if (!host) return;
+    const form = host.querySelector("form");
+    if (form) (form as HTMLFormElement).setAttribute("novalidate", "true");
+    host.querySelectorAll("input[required]").forEach((el) => {
+      (el as HTMLInputElement).removeAttribute("required");
+    });
+  }, []);
+
+  // When the slug changes, resolve the human title via the alias resolver.
+  useEffect(() => {
+    let ignore = false;
+    (async () => {
+      if (nextSlug) {
+        const title = await resolveAlias(nextSlug);
+        if (!ignore) setNextTitle(title);
+      } else {
+        setNextTitle(undefined);
+      }
+    })();
+    return () => {
+      ignore = true;
+    };
+  }, [nextSlug, resolveAlias]);
+  // Log presence of a "Next:" line for audit/UX metrics
+  useEffect(() => {
+    if (nextTitle) {
       try {
-        logEvent("ui.memory.anchor_seen", {
-          maker: anchorMaker ?? null,
-          ts: anchorTs ?? null,
-          rid: finalData.meta.request_id,
+        logEvent("ui.memory.next_line_present", {
+          next: nextTitle,
+          rid: finalData?.meta?.request_id ?? null
+        });
+      } catch { /* ignore */ }
+    }
+  }, [nextTitle, finalData?.meta?.request_id]);
+
+  // Emit a "short answer rendered" event whenever a final short answer is
+  // available. Use the anchor id as payload if present.
+  useEffect(() => {
+    if (finalData && finalData.answer && finalData.answer.short_answer) {
+      try {
+        logEvent("ui_short_answer_rendered", {
+          id: finalData?.evidence?.anchor?.id ?? null,
         });
       } catch {
         /* ignore logging errors */
       }
     }
-  }, [anchorMaker, anchorTs, finalData]);
+  }, [finalData]);
 
-  // Handler for evidence bundle download. Prefers a presigned URL when available.
+  // Extract supplementary answer fields for UI enhancements
+  const citationIds: string[] = finalData?.answer?.supporting_ids ?? [];
+  const fallbackUsed: boolean | undefined = finalData?.meta?.fallback_used;
+  // Derive a label describing the path taken (deterministic fallback or model).
+  const pathLabel: string = fallbackUsed ? "Deterministic" : "Model";
+  // nextLabel has been superseded by alias resolution via `nextTitle`. See
+  // useEffect below for details.
+
+  // Log when anchor maker/date chips are present
+  // Fire a layout painted event exactly once when this component mounts. When
+  // finalData is available we include its request id in the payload, otherwise
+  // pass null. This uses an empty dependency array so it runs only on the
+  // initial render.
+  useEffect(() => {
+    try {
+      logEvent("ui.memory.layout_painted", { rid: finalData?.meta?.request_id ?? null });
+    } catch {
+      /* ignore logging errors */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Handler for evidence bundle download.
+  // Strategy:
+  // 1) If we have a request id, use the canonical presign flow:
+  //    POST /v2/bundles/{rid}/download → { url }, then open the url
+  // 2) Else, if the response included a bundle_url, open that
+  // 3) Else, as a last resort (rid only), GET /v2/bundles/{rid} and save blob
   const handleDownloadEvidence = useCallback(async () => {
-    const rid = finalData?.meta?.request_id;
+    try { logEvent("ui.evidence_download_click", { rid: finalData?.meta?.request_id ?? null }); } catch { /* ignore */ }
     const bundleUrl = (finalData as any)?.bundle_url as string | undefined;
-    // Basic sanity
-    if (!rid) return;
-
-    // Attempt canonical flow: POST /v2/bundles/{rid}/download → {url, expires_in}
-    try {
-      logEvent("ui.memory.bundle_download", {
-        rid,
-        flow: "post_then_get",
-      });
-    } catch { /* ignore logging errors */ }
-
-    try {
-      const resp = await fetch(`/v2/bundles/${rid}/download`, { method: "POST" });
-      if (resp.ok) {
-        const data = await resp.json().catch(() => null) as any;
-        const url = data && typeof data.url === "string" ? data.url : undefined;
-        try {
-          logEvent("ui.memory.bundle_download.presigned_received", {
-            rid,
-            has_url: !!url,
-            expires_in: (data && data.expires_in) || null,
-          });
-        } catch { /* ignore logging errors */ }
-        if (url) {
-          window.open(url, "_blank");
-          return;
-        }
-      }
-    } catch {
-      // swallow and fall through to legacy fallbacks
+    const ridFromMeta = (finalData as any)?.meta?.request_id as string | undefined;
+    let rid = ridFromMeta;
+    if (!rid && bundleUrl) {
+      const m = /\/v2\/bundles\/([^\/\s]+)/i.exec(bundleUrl);
+      if (m && m[1]) rid = m[1];
     }
-
-    // Fallback 1: legacy bundle_url on the response (if present)
-    if (bundleUrl) {
-      try {
-        logEvent("ui.memory.bundle_download.fallback_bundle_url", { rid });
-      } catch { /* ignore logging errors */ }
-      window.open(bundleUrl, "_blank");
-      return;
-    }
-
-    // Fallback 2: direct GET to the gateway/edge bundle endpoint
-    try {
-      logEvent("ui.memory.bundle_download.fallback_direct_get", { rid, path: `/v2/bundles/${rid}` });
-    } catch { /* ignore logging errors */ }
-    try {
-      const resp = await fetch(`/v2/bundles/${rid}`);
-      if (!resp.ok) throw new Error(`Failed to download bundle: ${resp.status}`);
-      const blob = await resp.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${rid}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.URL.revokeObjectURL(url);
-    } catch {
-      /* swallow errors silently */
-    }
+    // Delegate to shared utility (presigned-first with safe fallbacks)
+    const { openEvidenceBundle } = await import("../../utils/bundle");
+    await openEvidenceBundle(rid, bundleUrl);
   }, [finalData]);
 
   // Build separate arrays for anchor, events, and transitions
@@ -155,9 +204,21 @@ export default function MemoryPage() {
   const eventsOnly: EvidenceItem[] = useMemo(() => {
     const bundle: EvidenceBundle | undefined = finalData?.evidence;
     if (!bundle) return [];
-    const evts = Array.isArray(bundle.events) ? bundle.events.map((e) => ({ ...e })) : [];
+    const evts = Array.isArray(bundle.events) ? bundle.events.map((e) => ({ ...e, type: 'EVENT' as const })) : [];
     // Ensure ids are present
     return evts.filter((e) => typeof (e as any).id === "string" && e.id);
+  }, [finalData]);
+
+  const anchorItem: EvidenceItem | undefined = useMemo(() => {
+    const a = finalData?.evidence?.anchor as any;
+    return a && a.id ? { ...a, type: 'DECISION' as const } : undefined;
+  }, [finalData]);
+
+  const transitionsBoth = useMemo(() => {
+    const t = finalData?.evidence?.transitions as any;
+    const preceding = Array.isArray(t?.preceding) ? t.preceding.map((x: any) => ({ ...x, type: 'TRANSITION' as const })) : [];
+    const succeeding = Array.isArray(t?.succeeding) ? t.succeeding.map((x: any) => ({ ...x, type: 'TRANSITION' as const })) : [];
+    return { preceding, succeeding };
   }, [finalData]);
 
   // Rank events by selector score (desc) then timestamp (desc), then id
@@ -178,32 +239,98 @@ export default function MemoryPage() {
 
   }, [eventsOnly, selectorScores]);
 
+  // Aggregate all evidence for the list: anchor → preceding transitions → ranked events → succeeding transitions
+  const allEvidenceItems: EvidenceItem[] = useMemo(() => {
+    const items: EvidenceItem[] = [];
+    if (anchorItem) items.push(anchorItem);
+    if (transitionsBoth.preceding?.length) items.push(...transitionsBoth.preceding);
+    if (rankedEvents?.length) items.push(...rankedEvents);
+    if (transitionsBoth.succeeding?.length) items.push(...transitionsBoth.succeeding);
+    return items;
+  }, [anchorItem, transitionsBoth, rankedEvents]);
+
+  // Events only for graph (exclude decision/transitions)
+  const filteredEventsForGraph: EvidenceItem[] = useMemo(() => {
+    const predicate = (it: EvidenceItem) => {
+      const t = it.tags || [];
+      return selectedTags.some((tg) => t.includes(tg));
+    };
+    if (selectedTags.length === 0) return rankedEvents;
+    return rankedEvents.filter(predicate);
+  }, [rankedEvents, selectedTags]);
+
   // Build receipts strip separately (prevents nested useMemo).
-  // Order: anchor → supporting_ids → top ranked events, capped at 3.
+  // Order: anchor → all supporting_ids (no cap).
   const receipts: string[] = useMemo(() => {
     const ids = new Set<string>();
     if (anchorId) ids.add(anchorId); // anchor from evidence
     (finalData?.answer?.supporting_ids ?? []).forEach((id: string) => ids.add(id));
-    rankedEvents.forEach((e) => ids.add(e.id));
-    return Array.from(ids).slice(0, 3);
-  }, [anchorId, finalData, rankedEvents]);
+    return Array.from(ids);
+  }, [anchorId, finalData]);
+
+  // Cache of resolved human titles for receipt chips: slug -> title|undefined
+  const [receiptTitles, setReceiptTitles] = useState<Record<string, string | undefined>>({});
+
+  // Resolve human titles for current receipts (anchor/supporting/events)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const updates: Record<string, string | undefined> = {};
+      for (const id of receipts) {
+        if (!(id in receiptTitles)) {
+          const t = await resolveAlias(id);
+          updates[id] = t;
+          if (!t) {
+            try { logEvent("ui.receipt_title_fallback", { id, rid: finalData?.meta?.request_id ?? null }); } catch {}
+          }
+        }
+      }
+      if (!cancelled && Object.keys(updates).length) {
+        setReceiptTitles((prev) => ({ ...prev, ...updates }));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [receipts, resolveAlias]);
+
+  useEffect(() => {
+    try { logEvent("ui.receipts_count", { count: receipts.length, rid: finalData?.meta?.request_id ?? null }); } catch {}
+  }, [receipts, finalData]);
 
   // Compute tag frequencies for the tag cloud
   const tagCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    rankedEvents.forEach((item) => {
-      item.tags?.forEach((tag) => {
-        counts[tag] = (counts[tag] || 0) + 1;
-      });
+    allEvidenceItems.forEach((item) => {
+      (item.tags ?? []).forEach((tag) => { counts[tag] = (counts[tag] || 0) + 1; });
     });
     return counts;
-  }, [rankedEvents]);
+  }, [allEvidenceItems]);
 
-  // Apply tag filter to evidence items
+  // Apply multi-tag filter (AND/OR) to all evidence (anchor always shown at top)
   const filteredEvidenceItems = useMemo(() => {
-    if (!tagFilter) return rankedEvents;
-    return rankedEvents.filter((item) => item.tags?.includes(tagFilter));
-  }, [rankedEvents, tagFilter]);
+    const items = allEvidenceItems.slice();
+    if (items.length === 0) return items;
+    const anchor = items[0]?.type === 'DECISION' ? items[0] : undefined;
+    const rest = anchor ? items.slice(1) : items;
+    if (selectedTags.length === 0) return items;
+    const predicate = (it: EvidenceItem) => {
+      const t = it.tags || [];
+      return selectedTags.some((tg) => t.includes(tg));
+    };
+    const filtered = rest.filter(predicate);
+    return anchor ? [anchor, ...filtered] : filtered;
+  }, [allEvidenceItems, selectedTags]);
+
+  // Log when the empty-state is shown (no evidence returned).
+  useEffect(() => {
+    if (!isStreaming && finalData?.evidence && filteredEvidenceItems.length === 0) {
+      try {
+        logEvent("ui.memory.empty_state_shown", {
+          rid: finalData?.meta?.request_id ?? null,
+          reason: "EMPTY_EVIDENCE",
+        });
+      } catch { /* ignore */ }
+    }
+  }, [isStreaming, finalData, filteredEvidenceItems]);
 
   // When final data arrives, expose its request id on the window for debug logs.
   useEffect(() => {
@@ -213,179 +340,197 @@ export default function MemoryPage() {
   }, [finalData]);
 
   return (
-    <div className="w-full max-w-4xl mx-auto p-4 space-y-6">
-      <Card className="relative">
+    <div
+      className="w-full max-w-[1040px] mx-auto px-6 space-y-8"
+      style={{ marginRight: auditOpen && finalData ? `calc(28rem + 24px)` : undefined }}
+    >
+      <Card className="relative mx-auto w-full max-w-[1024px] pr-6">
        {/* streaming progress bar */}
         {isStreaming && (
           <div className="absolute inset-x-0 top-0 h-[2px] bg-vaultred/70 animate-pulse" />
         )}
-        {/* encrypted status pill */}
-        <motion.div
-          className="absolute top-4 right-4 flex items-center space-x-2"
-          aria-label="status"
-        >
-          <motion.div
-            className="w-3 h-3 rounded-full bg-green-500"
-           animate={{ opacity: [0.3, 1, 0.3] }}
-            transition={{ duration: 2, ease: "easeInOut", repeat: Infinity }}
-          />
-          <span className="text-xs font-mono text-vaultred">ENCRYPTED</span>
-        </motion.div>
-        {/* heading */}
-        <h1 className="flex items-center text-2xl font-bold text-vaultred mb-2">
-          <span className="heading-accent" />
-          BatVault Memory Interface
+        {/* heading — BatVault Memory (Origins colors/glow, no dots, side-by-side) */}
+        <h1 className="flex items-baseline gap-2 mb-6">
+          {/* BatVault slightly larger */}
+          <span className="font-extrabold tracking-tight text-vaultred md:text-3xl text-3xl opacity-80">
+            BatVault
+          </span>
+          <span className="font-extrabold tracking-tight text-neonCyan md:text-3xl text-3xl opacity-80">
+            Memory
+          </span>
         </h1>
-        <p className="text-copy/90 mb-3">
-          Enter a decision reference or ask a natural question. Results will stream in
-          real time.
+        <p className="text-copy/90 mb-7">
+          Enter a decision reference.
         </p>
         {/* Query panel */}
-        <QueryPanel onAsk={ask} onQuery={query} isStreaming={isStreaming} />
-        {/* Streaming answer */}
-        {tokens.length > 0 && (
-          <div className="mt-4">
-            <TokenStreamLine tokens={tokens} />
-          </div>
-        )}
-        {/* Final answer summary */}
-        {shortAnswer && !isStreaming && (
-          <div className="mt-4 p-3 border-t border-gray-700">
-            <div className="flex justify-between items-start">
-              <div className="flex-1 mr-4">
-                <h2 className="text-lg font-semibold text-vaultred mb-1">Short answer</h2>
-                <p className="text-copy mb-2 text-lg md:text-xl leading-snug">{shortAnswer}</p>
-                {/* Citation pills: render up to the first three supporting IDs */}
-                {receipts && receipts.length > 0 && (
-                  <div className="flex flex-wrap gap-2 mb-2">
-                    {receipts.slice(0, 3).map((cid) => (
-                      <button
-                        key={cid}
-                        type="button"
-                        onClick={() => {
-                          try {
-                            logEvent("ui.citation_click", {
-                              id: cid,
-                              rid: finalData?.meta?.request_id ?? null,
-                            });
-                          } catch { /* ignore logging errors */ }
-                          setSelectedEvidenceId(cid);
-                          const el = document.getElementById(`evidence-${cid}`);
-                          if (el) {
-                            el.scrollIntoView({ behavior: "smooth", block: "center" });
-                            el.classList.add("animate-pulse");
-                            window.setTimeout(() => el.classList.remove("animate-pulse"), 1200);
-                          }
-                        }}
-                        className="text-xs font-mono px-2 py-0.5 rounded-full border border-vaultred/50 text-vaultred hover:bg-vaultred/30 transition-colors"
-                      >
-                        {cid}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {/* Maker/Date chips */}
-                {(anchorMaker || anchorTs) && (
-                  <div className="flex flex-wrap gap-2 mb-2">
-                    {anchorMaker && (
-                      <span className="text-xs font-mono px-2 py-0.5 rounded-full border border-vaultred/50 text-neonCyan">
-                        {anchorMaker}
-                      </span>
-                    )}
-                    {anchorTs && (
-                      <span className="text-xs font-mono px-2 py-0.5 rounded-full border border-vaultred/50 text-neonCyan">
-                        {anchorTs}
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-              {/* Fallback badge */}
-              <div className="self-start">
-                <span className="text-xs font-mono px-2 py-1 rounded-md border border-vaultred/50 text-vaultred whitespace-nowrap">
-                  {badgeLabel}
+        <div ref={queryPanelHostRef}>
+          <QueryPanel
+            onAsk={(intent: string, decisionRef: string) => {
+              const slug = decisionRef?.trim();
+              if (!slug) {
+                setEmptyHint("I can’t trace the void — drop a decision id.");
+                return;
+              }
+              setEmptyHint(null);
+              const effIntent = intent ?? "why_decision";
+              try { logEvent("ui.memory.ask", { intent: effIntent, decision_ref: slug }); } catch { /* ignore */ }
+              return ask(effIntent, slug);
+            }}
+            onQuery={(q: string) => {
+              if (emptyHint) setEmptyHint(null);
+              return query(q);
+            }}
+            isStreaming={isStreaming}
+          />
+          {emptyHint && (
+            <div role="alert" className="validation-pop mt-2">
+              {emptyHint}
+            </div>
+          )}
+        </div>
+        {(isStreaming || shortAnswer) && (
+          <div className="mt-6">
+            <div className="section-hairline" />
+            <div>
+              <div className="flex items-center justify-between">
+                <h3 className="text-xs tracking-widest uppercase text-neonCyan/80">Short answer</h3>
+                <span
+                  className="text-xs font-mono px-2 py-1 rounded-md border border-gray-600 text-copy/80 whitespace-nowrap self-start"
+                  title={fallbackUsed ? "Deterministic fallback path used" : "Model path used"}
+                >
+                  Path: {pathLabel}
                 </span>
               </div>
-            </div>
-            {/* Next transition line */}
-            {nextLabel && (
-              <div className="mt-1 text-xs text-copy">
-                <span className="font-semibold text-vaultred mr-1">Next:</span>
-                <span>{nextLabel}</span>
-              </div>
-            )}
-            {/* Download evidence button */}
-            <div className="mt-3 flex justify-end">
-              <Button
-                onClick={handleDownloadEvidence}
-                variant="secondary"
-                className="text-xs"
-              >
-                Download evidence
-              </Button>
-            </div>
-          </div>
-        )}
-        {/* Evidence list */}
-        {!isStreaming && finalData?.evidence && (
-          <div className="mt-6">
-            {/* Sticky subheader row containing the Evidence heading and tag cloud */}
-            <div className="sticky top-0 bg-surface/80 backdrop-blur py-2 z-10">
-              <h2 className="text-lg font-semibold text-vaultred mb-2">Evidence</h2>
-              {/* Tag cloud for filtering evidence. Always render the heading; if no tags are present,
-               * inform the user. This ensures the “Filter by tag” header is visible even when the API
-               * returns no tags. */}
-              <div className="mb-2">
-                <h3 className="text-sm font-semibold text-vaultred mb-1">Filter by tag</h3>
-                {Object.keys(tagCounts).length > 0 ? (
-                  <TagCloud
-                    tags={tagCounts}
-                    selected={tagFilter}
-                    onSelect={(tag) => setTagFilter(tag)}
-                  />
-                ) : (
-                  <p className="text-copy text-xs italic">
-                    No tags found in this evidence bundle.
+              <div className="mt-1">
+                <p className="text-copy text-lg md:text-xl leading-snug">
+                  {mainAnswer || (isStreaming ? tokens.join("") : shortAnswer)}
+                </p>
+                {(nextFromShort || nextTitle) && (
+                  <p className="text-copy/80 text-lg md:text-xl leading-snug mt-4">
+                    <span className="font-semibold">Next:</span>{" "}{nextFromShort ?? nextTitle}
                   </p>
                 )}
               </div>
+              <div className="section-hairline my-3" />
+               {/* Supporting IDs moved lower */}
+              {receipts && receipts.length > 0 && (
+                <div className="mt-3 flex gap-2 overflow-x-auto whitespace-nowrap no-scrollbar">
+                  {receipts.map((cid) => (
+                    <button
+                      key={cid}
+                      type="button"
+                      onClick={() => {
+                        try {
+                          logEvent("ui.citation_click", {
+                            id: cid,
+                            rid: finalData?.meta?.request_id ?? null,
+                          });
+                        } catch { /* ignore logging errors */ }
+                        setSelectedEvidenceId(cid);
+                        const el = document.getElementById(`evidence-${cid}`);
+                        if (el) {
+                          el.scrollIntoView({ behavior: "smooth", block: "center" });
+                          el.classList.add("animate-pulse");
+                          window.setTimeout(() => el.classList.remove("animate-pulse"), 1200);
+                        }
+                      }}
+                      className="text-xs px-2 py-0.5 rounded-full border border-vaultred/50 text-vaultred hover:bg-vaultred/30 transition-colors"
+                    >
+                      <span
+                        title={receiptTitles[cid] ? undefined : "No human title available"}
+                        className={receiptTitles[cid] ? "font-sans" : "font-mono"}
+                      >
+                        {receiptTitles[cid] ?? cid}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
+          </div>
+        )}
+        {/* Evidence & graph sections */}
+        {!isStreaming && finalData?.evidence && (
+          <div className="mt-8 space-y-6">
             {filteredEvidenceItems.length > 0 ? (
               <>
-                {/* Wrap multiple siblings in a fragment to fix syntax error */}
+                {/* Section: Evidence */}
+                <div className="mt-6">
+                  <div className="section-hairline" />
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xs tracking-widest uppercase text-neonCyan/80">Evidence</h3>
+                    <div className="flex items-center gap-3">
+                      <Button onClick={handleDownloadEvidence} variant="secondary" className="text-xs">
+                        Download evidence
+                        {typeof finalData?.meta?.bundle_size_bytes === "number" ? (
+                          <span className="ml-2 opacity-70">
+                            ({Math.max(1, Math.round(finalData.meta.bundle_size_bytes / 1024))} KB)
+                          </span>
+                        ) : null}
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="sticky top-0 bg-surface/80 backdrop-blur py-2 z-10 mt-4">
+                    {Object.keys(tagCounts).length > 0 ? (
+                      <TagFilter
+                        maxRows={2}
+                        tags={tagCounts}
+                        selected={selectedTags}
+                        onToggle={(tag) => {
+                          toggleTag(tag);
+                          try { logEvent("ui.tag_toggle", { tag, rid: finalData?.meta?.request_id ?? null }); } catch {}
+                        }}
+                      />
+                    ) : (
+                      <p className="text-copy text-xs italic">No tags found in this evidence bundle.</p>
+                    )}
+                  </div>
+                </div>
                 <EvidenceList
                   items={filteredEvidenceItems}
+                  anchorId={anchorId}
                   selectedId={selectedEvidenceId}
                   onSelect={(id) => {
                     setSelectedEvidenceId(id);
-                    try { logEvent("ui.evidence_select", { id, rid: finalData?.meta?.request_id ?? null }); } catch {}
+                    try {
+                      logEvent("ui.evidence_select", { id, rid: finalData?.meta?.request_id ?? null });
+                    } catch {}
                   }}
                   className="mt-2"
                 />
-                {/* Graph view for visualising relationships between evidence items */}
-                <details className="mt-6">
-                  <summary className="text-sm font-semibold text-vaultred cursor-pointer">Advanced</summary>
-                  <div className="mt-2">
-                    <h3 className="text-sm font-semibold text-vaultred mb-1">Relation graph</h3>
-                    <GraphView
-                    items={filteredEvidenceItems}
+                {/* Section: Graph */}
+                <div className="mt-8">
+                  <div className="section-hairline" />
+                  <h3 className="text-xs tracking-widest uppercase text-neonCyan/80 mb-2">Graph</h3>
+                  <GraphView
+                    items={filteredEventsForGraph}
+                    anchor={finalData?.evidence?.anchor as any}
+                    transitions={finalData?.evidence?.transitions as any}
                     selectedId={selectedEvidenceId}
                     onSelect={(id) => {
                       setSelectedEvidenceId(id);
-                      try { logEvent("ui.evidence_select", { id, rid: finalData?.meta?.request_id ?? null }); } catch {}
+                      try {
+                        logEvent("ui.evidence_select", { id, rid: finalData?.meta?.request_id ?? null });
+                      } catch {}
                     }}
                   />
-                  </div>
-                </details>
+                  {/* Transitions summary (preceding/succeeding) */}
+                </div>
               </>
             ) : (
-              <p className="text-copy text-sm">No evidence returned.</p>
+              <EmptyResult
+                heading="Unknown decision reference."
+                message="That slug isn’t in the vault. Try the Natural path and just ask your question."
+                ctaLabel="Go to Natural"
+                onCta={switchToNatural}
+                details='Tip: Ask something like “Why did Panasonic exit plasma TV production?”'
+              />
             )}
           </div>
         )}
         {/* Audit drawer trigger */}
         {(tokens.length > 0 || isStreaming || finalData) && (
-          <div className="mt-6 flex justify-end">
+          <div className="mt-8 flex justify-end">
             <Button
               onClick={handleOpenAudit}
               disabled={!finalData}
@@ -397,7 +542,7 @@ export default function MemoryPage() {
         )}
         {/* Error state */}
         {error && !isStreaming && (
-          <div className="mt-4 p-3 border-t border-red-500">
+          <div className="mt-6 pt-4 border-t border-red-500">
             <p className="text-red-400 font-mono text-sm">Error: {error.message}</p>
           </div>
         )}
