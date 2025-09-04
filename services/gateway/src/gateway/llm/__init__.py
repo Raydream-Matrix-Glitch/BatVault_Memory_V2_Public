@@ -3,7 +3,7 @@ import time
 from typing import Any, Dict, Optional
 import re
 from core_logging import get_logger
-from .logging_helpers import stage as log_stage
+from ..logging_helpers import stage as log_stage
 from core_config import get_settings
 from core_http.client import fetch_json
 _logger = get_logger("gateway.llm")
@@ -163,9 +163,29 @@ async def llm_call(envelope: Dict[str, Any],
         "latency_ms": 0,
         "error_code": None,
     })
+    # Persist adapter type and emit a decisive attempt log for auditability.
+    LAST_CALL["adapter"] = ("tgi" if (endpoint.endswith("/generate") or "tgi" in endpoint.lower()) else "vllm")
+    try:
+        log_stage("llm", "llm.attempt",
+                  request_id=request_id,
+                  endpoint=endpoint,
+                  cohort=cohort,
+                  adapter=LAST_CALL["adapter"],
+                  model=((envelope.get("policy") or {}).get("model")))
+    except Exception:
+        pass
     try:
         resp = await _invoke_adapter(endpoint, envelope, temperature=temperature, max_tokens=max_tokens)
         LAST_CALL["latency_ms"] = int((_time.perf_counter() - t0) * 1000)
+        try:
+            log_stage("llm", "llm.success",
+                      request_id=request_id,
+                      endpoint=endpoint,
+                      cohort=cohort,
+                      adapter=LAST_CALL.get("adapter"),
+                      latency_ms=LAST_CALL.get("latency_ms"))
+        except Exception:
+            pass
         return resp
     except Exception as e:
         LAST_CALL["latency_ms"] = int((_time.perf_counter() - t0) * 1000)
@@ -180,3 +200,5 @@ async def llm_call(envelope: Dict[str, Any],
         except Exception:
             pass
         raise
+# Back-compat export for older imports
+call_llm = llm_call

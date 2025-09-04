@@ -93,6 +93,31 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
     }
   }, [activeTab, meta?.request_id]);
 
+  useEffect(() => {
+    if (activeTab === "trace") {
+      try {
+        logEvent("ui.audit.trace_render", {
+          rid: meta?.request_id ?? null,
+          stages: (meta?.trace && meta.trace.length) || defaultStages.length,
+        });
+      } catch {}
+    }
+  }, [activeTab, meta?.trace]);
+
+  useEffect(() => {
+    try {
+      const el = document.querySelector('[data-testid="audit-drawer"]') as HTMLElement | null;
+      if (!el) return;
+      const box = el.getBoundingClientRect();
+      logEvent("ui.audit.drawer_mount", {
+        rid: meta?.request_id ?? null,
+        top: box.top,
+        bottom: box.bottom,
+        height: box.height,
+      });
+    } catch {}
+  }, []);
+
   // Helper to copy text to clipboard and notify the user silently.
   const copyToClipboard = async (text: string) => {
     try {
@@ -104,18 +129,10 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
   };
 
   // Default trace stages when no trace is provided
-  const defaultStages = [
-    "resolve",
-    "plan",
-    "exec",
-    "bundle",
-    "prompt",
-    "llm",
-    "validate",
-    "render",
-    "stream",
-  ];
+  const defaultStages = ["resolve", "plan", "exec_graph", "enrich", "bundle", "prompt", "llm", "validate", "render", "stream"];
 
+  // Optional per-stage timings in ms (UI degrades gracefully if absent)
+  const stageTimings = (meta as any)?.stage_timings ?? (meta as any)?.evidence_metrics?.stage_timings ?? null;
   // Flatten allowed and dropped IDs for evidence tab
   const allowed = evidence?.allowed_ids ?? [];
   // Prefer top-level fields; fall back to evidence_metrics (what the gateway emits today)
@@ -127,34 +144,33 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
   // Determine classes for drawer visibility. Increase width to accommodate all tabs
   // and ensure it doesn't cut off the last tab. On small screens, it still slides
   // in from the right with a fixed width (~28rem).
-  const drawerClasses = `fixed top-0 right-0 h-full w-[28rem] max-w-full bg-darkbg shadow-lg transform transition-transform duration-300 z-50 ${
+  const drawerClasses = `fixed top-0 bottom-0 right-0 m-0 h-screen w-[32rem] max-w-[96vw] bg-black/80 backdrop-blur-md border-l border-vaultred/40 shadow-neon-red transform transition-transform duration-300 z-50 ${
     open ? "translate-x-0" : "translate-x-full"
   }`;
 
   return (
-    <div className={drawerClasses} data-testid="audit-drawer">
+    <div className={drawerClasses + " flex flex-col"} data-testid="audit-drawer">
+      <div className="flex flex-col h-full">
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
         <h2 className="text-xl font-bold text-vaultred">Audit</h2>
-        <Button variant="secondary" onClick={onClose} className="px-2 py-1 text-sm">
-          Close
-        </Button>
-      </div>
-      {/* Compact meta bar */}
-      <div className="px-4 py-2 text-xs text-copy border-b border-gray-700 flex items-center justify-between">
-        <div className="flex flex-wrap gap-3 items-center">
-          <span><span className="font-semibold">Latency</span>: {meta?.latency_ms ?? "–"} ms</span>
-          <span><span className="font-semibold">Fallback</span>: {String(meta?.fallback_used ?? false)}</span>
-          <span className="hidden sm:inline">Prompt fp: {meta?.prompt_fingerprint ?? "–"}</span>
-          <span className="hidden sm:inline">Snapshot: {meta?.snapshot_etag ?? "–"}</span>
-        </div>
-        {(meta?.request_id || bundle_url) && (
-          <Button variant="secondary" onClick={async () => {
-            const { openEvidenceBundle } = await import("../../utils/bundle");
-            await openEvidenceBundle(meta?.request_id, bundle_url || undefined);
-          }} className="text-xs">
-            Open full bundle
+        <div className="flex items-center gap-2">
+          {meta?.request_id && (
+            <Button
+              variant="secondary"
+              onClick={() => {
+                try { logEvent("ui.audit.open_bundle", { rid: meta.request_id }); } catch {}
+                const url = bundle_url || `/v2/bundles/${meta.request_id}`;
+                window.open(url, "_blank");
+              }}
+              className="px-2 py-1 text-sm"
+            >
+              Open bundle
+            </Button>
+          )}
+          <Button variant="secondary" onClick={onClose} className="px-2 py-1 text-sm">
+            Close
           </Button>
-        )}
+        </div>
       </div>
       {/* Tabs */}
       <div className="flex space-x-3 px-4 border-b border-gray-700 overflow-x-auto">
@@ -199,18 +215,30 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
           <span>Fingerprint</span>
         </Tab>
       </div>
-      <div className="overflow-y-auto p-4 space-y-4" style={{ height: "calc(100% - 100px)" }}>
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {/* Trace tab */}
         {activeTab === "trace" && (
           <div>
             <h3 className="text-lg font-semibold text-vaultred mb-2">Gateway trace</h3>
-            <ol className="list-decimal list-inside space-y-1 text-copy text-sm">
-              {(meta?.trace && meta.trace.length > 0 ? meta.trace : defaultStages).map(
-                (stage, idx) => (
-                  <li key={`${stage}-${idx}`}>{stage}</li>
-                )
-              )}
-            </ol>
+            <div className="space-y-2">
+              {((meta?.trace && meta.trace.length > 0) ? meta.trace : defaultStages).map((stage, idx) => {
+                const ms = stageTimings && (stageTimings as any)[stage];
+                return (
+                  <div
+                    key={stage + "-" + idx}
+                    className="w-full rounded-xl border border-vaultred/50 bg-black/40 px-3 py-2 text-sm text-copy flex items-center justify-between"
+                  >
+                    <div className="flex items-center">
+                      <span className="font-mono opacity-70">{String(idx + 1).padStart(2, "0")}</span>
+                      <span className="ml-3 font-semibold">{stage}</span>
+                    </div>
+                    {typeof ms === "number" && (
+                      <span className="opacity-80 font-mono">{ms} ms</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
         {/* Prompt tab */}
@@ -400,33 +428,33 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
         )}
         {/* Metrics tab */}
         {activeTab === "metrics" && (
-          <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm text-copy">
-            <>
-              <div className="font-semibold">Latency</div>
-              <div>{meta?.latency_ms ?? "–"} ms</div>
-              <div className="font-semibold">Retries</div>
-              <div>{meta?.retries ?? "–"}</div>
-              <div className="font-semibold">Fallback used</div>
-              <div>{meta?.fallback_used ? "yes" : "no"}</div>
-              <div className="font-semibold">Fallback reason</div>
-              <div>{meta?.fallback_reason ?? "–"}</div>
-              <div className="font-semibold">Bundle size</div>
-              <div>{meta?.bundle_size_bytes ?? "–"} bytes</div>
-              <div className="font-semibold">Evidence count</div>
-              <div>{evidence ? evidence.events.length + 1 : "–"}</div>
-              <div className="font-semibold">Prompt tokens</div>
-              <div>{(meta as any)?.prompt_tokens ?? "–"}</div>
-              <div className="font-semibold">Evidence tokens</div>
-              <div>{(meta as any)?.evidence_tokens ?? "–"}</div>
-              <div className="font-semibold">Max tokens</div>
-              <div>{(meta as any)?.max_tokens ?? "–"}</div>
-              <div className="font-semibold">Selector</div>
-              <div>{(meta as any)?.selector_model_id ?? "–"}</div>
-              <div className="font-semibold">Load shed</div>
-              <div>{(meta as any)?.load_shed ? "yes" : "no"}</div>
-            </>
+          <div className="flex flex-col gap-2 text-sm text-copy">
+            {[
+              ["Latency", `${meta?.latency_ms ?? "–"} ms`],
+              ["Retries", meta?.retries ?? "–"],
+              ["Fallback used", meta?.fallback_used ? "yes" : "no"],
+              ["Fallback reason", meta?.fallback_reason ?? "–"],
+              ["Bundle size", (meta as any)?.bundle_size_bytes ?? "–"],
+              ["Evidence count", evidence ? (evidence.events?.length ?? 0) + 1 : "–"],
+              ["Prompt tokens", (meta as any)?.prompt_tokens ?? "–"],
+              ["Evidence tokens", (meta as any)?.evidence_tokens ?? "–"],
+              ["Max tokens", (meta as any)?.max_tokens ?? "–"],
+              ["Selector", (meta as any)?.selector_model_id ?? "–"],
+              ["Load shed", (meta as any)?.load_shed ? "yes" : "no"],
+              ["Routing conf.", (meta as any)?.routing_confidence ?? "–"],
+              ["Functions", (meta?.function_calls && meta.function_calls.length > 0) ? meta.function_calls.join(", ") : "–"],
+            ].map(([label, val]) => (
+              <div
+                key={String(label)}
+                className="w-full border border-vaultred/50 rounded-md px-3 py-2 flex items-center justify-between"
+              >
+                <span className="font-semibold">{label as string}</span>
+                <span className="font-mono break-all">{String(val)}</span>
+              </div>
+            ))}
           </div>
         )}
+          </div>
         {/* Fingerprint tab */}
         {activeTab === "fingerprints" && (
           <div className="space-y-3 text-sm text-copy break-all">

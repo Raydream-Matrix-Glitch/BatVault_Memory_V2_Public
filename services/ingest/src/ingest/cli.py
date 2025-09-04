@@ -1,4 +1,4 @@
-import sys, os, glob, re, time, argparse, hashlib
+import sys, os, glob, re, time, argparse, hashlib, platform
 from importlib import resources 
 from jsonschema import Draft202012Validator
 from core_logging import get_logger, log_stage, trace_span, log_event
@@ -14,6 +14,9 @@ from .catalog.field_catalog import build_field_catalog, build_relation_catalog
 
 logger = get_logger("ingest-cli")
 log_event(logger, "json_parser_selected", parser="core_utils.jsonx", fallback=False)
+log_event(logger, "json_parser_runtime", parser="core_utils.jsonx",
+          orjson_present=bool(getattr(jsonx, "_orjson", None)),
+          python=platform.python_version(), jsonx_module=getattr(jsonx, "__file__", None))
 settings = get_settings()
 
 # ------------------------------------------------------------------
@@ -69,12 +72,14 @@ def load_schema(name: str) -> dict:
     """
     pkg = "ingest.schemas.json_v2"
     path = resources.files(pkg).joinpath(f"{name}.schema.json")
-    # Parse the schema using the canonical jsonx loader for deterministic
-    # key ordering and float handling.  Fallback to an empty dict on error.
+    # Parse using the canonical JSON loader for deterministic handling.
+    # Fail closed in case of schema parse errors (validator will catch later).
     try:
-        return jsonx.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return jsonx.loads(path.read_text(encoding="utf-8"))
+        return jsonx.loads(path.read_bytes())
+    except Exception as e:
+        log_stage(logger, "ingest", "schema_parse_error",
+                  schema=name, error=str(e))
+        return {}
 
 SC_DECISION = load_schema("decision")
 SC_EVENT = load_schema("event")
@@ -108,16 +113,21 @@ def seed(path: str) -> int:
     alias_stats = {"hits": 0, "docs": 0}
     for p in files:
         try:
-            with open(p, "r", encoding="utf-8") as fh:
+            with open(p, "rb") as fh:
                 doc = jsonx.loads(fh.read())
         except Exception as e:
-            # Log parse errors via structured logging; capture line/column when available.
-            if getattr(e, "lineno", None):
-                msg = f"{p}:{e.lineno}:{e.colno}: json error {e.msg}"
-            else:
-                msg = f"{p}: json error {e}"
-            errors.append(msg)
-            log_stage(logger, "ingest", "fixture_parse_error", path=p, error=str(e))
+            # Structured parse error with cross-impl (orjson/stdlib) support
+            line = getattr(e, "lineno", getattr(e, "line", None))
+            col  = getattr(e, "colno",  getattr(e, "col",  None))
+            msg  = getattr(e, "msg", str(e))
+            err_type = f"{e.__class__.__module__}.{e.__class__.__name__}"
+            pretty = f"{p}:{line}:{col}: json error {msg}" if (line and col) else f"{p}: json error {msg}"
+            errors.append(pretty)
+            log_stage(
+                logger, "ingest", "fixture_parse_error",
+                path=p, error=msg, error_type=err_type, line=line, col=col, parser="core_utils.jsonx",
+                deterministic_id=_stable_id(p),
+            )
             continue
         # Canonicalize aliases BEFORE kind inference and schema validation
         doc, hits = canonicalize(doc)
@@ -189,15 +199,20 @@ def seed(path: str) -> int:
     # ---------- 🎯  content-addressable batch snapshot (spec §D) ----------
     from core_storage.minio_utils import ensure_bucket
     import minio, io, gzip, datetime as _dt
-    from core_utils import jsonx
     minio_client = minio.Minio(settings.minio_endpoint,
                                access_key=settings.minio_access_key,
                                secret_key=settings.minio_secret_key,
                                secure=False)
     ensure_bucket(minio_client, "batvault-snapshots", 30)
-    blob = gzip.compress(jsonx.dumps({"decisions": decisions,
-                                       "events": events,
-                                       "transitions": transitions}).encode("utf-8"))
+    blob = gzip.compress(
+        jsonx.dumps(
+            {
+                "decisions": decisions,
+                "events": events,
+                "transitions": transitions,
+            }
+        ).encode("utf-8")
+    )
     obj_name = f"{snapshot_etag}.json.gz"
     minio_client.put_object("batvault-snapshots", obj_name,
                             io.BytesIO(blob), length=len(blob),
@@ -238,7 +253,7 @@ def seed(path: str) -> int:
         removed_nodes=removed_nodes, removed_edges=removed_edges,
         latency_ms=dt_total_ms,
     )
-    # Emit the final summary using jsonx.dumps for stable key ordering.
+    # Emit the final summary using _jsonx.dumps for stable key ordering.
     print(jsonx.dumps({"ok": True, "files": len(files), "snapshot_etag": snapshot_etag}))
     return 0
 

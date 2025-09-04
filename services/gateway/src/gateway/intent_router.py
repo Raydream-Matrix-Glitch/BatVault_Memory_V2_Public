@@ -6,9 +6,7 @@ returns lightweight metadata used for audit logs. The actual Memory
 API calls are performed later by the builder.
 """
 from __future__ import annotations
-
 from typing import Any, Dict, List
-
 from core_logging import get_logger
 from .logging_helpers import stage as log_stage
 

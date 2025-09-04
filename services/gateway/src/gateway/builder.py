@@ -19,18 +19,16 @@ from core_models.models import (
     MetaInfo,
 )
 from core_models.meta_inputs import MetaInputs
-
-from gateway.budget_gate import run_gate
 from shared.normalize import normalise_event_amount as _normalise_event_amount  # promoted helper
 from shared import dedup_and_normalise_events as _shared_dedup_and_normalise_events
 from gateway import selector as _selector
-from gateway.inference_router import last_call as _llm_last_call
+from gateway.inference_router import last_call as _inference_last_call
+from gateway.inference_router import sanitize_fallback_reason as _sanitize_fallback_reason
 from .prompt_envelope import build_prompt_envelope
 from .templater import finalise_short_answer
 from core_validator import validate_response as _core_validate_response
 from core_validator import canonical_allowed_ids
-from gateway.inference_router import call_llm as llm_call
-import gateway.templater as templater
+from gateway.inference_router import llm_call
 import inspect
 
 # Import metadata helpers to construct canonical meta information.  The
@@ -456,7 +454,8 @@ async def build_why_decision_response(
             log_stage("prompt", "llm_gate",
                       llm_mode=settings.llm_mode,
                       load_shed=should_load_shed(),
-                      use_llm=use_llm)
+                      use_llm=use_llm,
+                      policy_model=getattr(settings, "vllm_model_name", None))
             if not use_llm and should_load_shed():
                 # Strategic breadcrumb for the Audit Drawer
                 log_stage("llm", "shed", reason="load_shed_flag", request_id=req_id)
@@ -500,9 +499,18 @@ async def build_why_decision_response(
                     temperature=temp,
                     max_tokens=max_tokens,
                 )
-            except Exception:
-                # On any exception treat as no raw JSON (fallback path)
+            except Exception as e:
                 raw_json = None
+                # Leave detailed reason mapping to inference_router; we just mark the attempt.
+                try:
+                    log_stage(
+                        "inference",
+                        "dispatch_exception",
+                        request_id=req_id,
+                        exception=type(e).__name__,
+                    )
+                except Exception:
+                    pass
             # No explicit retry loop here; llm_call delegates retries.
             retry_count = max_retries
         # Determine whether this is a fallback: if the LLM did not run
@@ -515,38 +523,18 @@ async def build_why_decision_response(
             llm_fallback = True
             if use_llm:
                 try:
-                    from gateway.llm import (_llm_last_call as _llm_last_call_imported,
-                                             _sanitize_reason as _sanitize_reason_imported)
-                    imported_last_call = _llm_last_call_imported
-                    sanitize_fn = _sanitize_reason_imported
+                    from gateway.inference_router import last_call as imported_last_call  # modern source of truth
                 except Exception:
-                    # Fall back to a local sanitiser and an empty last_call
                     imported_last_call = {}
-                    def sanitize_fn(reason: str | None) -> str:
-                        """
-                        Local sanitiser used when the gateway.llm module cannot be imported.
-                        Empty or unknown reasons indicate the model was unavailable; return
-                        ``llm_unavailable`` in that case.  Preserve HTTP-related reasons
-                        as ``http_error`` for observability.
-                        """
-                        if not reason:
-                            return "llm_unavailable"
-                        r = str(reason).strip().lower()
-                        allowed = {
-                            "llm_off",
-                            "endpoint_unreachable",
-                            "timeout",
-                            "http_error",
-                            "parse_error",
-                            "stub_answer",
-                            "no_raw_json",
-                            "llm_unavailable",
-                        }
-                        if r in allowed:
-                            return r
-                        return "http_error" if "http" in r else "llm_unavailable"
                 error_code = imported_last_call.get("error_code") if isinstance(imported_last_call, dict) else None
-                fallback_reason = sanitize_fn(error_code)
+                if not error_code:
+                    status = (str(imported_last_call.get("status") or "").lower()
+                              if isinstance(imported_last_call, dict) else "")
+                    if "timeout" in status:
+                        error_code = "timeout"
+                    elif "http" in status:
+                        error_code = "http_error"
+                fallback_reason = _sanitize_fallback_reason(error_code)
                 # Strategic log: immediate fallback decision (+ environment for audit).
                 # When no error code is present default to ``llm_unavailable`` so
                 # clients know the model was unreachable (replaces “no_raw_json”).
@@ -555,11 +543,15 @@ async def build_why_decision_response(
                         "llm",
                         "fallback_decision",
                         request_id=req_id,
-                        reason=(_llm_last_call.get("error_code") or "llm_unavailable"),
-                        openai_disabled=getattr(s, "openai_disabled", False),
-                        canary_pct=getattr(s, "canary_pct", 0),
-                        control=getattr(s, "control_model_endpoint", ""),
-                        canary=getattr(s, "canary_model_endpoint", ""),
+                        reason=(fallback_reason or "llm_unavailable"),
+                        adapter=imported_last_call.get("adapter"),
+                        endpoint=(imported_last_call.get("endpoint") or getattr(settings, "control_model_endpoint", "")),
+                        latency_ms=imported_last_call.get("latency_ms"),
+                        policy_model=(envelope.get("policy") or {}).get("model"),
+                        openai_disabled=getattr(settings, "openai_disabled", False),
+                        canary_pct=getattr(settings, "canary_pct", 0),
+                        control=getattr(settings, "control_model_endpoint", ""),
+                        canary=getattr(settings, "canary_model_endpoint", ""),
                     )
                 except Exception:
                     pass
@@ -661,10 +653,10 @@ async def build_why_decision_response(
     llm_attempt = None
     llm_latency = None
     try:
-        llm_model   = _llm_last_call.get("model")
-        llm_canary  = _llm_last_call.get("canary")
-        llm_attempt = _llm_last_call.get("attempt")
-        llm_latency = _llm_last_call.get("latency_ms")
+        llm_model   = _inference_last_call.get("model")
+        llm_canary  = _inference_last_call.get("canary")
+        llm_attempt = _inference_last_call.get("attempt")
+        llm_latency = _inference_last_call.get("latency_ms")
     except Exception:
         pass
 
@@ -675,10 +667,20 @@ async def build_why_decision_response(
             _metric_counter('gateway_llm_fallback_total', 1)
         except Exception:
             pass
-        log_stage("builder", "llm_fallback_used",
-                  request_id=req_id,
-                  prompt_fp=prompt_fp,
-                  bundle_fp=bundle_fp)
+        log_stage(
+            "builder",
+            "llm_fallback_used",
+            request_id=req_id,
+            prompt_fp=prompt_fp,
+            bundle_fp=bundle_fp,
+            fallback_reason=fallback_reason,
+            llm_mode=getattr(settings, "llm_mode", "unknown"),
+            load_shed=should_load_shed(),
+            llm_model=llm_model,
+            llm_canary=llm_canary,
+            llm_attempt=llm_attempt,
+            llm_latency_ms=llm_latency
+        )
     if sel_meta.get("selector_truncation"):
         log_stage("builder", "selector_truncated",
                   request_id=req_id,
@@ -827,11 +829,7 @@ async def build_why_decision_response(
     fallback_used = bool(llm_fallback or any_validation)
     # Log an explicit fallback reason for traceability
     try:
-        if llm_fallback:
-            log_stage("builder", "llm_fallback_used",
-                      request_id=req_id, prompt_fp=prompt_fp, bundle_fp=bundle_fp,
-                      snapshot_etag=snapshot_etag_fp)
-        elif any_validation:
+        if not llm_fallback and any_validation:
             if fatal_validation:
                 codes = [e.get("code") for e in validator_errs or [] if e.get("code") in fatal_codes]
                 log_stage("builder", "validator_fallback",
@@ -930,7 +928,6 @@ async def build_why_decision_response(
         )
         anchor_id = getattr(ev.anchor, "id", None) or "unknown"
         log_stage(
-            logger,
             "builder",
             "etag_propagated",
             anchor_id=anchor_id,

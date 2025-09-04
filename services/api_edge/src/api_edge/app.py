@@ -28,7 +28,7 @@ import core_metrics
 from core_utils.health import attach_health_routes
 from core_utils import idempotency_key
 from core_utils.ids import generate_request_id
-from core_utils import jsonx as _jsonx
+from core_utils import jsonx
 from typing import Dict
 
 # ---------------------------------------------------------------------------
@@ -154,7 +154,7 @@ async def req_logger(request: Request, call_next):  # noqa: D401
         # ---- pre-request ----------------------------------------------------
         body = await request.body()
         try:
-            parsed = _jsonx.loads(body.decode("utf-8")) if body else None
+            parsed = jsonx.loads(body.decode("utf-8")) if body else None
         except Exception:
             parsed = body.decode("utf-8", errors="ignore")
 
@@ -395,7 +395,13 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
                 )
             except Exception:
                 pass
-            return JSONResponse(status_code=502, content={"detail": "upstream_error"})
+            # If streaming fails, fall back to a normal POST once so callers still get a deterministic fallback.
+            try:
+                resp2 = await client.post(upstream_url, content=body, headers=inject_trace_context(headers))
+                data2 = resp2.json()
+                return JSONResponse(status_code=resp2.status_code, content=data2)
+            except Exception:
+                return JSONResponse(status_code=502, content={"detail": "upstream_error"})
         status_code = getattr(upstream, "status_code", 500)
         etag = upstream.headers.get("x-snapshot-etag")
         content_type = upstream.headers.get("content-type", "text/event-stream")

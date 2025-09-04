@@ -1,7 +1,7 @@
 {
   "id": "philips-lighting-split-2014",
   "option": "Split Philips into HealthTech and Lighting divisions",
-  "description": "On 23 September 2014, Philips announced its intention to split the group into two separate market-leading entities: HealthTech and Lighting.",
+  "rationale": "On 23 September 2014, Philips announced its intention to split the group into two separate market-leading entities: HealthTech and Lighting.",
   "timestamp": "2014-09-23T00:00:00Z",
   "decision_maker": "Frans van Houten",
   "tags": ["organizational_structure"],

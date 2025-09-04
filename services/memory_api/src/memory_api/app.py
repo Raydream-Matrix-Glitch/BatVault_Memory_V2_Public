@@ -356,8 +356,6 @@ async def enrich_transition(node_id: str, response: Response):
 def field_catalog(request):
     """Test-friendly callable mirroring /api/schema/fields."""
     fields, etag = _compute_field_catalog()
-    log_stage(logger, "schema", "fields_function_called",
-              has_mutable_headers=isinstance(getattr(request, "headers", None), dict))
     if isinstance(getattr(request, "headers", None), dict) and etag:
         request.headers["x-snapshot-etag"] = etag
     return {"fields": fields}
@@ -365,8 +363,6 @@ def field_catalog(request):
 def relation_catalog(request):
     """Test-friendly callable mirroring /api/schema/rels."""
     relations, etag = _compute_relation_catalog()
-    log_stage(logger, "schema", "relations_function_called",
-              has_mutable_headers=isinstance(getattr(request, "headers", None), dict))
     if isinstance(getattr(request, "headers", None), dict) and etag:
         request.headers["x-snapshot-etag"] = etag
     return {"relations": relations}

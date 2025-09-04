@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 import pathlib
 import re
 
-from core_utils import jsonx as _jsonx
+from core_utils import jsonx
 from core_logging import get_logger, trace_span
 from ..logging_helpers import stage as log_stage
 from core_observability.otel import inject_trace_context
@@ -36,7 +36,7 @@ def _offline_fixture_search(text: str, k: int = 24) -> List[Dict[str, Any]]:
     matches: List[Dict[str, Any]] = []
     for path in repo.glob("*.json"):
         try:
-            doc = _jsonx.loads(path.read_text(encoding="utf-8"))
+            doc = jsonx.loads(path.read_text(encoding="utf-8"))
         except Exception:       # malformed fixture – ignore
             continue
         haystack = f"{doc.get('option','')} {doc.get('rationale','')}".lower()

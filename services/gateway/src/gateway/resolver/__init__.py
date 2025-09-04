@@ -7,7 +7,7 @@ from typing import Dict, Any
 from redis.exceptions import RedisError, ConnectionError
 
 from core_http.client import fetch_json
-from core_utils import jsonx as _jsonx
+from core_utils import jsonx
 from gateway.redis import get_redis_pool
 from ..metrics import counter as _metric_counter, histogram as _metric_histogram
 
@@ -86,7 +86,7 @@ async def resolve_decision_text(
         cached = await _cache_get(cache_key)
         if cached:
             _metric_counter("cache_hit_total", 1, service="resolver")
-            return _jsonx.loads(cached)
+            return jsonx.loads(cached)
 
         try:
             # Start the slug short‑circuit via the unified fetch_json helper.  This will
@@ -107,7 +107,7 @@ async def resolve_decision_text(
             )
             if isinstance(data, dict) and data.get("id") == _text:
                 _metric_counter("resolver_slug_short_circuit_total", 1, service="resolver")
-                await _cache_setex(cache_key, CACHE_TTL, _jsonx.dumps(data))
+                await _cache_setex(cache_key, CACHE_TTL, jsonx.dumps(data))
                 log_stage(
                     "resolver",
                     "slug_short_circuit_end",
@@ -126,7 +126,7 @@ async def resolve_decision_text(
     cached = await _cache_get(key)
     if cached:
         _metric_counter("cache_hit_total", 1, service="resolver")
-        return _jsonx.loads(cached)
+        return jsonx.loads(cached)
 
     _metric_counter("cache_miss_total", 1, service="resolver")
 
@@ -160,5 +160,5 @@ async def resolve_decision_text(
     _metric_histogram("resolver_confidence", float(best_score))
     best = best_candidate
 
-    await _cache_setex(key, CACHE_TTL, _jsonx.dumps(best))
+    await _cache_setex(key, CACHE_TTL, jsonx.dumps(best))
     return best

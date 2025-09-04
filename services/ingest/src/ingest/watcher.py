@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import redis, time
-from core_utils import jsonx as _jsonx
+import asyncio
+from core_utils import jsonx
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,7 +29,7 @@ def _cache_get(key: str):
     val = r.get(key)
     if val is not None:
         _metric_counter("cache_hit_total", 1, service="ingest")
-        return _jsonx.loads(val)
+        return jsonx.loads(val)
     _metric_counter("cache_miss_total", 1, service="ingest")
     return None
 
@@ -37,7 +38,7 @@ def _cache_set(key: str, value, ttl: int = _CACHE_TTL):
     if not r:
         return
     _metric_counter("cache_write_total", 1, service="ingest")
-    r.setex(key, ttl, _jsonx.dumps(value))
+    r.setex(key, ttl, jsonx.dumps(value))
 
 # Initialize structured logger with ingest service context
 logger = get_logger("ingest.watcher")

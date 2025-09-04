@@ -1,8 +1,29 @@
-from typing import Any, Mapping, Iterable
-import orjson
-from pydantic import BaseModel  # type: ignore
+from __future__ import annotations
+from typing import Any, Mapping
+import json as _pyjson
+import os
+
+# Optional, fast path JSON
+try:
+    import orjson as _orjson  # type: ignore
+except Exception:  # pragma: no cover - orjson missing/unavailable
+    _orjson = None
+
+# Optional override to force stdlib json (diagnostics/compat)
+if os.getenv("JSONX_FORCE_STDJSON", "").strip().lower() in ("1","true","yes"):  # pragma: no cover
+    _orjson = None
+
+# Optional Pydantic import across v1/v2
+try:
+    from pydantic import BaseModel  # type: ignore
+except Exception:  # pragma: no cover
+    BaseModel = object  # type: ignore
 
 __all__ = ["dumps", "loads", "sanitize"]
+
+def _is_pydantic_model(obj: Any) -> bool:
+    # Works for both pydantic v1/v2 and duck-typed models
+    return isinstance(obj, BaseModel) or hasattr(obj, "model_dump") or hasattr(obj, "dict")
 
 def sanitize(obj: Any) -> Any:
     """Recursively convert *obj* into something JSON-serialisable.
@@ -22,11 +43,15 @@ def sanitize(obj: Any) -> Any:
         return {"error": obj.__class__.__name__, "message": str(obj)}
 
     # Pydantic models
-    if isinstance(obj, BaseModel):  # pragma: no cover - defensive
+    if _is_pydantic_model(obj):  # pragma: no cover - defensive
+        # Prefer v2 API, fall back to v1
         try:
-            return obj.model_dump(mode="python")
+            return obj.model_dump(mode="python")  # type: ignore[attr-defined]
         except Exception:
-            return str(obj)
+            try:
+                return obj.dict()  # type: ignore[attr-defined]
+            except Exception:
+                return str(obj)
 
     # Bytes → text
     if isinstance(obj, (bytes, bytearray, memoryview)):
@@ -70,10 +95,52 @@ def dumps(obj: Any) -> str:
     """
     def _default(o: Any) -> Any:
         return sanitize(o)
-    return orjson.dumps(obj, option=orjson.OPT_SORT_KEYS, default=_default).decode("utf-8")
+    # Fast path: orjson (if available)
+    if _orjson is not None:
+        try:
+            return _orjson.dumps(obj, option=_orjson.OPT_SORT_KEYS, default=_default).decode("utf-8")
+        except Exception:
+            # fall through to stdlib
+            pass
+    # Robust fallback: stdlib json (handles more exotic types via default())
+    return _pyjson.dumps(
+        obj,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=_default,
+        separators=(",", ":"),  # canonical/compact
+    )
 
 def loads(data: str | bytes) -> Any:
-    """Fast JSON load from str/bytes."""
+    """Robust JSON load from str/bytes with BOM/encoding fallback.
+
+    - Accepts str or bytes
+    - Tries orjson first (bytes only)
+    - On failure, strips UTF-8 BOM and retries once
+    - Falls back to stdlib json with 'utf-8-sig' decoding
+    """
+    # Normalise to bytes for fast path
     if isinstance(data, str):
-        data = data.encode("utf-8")
-    return orjson.loads(data)
+        b = data.encode("utf-8", errors="strict")
+    else:
+        b = data
+
+    # Fast path: orjson if available
+    if _orjson is not None:
+        try:
+            return _orjson.loads(b)
+        except Exception:
+            # Try stripping BOM once then retry
+            try:
+                if len(b) >= 3 and b[:3] == b"\xef\xbb\xbf":
+                    return _orjson.loads(b[3:])
+            except Exception:
+                pass
+            # fall through to stdlib
+
+    # Fallback: stdlib json with utf-8-sig to drop BOM if present
+    try:
+        txt = b.decode("utf-8-sig")
+    except Exception:
+        txt = b.decode("utf-8", errors="replace")
+    return _pyjson.loads(txt)

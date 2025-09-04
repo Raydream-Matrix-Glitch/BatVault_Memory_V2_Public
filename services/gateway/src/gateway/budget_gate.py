@@ -16,6 +16,7 @@ from core_config.constants import (
     GATE_COMPLETION_SHRINK_FACTOR,
     GATE_SHRINK_JITTER_PCT,
     GATE_MAX_SHRINK_RETRIES,
+    GATE_SAFETY_HEADROOM_TOKENS,
 )
 from core_models.models import GatePlan
 from shared.prompt_budget import gate_budget
@@ -76,12 +77,19 @@ def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, mo
         dynamic_context = CONTROL_CONTEXT_WINDOW
         dynamic_completion = CONTROL_COMPLETION_TOKENS
 
+    try:
+        headroom = int(getattr(_s, 'gate_safety_headroom_tokens', None) or GATE_SAFETY_HEADROOM_TOKENS)
+    except Exception:
+        headroom = GATE_SAFETY_HEADROOM_TOKENS
+    # Ensure the effective context never drops below guard+64 so we always allow a minimal completion.
+    effective_context = max(CONTROL_PROMPT_GUARD_TOKENS + 64, int(dynamic_context) - int(headroom))
+
     gp_dict, trimmed_evidence = gate_budget(
         render_fn=build_messages,
         truncate_fn=authoritative_truncate,
         envelope=envelope,
         evidence_obj=evidence_obj,
-        context_window=dynamic_context,
+        context_window=effective_context,
         guard_tokens=CONTROL_PROMPT_GUARD_TOKENS,
         desired_completion_tokens=dynamic_completion,
         max_retries=GATE_MAX_SHRINK_RETRIES,

@@ -190,6 +190,25 @@ def build_prompt_envelope(
         # OTEL optional – ignore if not installed
         pass
 
+    # Ensure policy.model is set so adapters don't fall back to intent as a model name.
+    try:
+        from core_config import get_settings as _get_settings  # local import to avoid circulars
+        _s = _get_settings()
+        _policy = env.get("policy") or {}
+        if not (_policy.get("model") or "").strip():
+            _mn = getattr(_s, "vllm_model_name", None)
+            if _mn:
+                _policy["model"] = _mn
+                env["policy"] = _policy
+                try:
+                    from .logging_helpers import stage as _log_stage
+                    _log_stage("prompt", "policy_model_injected", model=_mn)
+                except Exception:
+                    pass
+    except Exception:
+        # Best-effort only: never fail envelope building for missing model name
+        pass
+
     return env
 
 try:

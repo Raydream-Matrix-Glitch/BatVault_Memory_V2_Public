@@ -7,12 +7,15 @@ MAX_PROMPT_BYTES = int(os.getenv("MAX_PROMPT_BYTES", "8192"))
 SELECTOR_TRUNCATION_THRESHOLD = int(os.getenv("SELECTOR_TRUNCATION_THRESHOLD", "6144"))
 
 # -------- Token-aware budgets (new) -----------------------------------
-# Total context window of the control model (e.g., 2048)
-CONTROL_CONTEXT_WINDOW = int(os.getenv("CONTROL_CONTEXT_WINDOW", "2048"))
+# Total context window of the control model (e.g., 2048).
+# If CONTROL_CONTEXT_WINDOW is unset, fall back to VLLM_MAX_MODEL_LEN for convenience.
+CONTROL_CONTEXT_WINDOW = int((os.getenv("CONTROL_CONTEXT_WINDOW") or os.getenv("VLLM_MAX_MODEL_LEN") or "2048"))
 # Desired completion budget; router will clamp to remaining room
 CONTROL_COMPLETION_TOKENS = int(os.getenv("CONTROL_COMPLETION_TOKENS", "512"))
 # Guard tokens for wrappers/stop sequences/system prompts
 CONTROL_PROMPT_GUARD_TOKENS = int(os.getenv("CONTROL_PROMPT_GUARD_TOKENS", "32"))
+LLM_MIN_COMPLETION_TOKENS = int(os.getenv("LLM_MIN_COMPLETION_TOKENS", "16"))
+GATE_SAFETY_HEADROOM_TOKENS = int(os.getenv("GATE_SAFETY_HEADROOM_TOKENS", "128"))
 
 # -------- Gate shrink knobs (deterministic) -------------------------------
 GATE_COMPLETION_SHRINK_FACTOR = float(os.getenv("GATE_COMPLETION_SHRINK_FACTOR", "0.8"))

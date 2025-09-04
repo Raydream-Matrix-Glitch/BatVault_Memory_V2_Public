@@ -50,7 +50,34 @@ class WhyDecisionAnchor(BaseModel):
         return self
     model_config = ConfigDict(extra='forbid')
 
-class MetaInfo(BaseModel):
+class _DictLikeMixin:
+    """
+    Lightweight dict-compatibility for Pydantic models used in the Gateway.
+    Lets existing code call .get(), .update(), and item access while keeping
+    Pydantic validation and `extra="forbid"`.
+    """
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+    def update(self, data: Dict[str, Any]) -> None:
+        # Only set known fields to preserve `extra="forbid"`.
+        for k, v in (data or {}).items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+    def __getitem__(self, key: str):
+        if hasattr(self, key):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value) -> None:
+        if hasattr(self, key):
+            setattr(self, key, value)
+        else:
+            # Preserve explicit schema forbidding unknown keys.
+            raise KeyError(key)
+
+class MetaInfo(_DictLikeMixin, BaseModel):
     """
     Canonical, JSON-first meta block (single source of truth).
     Exactly one occurrence per field; validated before serialization.
@@ -75,6 +102,10 @@ class MetaInfo(BaseModel):
     validator_error_count: int
     # Compact, public-safe list of validator warning codes
     validator_warnings: List[str] = Field(default_factory=list)
+    # ---- Natural-language routing (for /v2/query) ----
+    function_calls: Optional[List[str]] = None
+    routing_confidence: Optional[float] = None
+    routing_model_id: Optional[str] = None
     # Trace correlation for UI audit drawer
     trace_id: Optional[str] = None
     span_id: Optional[str] = None

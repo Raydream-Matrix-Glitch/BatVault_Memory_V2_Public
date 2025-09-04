@@ -309,6 +309,14 @@ async def request_logging_middleware(request: Request, call_next):
     req_id = compute_request_id(str(request.url.path), dict(request.query_params), None); t0 = time.perf_counter()
     log_stage("request", "request_start", request_id=req_id,
               path=request.url.path, method=request.method)
+    try:
+        log_stage("request", "v2_query_start",
+                  request_id=req_id,
+                  llm_mode=getattr(settings, "llm_mode", "unknown"),
+                  stream=bool(stream),
+                  text_len=len(q))
+    except Exception:
+        pass
 
     try:
         from opentelemetry import trace as _trace  # type: ignore
@@ -605,6 +613,12 @@ async def ask(
                 etag = None
             if etag:
                 headers["x-snapshot-etag"] = etag
+        try:
+            log_stage("request", "v2_query_end",
+                      request_id=req_id,
+                      fallback_used=bool(resp.meta.get("fallback_used", False)))
+        except Exception:
+            pass
         return StreamingResponse(
             stream_answer_with_final(
                 short_answer,
@@ -628,6 +642,12 @@ async def ask(
             headers["x-model"] = str(mdl)
         if can is not None:
             headers["x-canary"] = "true" if can else "false"
+    except Exception:
+        pass
+    try:
+        log_stage("request", "v2_query_end",
+                  request_id=req_id,
+                  fallback_used=bool(resp.meta.get("fallback_used", False)))
     except Exception:
         pass
     return JSONResponse(content=resp.model_dump(mode="python"), headers=headers)
