@@ -18,6 +18,7 @@ from core_models.models import (
     WhyDecisionEvidence,
     WhyDecisionTransitions,
 )
+from .logging_helpers import stage as log_stage
 from .budget_gate import authoritative_truncate
 from .selector import bundle_size_bytes
 from core_validator import canonical_allowed_ids
@@ -47,11 +48,17 @@ async def resolve_anchor(decision_ref: str, *, intent: str | None = None):
     await asyncio.sleep(0)
     return {"id": decision_ref}
 
-async def expand_graph(decision_id: str, *, intent: str | None = None, k: int = 1):
+async def expand_graph(decision_id: str, *, intent: str | None = None, k: int = 1, policy_headers: dict | None = None):
     settings = get_settings()
     payload = {"node_id": decision_id, "k": k}
     try:
-        data = await fetch_json("POST", f"{settings.memory_api_url}/api/graph/expand_candidates", json=payload, stage="expand")
+        data = await fetch_json(
+            "POST",
+            f"{settings.memory_api_url}/api/graph/expand_candidates",
+            json=payload,
+            stage="expand",
+            headers=inject_trace_context(dict(policy_headers or {})),
+        )
         return data or {"neighbors": [], "meta": {}}
     except Exception as exc:
         logger.warning("expand_candidates_failed", extra={"anchor_id": decision_id, "error": type(exc).__name__})
@@ -181,7 +188,10 @@ class EvidenceBuilder:
         include_neighbors: bool = True,
         intent: str = "why_decision",
         scope: str = "k1",
+        fresh: bool = False,
+        policy_headers: dict | None = None,
     ) -> WhyDecisionEvidence:
+
         events: list = []
         pre: list = []
         suc: list = []
@@ -200,7 +210,7 @@ class EvidenceBuilder:
         retry_count = 0
         stale_ev: WhyDecisionEvidence | None = None
 
-        if self._redis:
+        if self._redis and not fresh:
             try:
                 cached_raw = await self._safe_get(alias_key)
                 if cached_raw:
@@ -274,6 +284,12 @@ class EvidenceBuilder:
             except Exception:
                 logger.warning("redis read error – bypassing cache", exc_info=True)
                 self._redis = None
+        elif fresh:
+            try:
+                log_stage("cache", "bypass", anchor_id=anchor_id, reason="fresh=true")
+            except Exception:
+                # keep hot path resilient
+                pass
 
         with trace_span("plan", anchor_id=anchor_id):
             plan = {"node_id": anchor_id, "k": 1}
@@ -287,6 +303,7 @@ class EvidenceBuilder:
             hdr_etag: str = "unknown"
             neigh: dict = {"neighbors": []}
             meta: dict | None = None
+            policy_trace: dict | None = None
 
             def _has_meaningful_anchor(d: dict) -> bool:
                 return bool(d.get("title") or d.get("option") or d.get("rationale") or d.get("timestamp") or d.get("decision_maker"))
@@ -296,7 +313,7 @@ class EvidenceBuilder:
                 try:
                     resp_anchor = await enrich_client.get(
                         f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}",
-                        headers=inject_trace_context({}),
+                        headers=inject_trace_context(dict(policy_headers or {})),
                     )
                     if hasattr(resp_anchor, "raise_for_status"):
                         resp_anchor.raise_for_status()
@@ -342,7 +359,7 @@ class EvidenceBuilder:
                             await asyncio.sleep(random.uniform(0.02, 0.05))
                             retry_resp = await enrich_client.get(
                                 f"{settings.memory_api_url}/api/enrich/decision/{anchor_id}",
-                                headers=inject_trace_context({}),
+                                headers=inject_trace_context(dict(policy_headers or {})),
                             )
                             if hasattr(retry_resp, "raise_for_status"):
                                 retry_resp.raise_for_status()
@@ -395,7 +412,7 @@ class EvidenceBuilder:
                     resp_neigh = await expand_client.post(
                         f"{settings.memory_api_url}/api/graph/expand_candidates",
                         json=plan,
-                        headers=inject_trace_context({}),
+                        headers=inject_trace_context(dict(policy_headers or {})),
                     )
                     if hasattr(resp_neigh, "raise_for_status"):
                         resp_neigh.raise_for_status()
@@ -404,11 +421,19 @@ class EvidenceBuilder:
                     except Exception:
                         neigh = resp_neigh.json() or {}
                     meta = neigh.get("meta") or {}
+                    policy_trace = neigh.get("policy_trace") or {}
                 except Exception as exc:
+                    # Add HTTP status/details when available (httpx.HTTPStatusError)
                     try:
+                        status = getattr(getattr(exc, "response", None), "status_code", None)
+                        detail = None
+                        try:
+                            detail = getattr(exc, "response").text[:200]  # avoid huge logs
+                        except Exception:
+                            detail = None
                         logger.warning(
                             "expand_candidates_failed",
-                            extra={"anchor_id": anchor_id, "error": type(exc).__name__},
+                            extra={"anchor_id": anchor_id, "error": type(exc).__name__, "status": status, "detail": detail},
                         )
                     except Exception:
                         pass
@@ -424,6 +449,7 @@ class EvidenceBuilder:
         # (rest of the function continues unchanged; neigh/meta are now populated)
 
         meta = neigh.get("meta") or {}
+        policy_trace = (locals().get("policy_trace") or {}) if "policy_trace" in locals() else {}
         # Strategic: show whether expand actually returned anything,
         # without dumping payloads.
         try:
@@ -591,31 +617,10 @@ class EvidenceBuilder:
                 deduped_events.append(ev)
             events = deduped_events
 
-            # Optional M5 heuristic – further deduplicate near-identical events by day+summary.
-            # Feature-flagged OFF by default to avoid accidental loss of distinct events.
+            # Near-identical event collapse removed.
             try:
-                from core_config import get_settings as _get_settings
-                _settings = _get_settings()
-                if getattr(_settings, 'enable_day_summary_dedup', False):
-                    grouped_keys: set[tuple] = set()
-                    unique_events: list[dict] = []
-                    for ev in events:
-                        try:
-                            ts = ev.get("timestamp") or ""
-                            date_part = ts.split("T")[0] if isinstance(ts, str) else str(ts)[:10]
-                            summary = ev.get("summary") or ev.get("description") or ""
-                            if not isinstance(summary, str):
-                                summary = str(summary)
-                            # use top-level `re` imported at file head
-                            key_text = re.sub(r"[\d\$¥€£,\.\s]+", "", summary).lower()
-                            dedup_key = (date_part, key_text)
-                        except Exception:
-                            dedup_key = (ev.get("timestamp"), ev.get("id"))
-                        if dedup_key in grouped_keys:
-                            continue
-                        grouped_keys.add(dedup_key)
-                        unique_events.append(ev)
-                    events = unique_events
+                from .logging_helpers import stage as log_stage
+                log_stage("evidence", "near_identical_collapse_skipped", anchor_id=anchor_id)
             except Exception:
                 pass
 
@@ -748,7 +753,7 @@ class EvidenceBuilder:
                         try:
                             dresp = await tr_client.get(
                                 f"{settings.memory_api_url}/api/enrich/decision/{decision_id}",
-                                headers=inject_trace_context({}),
+                                headers=inject_trace_context(dict(policy_headers or {})),
                             )
                             if hasattr(dresp, "raise_for_status"):
                                 dresp.raise_for_status()
@@ -771,7 +776,7 @@ class EvidenceBuilder:
                         try:
                             resp = await tr_client.get(
                                 f"{settings.memory_api_url}/api/enrich/transition/{tid}",
-                                headers=inject_trace_context({}),
+                                headers=inject_trace_context(dict(policy_headers or {})),
                             )
                             if hasattr(resp, "raise_for_status"):
                                 resp.raise_for_status()
@@ -819,7 +824,7 @@ class EvidenceBuilder:
                         try:
                             resp = await tr_client.get(
                                 f"{settings.memory_api_url}/api/enrich/transition/{tid}",
-                                headers=inject_trace_context({}),
+                                headers=inject_trace_context(dict(policy_headers or {})),
                             )
                             if hasattr(resp, "raise_for_status"):
                                 resp.raise_for_status()
@@ -1030,16 +1035,35 @@ class EvidenceBuilder:
 
         ev.snapshot_etag = snapshot_etag
         ev.__dict__["_retry_count"] = retry_count
-        ev, selector_meta = authoritative_truncate(ev)
+        selector_meta = {
+            "prompt_truncation": False,
+            "total_neighbors_found": max(len(ev.allowed_ids or []) - 1, 0),
+            "final_evidence_count": len(ev.allowed_ids or []),
+            "dropped_evidence_ids": [],
+            "prompt_tokens": 0,
+            "max_prompt_tokens": None,
+            "bundle_size_bytes": 0,
+        }
         if getattr(ev, "snapshot_etag", None) != snapshot_etag:
             ev.snapshot_etag = snapshot_etag
         try:
             pre_list = list(ev.transitions.preceding)
             suc_list = list(ev.transitions.succeeding)
         except Exception:
-            pre_list = []
-            suc_list = []
-        ev.allowed_ids = _collect_allowed_ids(ev.anchor, ev.events, pre_list, suc_list)
+            pre_list, suc_list = [], []
+        # Preserve full k=1 allowed_ids; do not recompute here (gating is applied only to the prompt).
+        try:
+            from .logging_helpers import stage as log_stage
+            log_stage(
+                "evidence", "allowed_ids_preserved",
+                anchor_id=anchor_id,
+                allowed_ids_count=len(ev.allowed_ids or []),
+                events_after=len(ev.events or []),
+                preceding_after=len(pre_list or []),
+                succeeding_after=len(suc_list or []),
+            )
+        except Exception:
+            pass
         # Strategic: log sizes and class breakdown without dumping payloads
         try:
             _type_counts = {
@@ -1052,8 +1076,60 @@ class EvidenceBuilder:
         except Exception:
             pass
         ev.__dict__["_selector_meta"] = selector_meta
+        # ── Attach policy_trace (if provided by Memory API) for audit drawer surfacing ──
+        try:
+            ev.__dict__["_policy_trace"] = policy_trace or {}
+            # strategic breadcrumb for observability
+            try:
+                hv = (policy_trace or {}).get("counts", {}).get("hidden_vertices", 0)
+                he = (policy_trace or {}).get("counts", {}).get("hidden_edges", 0)
+                logger.info("policy_trace_attached", extra={"anchor_id": anchor_id, "hidden_vertices": hv, "hidden_edges": he})
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-        truncated_flag = selector_meta.get("selector_truncation", False)
+        # ── Defense-in-depth: cheap ACL re-check on sanitized docs (log-only) ──
+        try:
+            roles_hdr = (policy_headers or {}).get("X-User-Roles") or (policy_headers or {}).get("x-user-roles") or ""
+            namespaces_hdr = (policy_headers or {}).get("X-User-Namespaces") or (policy_headers or {}).get("x-user-namespaces") or ""
+            sens_hdr = (policy_headers or {}).get("X-Sensitivity-Ceiling") or (policy_headers or {}).get("x-sensitivity-ceiling") or ""
+            roles = {r.strip() for r in str(roles_hdr).split(",") if r.strip()}
+            namespaces = {n.strip() for n in str(namespaces_hdr).split(",") if n.strip()}
+            sens_order = {"low": 0, "medium": 1, "high": 2}
+            sens_ceiling = sens_order.get(str(sens_hdr).strip().lower(), 2)
+            def _allowed(doc: dict) -> bool:
+                try:
+                    ra = set(doc.get("roles_allowed") or [])
+                    if ra and roles and roles.isdisjoint(ra):
+                        return False
+                except Exception:
+                    pass
+                try:
+                    ns = set(doc.get("namespaces") or [])
+                    if ns and namespaces and namespaces.isdisjoint(ns):
+                        return False
+                except Exception:
+                    pass
+                try:
+                    s = str(doc.get("sensitivity","")).lower()
+                    if s and sens_order.get(s, 0) > sens_ceiling:
+                        return False
+                except Exception:
+                    pass
+                return True
+            before_ct = len(ev.events or [])
+            ev.events = [e for e in (ev.events or []) if (not isinstance(e, dict)) or _allowed(e)]
+            dropped = before_ct - len(ev.events or [])
+            if dropped > 0:
+                try:
+                    logger.info("gateway_acl_recheck_dropped", extra={"anchor_id": anchor_id, "dropped": int(dropped)})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        truncated_flag = selector_meta.get("prompt_truncation", False)
         composite_key  = _make_cache_key(
             anchor_id,
             intent,
@@ -1129,5 +1205,5 @@ class EvidenceBuilder:
                 pass
             return False
 
-    async def get_evidence(self, anchor_id: str) -> WhyDecisionEvidence:
-        return await self.build(anchor_id)
+    async def get_evidence(self, anchor_id: str, *, fresh: bool = False) -> WhyDecisionEvidence:
+        return await self.build(anchor_id, fresh=fresh)

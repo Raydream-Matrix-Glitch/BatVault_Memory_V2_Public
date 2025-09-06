@@ -13,11 +13,10 @@ services:
 
   grafana:
     image: grafana/grafana:10.4.2
+    env_file:
+      - .env
+      - .env.local
     restart: unless-stopped
-    environment:
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
-      - GF_LOG_FILTERS=authn.service:info
     volumes:
       - ./ops/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./ops/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
@@ -29,8 +28,9 @@ services:
   arangodb:
     image: arangodb:3.12.4
     restart: always
-    environment:
-      - ARANGO_ROOT_PASSWORD=${ARANGO_ROOT_PASSWORD:-batvault}
+    env_file:
+      - .env
+      - .env.local
     command: >
       arangod
       --server.endpoint=tcp://0.0.0.0:8529
@@ -73,9 +73,9 @@ services:
     image: minio/minio:latest
     restart: unless-stopped
     command: server /data --console-address ":9001"
-    environment:
-      - MINIO_ROOT_USER=${MINIO_ACCESS_KEY:-minioadmin}
-      - MINIO_ROOT_PASSWORD=${MINIO_SECRET_KEY:-minioadmin}
+    env_file:
+      - .env
+      - .env.local
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -107,16 +107,8 @@ services:
       context: .
       dockerfile: ops/docker/Dockerfile.python
     environment:
-      - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
-      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-      - OTEL_PROPAGATORS=tracecontext,baggage
-      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - OTEL_SERVICE_NAME=api_edge
-      - OTEL_PROPAGATORS=tracecontext,baggage
-      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - BATVAULT_HEALTH_PORT=8080
-      - OTEL_LOG_LEVEL=error
     env_file:
       - .env
       - .env.local
@@ -142,17 +134,8 @@ services:
   gateway:
     image: batvault/python-svc:dev
     environment:
-      - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
-      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_SERVICE_NAME=gateway
-      - OTEL_PROPAGATORS=tracecontext,baggage
-      - OTEL_TRACES_SAMPLER=parentbased_always_on
       - BATVAULT_HEALTH_PORT=8081
-      - CITE_ALL_IDS=true
-      - TIMEOUT_ENRICH_MS=1200
-      - TIMEOUT_EXPAND_MS=400
-      - OTEL_LOG_LEVEL=error
     env_file:
       - .env
       - .env.local
@@ -178,20 +161,16 @@ services:
   memory_api:
     image: batvault/python-svc:dev
     environment:
-      - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
-      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_SERVICE_NAME=memory_api
-      - OTEL_PROPAGATORS=tracecontext,baggage
-      - OTEL_TRACES_SAMPLER=parentbased_always_on
-      - ARANGO_VECTOR_INDEX_ENABLED=true
       - BATVAULT_HEALTH_PORT=8000
-      - OTEL_LOG_LEVEL=error
+      - POLICY_DIR=/app/policy/roles
     env_file:
       - .env
       - .env.local
       - services/memory_api/.env.local
     command: ["python", "-m", "memory_api.__main__"]
+    volumes:
+      - ./policy/roles:/app/policy/roles:ro
     # Expose container:8000 to host:8082 (internal still 8000)
     ports: ["8082:8000"]
     healthcheck:
@@ -237,11 +216,6 @@ services:
       - VLLM_SWAP_GB=${VLLM_SWAP_GB:-4}
       # GPU VRAM target fraction. 0.86 leaves ~1.7 GiB headroom on 12 GiB GPUs.
       - VLLM_GPU_UTIL=${VLLM_GPU_UTIL:-0.86}
-      # Concurrency & context – keep reasonable defaults; override via .env as needed.
-      - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-2048}
-      - VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-2}
-      - VLLM_MAX_BATCHED_TOKENS=${VLLM_MAX_BATCHED_TOKENS:-2048}
-      - VLLM_QUANTIZATION=${VLLM_QUANTIZATION:-awq}
     command:
       - --host
       - "0.0.0.0"
@@ -287,21 +261,9 @@ services:
     image: ghcr.io/huggingface/text-generation-inference:latest
     mem_limit: "8g"
     mem_reservation: "6g"
-    environment:
-      # Keep TGI small so it can't spike host RAM.
-      - MAX_BATCH_SIZE=${TGI_MAX_BATCH_SIZE:-1}
-      - MAX_INPUT_LENGTH=${TGI_MAX_INPUT_LEN:-2048}
-      - MAX_TOTAL_TOKENS=${TGI_MAX_TOTAL_TOKENS:-2048}
-      - MAX_BATCH_PREFILL_TOKENS=${TGI_MAX_PREFILL_TOKENS:-2048}
-      - MAX_CONCURRENT_REQUESTS=${TGI_MAX_CONCURRENT_REQUESTS:-4}
-      - CUDA_MEMORY_FRACTION=${TGI_CUDA_FRACTION:-0.60}
-      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      - HF_HOME=/data/hf
-      - NUM_PROMPT_TOKENS=1024
-      - NUM_RESPONSE_TOKENS=1024
-      - HF_HOME=/data/hf
-      - HF_TOKEN=${HF_TOKEN}
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    env_file:
+      - .env
+      - .env.local
     command:
       - --model-id
       - "${TGI_CANARY_MODEL_ID:?err}"
@@ -326,8 +288,9 @@ services:
     profiles: [llm]
     image: ghcr.io/huggingface/text-embeddings-inference:latest
     gpus: "all"
-    environment:
-      - HF_HOME=/data/hf
+    env_file:
+      - .env
+      - .env.local
     command:
       - --model-id
       - "${TEI_MODEL_NAME:?err}"
@@ -349,15 +312,8 @@ services:
   ingest:
     image: batvault/python-svc:dev
     environment:
-      - PYTHONUNBUFFERED=1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}
-      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
       - OTEL_SERVICE_NAME=ingest
-      - OTEL_PROPAGATORS=tracecontext,baggage
-      - OTEL_TRACES_SAMPLER=parentbased_always_on
-      - ARANGO_VECTOR_INDEX_ENABLED=true
       - BATVAULT_HEALTH_PORT=8083
-      - OTEL_LOG_LEVEL=error
     env_file:
       - .env
       - .env.local
@@ -381,9 +337,10 @@ services:
 
   jaeger:
     image: jaegertracing/all-in-one:1.57
+    env_file:
+      - .env
+      - .env.local
     restart: unless-stopped
-    environment:
-      - COLLECTOR_OTLP_ENABLED=true
     ports:
       - "16686:16686"
       - "14250:14250"

@@ -1,0 +1,31 @@
+{
+  "id": "acme-prod-pivot-cloud-only-tiers-2024",
+  "option": "Pivot product roadmap to cloud-only tiers (Starter, Growth, Enterprise)",
+  "rationale": "Align packaging with cloud capabilities, simplify support, and accelerate feature cadence.",
+  "timestamp": "2024-04-01T10:00:00Z",
+  "decision_maker": "Product Director",
+  "tags": ["roadmap", "packaging", "cloud_only"],
+  "supported_by": [
+    "acme-e-top-accounts-migration-appetite-2024",
+    "acme-e-partner-ecosystem-readiness-2024",
+    "acme-e-alias-descope-onprem-2024"
+  ],
+  "based_on": ["acme-corp-descope-onprem-2024"],
+  "transitions": [],
+  "domain": "acme/product",
+  "importance": 0.88,
+  "sensitivity": "medium",
+  "namespaces": ["internal"],
+  "roles_allowed": ["manager", "director", "exec"],
+  "x-extra": {
+    "ga_milestones": [
+      {"name": "Starter GA", "date": "2024-06-30"},
+      {"name": "Growth GA", "date": "2024-09-30"},
+      {"name": "Enterprise GA", "date": "2024-12-15"}
+    ],
+    "kpis": [
+      {"name": "Cloud attach rate", "unit": "%", "baseline": 62, "target": 80},
+      {"name": "Support ticket volume", "unit": "tickets/week", "baseline": 1400, "target": 950}
+    ]
+  }
+}

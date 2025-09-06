@@ -83,7 +83,7 @@ def _reason_from_exception(exc: BaseException) -> str:
     name = type(exc).__name__
     try:
         import httpx
-        if isinstance(exc, httpx.ConnectTimeout) or isinstance(exc, TimeoutError):
+        if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout)) or isinstance(exc, TimeoutError):
             return "timeout"
         if isinstance(exc, httpx.ConnectError):
             return "endpoint_unreachable"
@@ -178,6 +178,11 @@ async def llm_call(envelope: Dict[str, Any],
         resp = await _invoke_adapter(endpoint, envelope, temperature=temperature, max_tokens=max_tokens)
         LAST_CALL["latency_ms"] = int((_time.perf_counter() - t0) * 1000)
         try:
+            from core_config.constants import TIMEOUT_LLM_MS as _LLM_TO
+            LAST_CALL["timeout_ms_used"] = int(_LLM_TO)
+        except Exception:
+            pass
+        try:
             log_stage("llm", "llm.success",
                       request_id=request_id,
                       endpoint=endpoint,
@@ -196,7 +201,8 @@ async def llm_call(envelope: Dict[str, Any],
                       endpoint=endpoint,
                       cohort=cohort,
                       reason=LAST_CALL["error_code"],
-                      latency_ms=LAST_CALL["latency_ms"])
+                      latency_ms=LAST_CALL["latency_ms"],
+                      timeout_ms_used=LAST_CALL.get("timeout_ms_used", None))
         except Exception:
             pass
         raise

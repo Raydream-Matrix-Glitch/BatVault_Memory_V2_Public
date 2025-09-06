@@ -151,6 +151,7 @@ def build_prompt_envelope(
     env: Dict[str, Any] = {
         "prompt_version": kw.get("prompt_version", "why_v1"),
         "intent": kw.get("intent", "why_decision"),
+        "endpoint": kw.get("endpoint", "ask"),
         "prompt_id": pol["prompt_id"],
         "policy_id": pol["policy_id"],
         "question": question,
@@ -166,6 +167,9 @@ def build_prompt_envelope(
             "max_tokens": kw.get("max_tokens", pol.get("max_tokens", 256)),
         },
     }
+
+    if 'selection_order' in kw and isinstance(kw.get('selection_order'), (list, tuple)):
+        env['selection_order'] = list(kw['selection_order'])
 
     bundle_fp = _sha256(canonical_json(evidence))
     prompt_fp = _sha256(canonical_json(env))

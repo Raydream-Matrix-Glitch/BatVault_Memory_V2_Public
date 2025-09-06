@@ -21,7 +21,7 @@ class WhyDecisionResponse(BaseModel):
     prompt_fingerprint: str
 
     anchor: Anchor
-    supporting_ids: List[str] = Field(default_factory=list)
+    cited_ids: List[str] = Field(default_factory=list)
     allowed_ids: List[str] = Field(default_factory=list)
 
     short_answer: str = ""
@@ -32,8 +32,8 @@ class WhyDecisionResponse(BaseModel):
     artifacts: Dict[str, object] = Field(default_factory=dict)
 
     def validate_semantics(self) -> None:
-        """Cheap semantic checks: supporting ⊆ allowed and anchor is cited."""
-        if not set(self.supporting_ids).issubset(set(self.allowed_ids)):
-            raise ValueError("supporting_ids must be a subset of allowed_ids")
-        if self.anchor.id not in self.supporting_ids:
-            raise ValueError("anchor.id must be present in supporting_ids")
+        """Cheap semantic checks: cited ⊆ allowed and anchor is cited."""
+        if not set(self.cited_ids).issubset(set(self.allowed_ids)):
+            raise ValueError("cited_ids must be a subset of allowed_ids")
+        if self.anchor.id not in self.cited_ids:
+            raise ValueError("anchor.id must be present in cited_ids")

@@ -9,16 +9,12 @@ implemented here cover:
 * **Allowed ID union** – the ``allowed_ids`` array on the evidence must
   exactly equal the set formed by the anchor id, every event id, and
   all transition ids.  Ordering is canonical: anchor first, followed
-  by events (ascending by timestamp) and then transitions (ascending
-  by timestamp).  Any deviation from this union is corrected and a
+  by events (ascending by timestamp), then transitions (ascending
+  by timestamp), and **neighbor decision ids** reachable via the
+  transitions (`from`/`to`) in a stable order. Any deviation from this union is corrected and a
   structured error is emitted.
 
-* **Supporting ID rules** – every response must cite the anchor and all
-  transitions.  Unsupported ids are discarded and duplicates removed
-  while preserving relative order.  The anchor is always placed first.
-  If the environment variable ``CITE_ALL_IDS`` is set to a truthy value
-  then the supporting ids are forced to be equal to the canonical
-  ``allowed_ids`` (with the anchor first).
++* **Cited ID rules** – responses must cite the anchor. Other items are optional and should reflect what the short answer actually references (events, neighbor decisions, transitions). Unsupported ids are discarded and duplicates removed while preserving relative order. The anchor is always placed first. If the environment variable ``CITE_ALL_IDS`` is truthy then the cited ids are forced to equal the canonical ``allowed_ids`` (with the anchor first).
 
 * **Events‑only evidence** – the ``evidence.events`` array may only
   contain atomic events (type ``"event"``).  Any item missing a type
@@ -330,24 +326,56 @@ def _normalise_anchor(anchor: WhyDecisionAnchor) -> Tuple[WhyDecisionAnchor, Lis
 
 
 def _canonical_allowed_ids(anchor_id: str, events: List[Dict[str, Any]], transitions: List[Dict[str, Any]]) -> List[str]:
-    """Compute the canonical allowed ids list."""
+    """Compute the canonical allowed ids list.
+
+    Updated policy (k=1 neighbors): include anchor, all event IDs, all transition IDs,
+    and the decision IDs referenced by transitions (``from``/``to``). Duplicates are
+    removed while preserving first occurrence
+
+    Updated: include neighbor decision IDs referenced by transitions (both `from` and `to`)
+    in addition to transition IDs themselves. Order is deterministic:
+      1) anchor
+      2) event ids (asc by timestamp)
+      3) transition ids (asc by timestamp)
+      4) neighbor decision ids discovered from transitions, in the same (asc timestamp) order
+    Duplicates are removed while preserving the first occurrence.
+    """
     ids: List[str] = []
     seen: set[str] = set()
     if anchor_id:
         ids.append(anchor_id)
         seen.add(anchor_id)
+    # 1) events
     sorted_events = sorted(events, key=lambda e: e.get("timestamp") or "")
     for e in sorted_events:
         eid = e.get("id")
         if eid and eid not in seen:
             ids.append(eid)
             seen.add(eid)
+    # 2) transitions (collect neighbor decision ids for step 4)
     sorted_trans = sorted(transitions, key=lambda t: t.get("timestamp") or "")
+    neighbor_decisions: List[str] = []
     for tr in sorted_trans:
         tid = tr.get("id")
         if tid and tid not in seen:
             ids.append(tid)
             seen.add(tid)
+        # Also include neighbor decision IDs referenced by this transition
+        for key in ("from", "to"):
+            did = tr.get(key)
+            if isinstance(did, str) and did and did not in seen:
+                ids.append(did)
+                seen.add(did)
+        # collect neighbor decisions (from/to), excluding the anchor
+        for end_key in ("from", "to"):
+            nid = tr.get(end_key)
+            if isinstance(nid, str) and nid and nid != anchor_id and nid not in neighbor_decisions:
+                neighbor_decisions.append(nid)
+    # 3) neighbor decisions (stable order derived from transitions)
+    for nid in neighbor_decisions:
+        if nid not in seen:
+            ids.append(nid)
+            seen.add(nid)
     return ids
 
 # ---------------------------------------------------------------------------
@@ -429,62 +457,83 @@ def validate_response(resp: Any) -> Tuple[bool, List[Dict[str, Any]]]:
     orig_allowed = list(model_resp.evidence.allowed_ids or [])
     orig_set = set(orig_allowed)
     expected_set = set(expected_allowed)
-    if orig_set != expected_set:
-        removed = [x for x in orig_allowed if x not in expected_set]
-        added = [x for x in expected_allowed if x not in orig_set]
+    # New policy: allowed_ids must be a *superset* of the canonical union.
+    # If any required IDs are missing, append them; never remove extras.
+    missing = [x for x in expected_allowed if x not in orig_set]
+    if missing:
         errors.append({
-            "code": "allowed_ids_exact_union_violation",
-            "details": {"removed": removed, "added": added},
+            "code": "allowed_ids_missing_added",
+            "details": {"added": missing},
         })
-        model_resp.evidence.allowed_ids = expected_allowed
+        # Preserve input order deterministically: anchor first (if present),
+        # then existing items in their original order, then missing items
+        # in canonical order.
+        new_allowed: list[str] = []
+        seen: set[str] = set()
+        if anchor_id:
+            new_allowed.append(anchor_id)
+            seen.add(anchor_id)
+        for x in orig_allowed:
+            if x not in seen:
+                new_allowed.append(x)
+                seen.add(x)
+        for x in expected_allowed:
+            if x not in seen:
+                new_allowed.append(x)
+                seen.add(x)
+        model_resp.evidence.allowed_ids = new_allowed
     else:
-        # When sets are equal but ordering differs, silently reorder to the canonical order.
-        if orig_allowed != expected_allowed:
-            model_resp.evidence.allowed_ids = expected_allowed
+        # Maintain existing order; ensure anchor is first for determinism.
+        if orig_allowed and anchor_id and orig_allowed[0] != anchor_id and anchor_id in orig_allowed:
+            try:
+                orig_allowed.remove(anchor_id)
+                orig_allowed.insert(0, anchor_id)
+                model_resp.evidence.allowed_ids = orig_allowed
+            except Exception:
+                pass
 
     supp_ids: List[str] = []
+    # Prefer `cited_ids`; fall back to legacy `supporting_ids`
     try:
-        supp_ids = list(model_resp.answer.supporting_ids or [])
+        cited_ids = list(model_resp.answer.cited_ids or [])
+        if not cited_ids:
+            cited_ids = list(getattr(model_resp.answer, "supporting_ids", []) or [])
     except Exception:
-        supp_ids = []
+        cited_ids = []
     if anchor_id:
-        if anchor_id not in supp_ids:
-            errors.append({"code": "supporting_ids_missing_anchor", "details": {"anchor_id": anchor_id}})
-        if not supp_ids or supp_ids[0] != anchor_id:
-            if anchor_id in supp_ids:
-                supp_ids = [x for x in supp_ids if x != anchor_id]
-            supp_ids.insert(0, anchor_id)
-    transition_ids = [tr.get("id") for tr in (new_preceding + new_succeeding) if tr.get("id")]
-    missing_transitions = [tid for tid in transition_ids if tid not in supp_ids]
-    if missing_transitions:
-        for tid in transition_ids:
-            if tid not in supp_ids:
-                supp_ids.append(tid)
-        errors.append({"code": "supporting_ids_missing_transition", "details": {"missing": missing_transitions}})
-    filtered_supp = []
+        if anchor_id not in cited_ids:
+            errors.append({"code": "cited_ids_missing_anchor", "details": {"anchor_id": anchor_id}})
+        if not cited_ids or cited_ids[0] != anchor_id:
+            if anchor_id in cited_ids:
+                cited_ids = [x for x in cited_ids if x != anchor_id]
+            cited_ids.insert(0, anchor_id)
+    # Filter to allowed set; record removed items
+    # (fix NameError: define allowed_set before use)
     allowed_set = set(model_resp.evidence.allowed_ids or [])
-    removed_support: List[str] = []
-    # Remove duplicates and filter out ids not in allowed_set.  Collect removed ids
-    for sid in supp_ids:
-        if sid in allowed_set and sid not in filtered_supp:
-            filtered_supp.append(sid)
+    removed: List[str] = []
+    filtered: List[str] = []
+    for sid in cited_ids:
+        if sid in allowed_set and sid not in filtered:
+            filtered.append(sid)
         elif sid not in allowed_set:
-            removed_support.append(sid)
-    # Determine whether CITE_ALL_IDS is enabled up front
+            removed.append(sid)
     cite_all_env = os.getenv("CITE_ALL_IDS")
     cite_all = _is_truthy(cite_all_env)
-    # Emit removed-invalid error only when not citing all ids
-    if removed_support and not cite_all:
-        errors.append({"code": "supporting_ids_removed_invalid", "details": {"removed": removed_support}})
-    # Update supporting_ids to the filtered list
-    supp_ids = filtered_supp
+    if removed and not cite_all:
+        errors.append({"code": "cited_ids_removed_invalid", "details": {"removed": removed}})
+    cited_ids = filtered
     if cite_all:
-        # In cite-all mode supporting_ids must match allowed_ids exactly.  Only emit
-        # an error when the existing order deviates from the canonical allowed_ids.
-        if supp_ids != model_resp.evidence.allowed_ids:
-            errors.append({"code": "supporting_ids_enforced_cite_all_ids", "details": {"before": supp_ids, "after": model_resp.evidence.allowed_ids}})
-        supp_ids = list(model_resp.evidence.allowed_ids)
-    model_resp.answer.supporting_ids = supp_ids
+        # In cite-all mode cited_ids must match allowed_ids exactly. Emit when order deviates.
+        if cited_ids != model_resp.evidence.allowed_ids:
+            errors.append({"code": "cited_ids_enforced_cite_all_ids", "details": {"before": cited_ids, "after": model_resp.evidence.allowed_ids}})
+        cited_ids = list(model_resp.evidence.allowed_ids)
+    # Write back; mirror to legacy for compatibility
+    try:
+        model_resp.answer.cited_ids = cited_ids
+        if hasattr(model_resp.answer, "supporting_ids"):
+            model_resp.answer.supporting_ids = cited_ids
+    except Exception:
+        pass
 
     flags = model_resp.completeness_flags
     # Update preceding/succeeding flags silently; mismatches do not produce errors
@@ -511,16 +560,14 @@ def validate_response(resp: Any) -> Tuple[bool, List[Dict[str, Any]]]:
 
     # Determine fatality.  A response is fatal if we encountered an
     # invalid_response error from the schema validator or if the only
-    # semantic violation is that supporting_ids contained an invalid id
-    # without any accompanying missing-anchor or missing-transition errors.
+    # semantic violation is that cited_ids contained an invalid id
+    # without any accompanying missing-anchor errors.
     fatal = any(err.get("code") == "invalid_response" for err in errors)
     if not fatal:
         codes = {err.get("code") for err in errors if isinstance(err, dict)}
-        if "supporting_ids_removed_invalid" in codes:
-            # If this is the only support-related error (no missing anchor or transitions),
-            # treat it as fatal.  Otherwise it is repairable and non-fatal.
-            if "supporting_ids_missing_anchor" not in codes and "supporting_ids_missing_transition" not in codes:
-                fatal = True
+        if "cited_ids_removed_invalid" in codes and "cited_ids_missing_anchor" not in codes:
+            # If invalid ids were present and no anchor fix was needed, treat as fatal.
+            fatal = True
     ok = not fatal
     if not isinstance(resp, WhyDecisionResponse):
         try:

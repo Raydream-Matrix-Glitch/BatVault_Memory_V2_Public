@@ -134,6 +134,19 @@ def run_gate(envelope: Dict[str, Any], evidence_obj: Any, *, request_id: str, mo
     gp = GatePlan(**{**gp_dict, "fingerprints": {"prompt": prompt_fingerprint}})
     return gp, trimmed_evidence
 
+def _as_event_dict(item: Any) -> Dict[str, Any]:
+    """Strict conversion to a dict with at least an 'id' key; raises on failure."""
+    if isinstance(item, dict):
+        if "id" in item and isinstance(item["id"], str) and item["id"]:
+            return item
+        raise ValueError("event dict missing 'id'")
+    if hasattr(item, "model_dump"):
+        d = item.model_dump(mode="python")
+        if isinstance(d, dict) and d.get("id"):
+            return d
+        raise ValueError("model_dump missing 'id'")
+    raise TypeError(f"unsupported event type: {type(item)}")
+
 def authoritative_truncate(
     evidence_obj,
     *,
@@ -146,15 +159,28 @@ def authoritative_truncate(
     Authoritative token-budgeting + trimming loop.
 
     - Computes max_prompt_tokens = context_window - desired_completion_tokens - guard_tokens
-    - Drops least-relevant events (based on selector.rank_events) until the prompt fits
-    - Produces meta compatible with previous selector output
+    - Drops from the tail of the provided selection order until the prompt fits
+      (order comes from envelope['selection_order'] if provided, otherwise current evidence order)
+    - Produces meta compatible with selector output, with a single prompt_truncation flag
     """
-    from .selector import evidence_prompt_tokens, rank_events
+    from .selector import evidence_prompt_tokens
     from core_models.models import WhyDecisionEvidence
 
     # Work on a deep copy so the caller keeps the original
     ev: WhyDecisionEvidence = evidence_obj.model_copy(deep=True)
     request_id = getattr(ev, "_request_id", None)
+
+    # Emit a precheck snapshot of budget inputs before any pruning happens
+    try:
+        log_stage("gate", "precheck",
+                  request_id=request_id,
+                  overhead_tokens=int(overhead_tokens),
+                  evidence_tokens=int(evidence_prompt_tokens(ev)),
+                  context_window=context_window,
+                  desired_completion_tokens=desired_completion_tokens,
+                  guard_tokens=guard_tokens)
+    except Exception:
+        pass
 
     # If gate knobs missing, just pass-through with canonical allowed_ids
     if (
@@ -162,57 +188,83 @@ def authoritative_truncate(
         or context_window is None
         or guard_tokens is None
     ):
+        # No budget knobs provided: pass-through (include-all policy).
+        # Build a prompt meta that explicitly encodes the prompt set (== pool).
+        _pool_ids: list[str] = []
         try:
             from core_validator import canonical_allowed_ids as _canon
             aid = getattr(ev.anchor, "id", "") or ""
-            events = [e if isinstance(e, dict) else getattr(e, "model_dump", dict)(mode="python") for e in (ev.events or [])]
+            events = []
+            for _raw in (ev.events or []):
+                try:
+                    events.append(_as_event_dict(_raw))
+                except Exception:
+                    continue
             transitions = []
             tr = getattr(ev, "transitions", None)
             if tr is not None:
                 transitions.extend(getattr(tr, "preceding", []) or [])
                 transitions.extend(getattr(tr, "succeeding", []) or [])
-                transitions = [t if isinstance(t, dict) else getattr(t, "model_dump", dict)(mode="python") for t in transitions]
-            ev.allowed_ids = _canon(aid, events, transitions)
+                _tmp = []
+                for _t in transitions:
+                    try:
+                        _tmp.append(_as_event_dict(_t))
+                    except Exception:
+                        continue
+                transitions = _tmp
+            _pool_ids = _canon(aid, events, transitions)
         except Exception:
-            pass
+            _pool_ids = []
         meta = {
-            "selector_truncation": False,
-            "total_neighbors_found": max(len(ev.allowed_ids or []) - 1, 0),
-            "final_evidence_count": len(ev.allowed_ids or []),
-            "dropped_evidence_ids": [],
+            "prompt_truncation": False,
+            "prompt_included_ids": _pool_ids,
+            "prompt_excluded_ids": [],
             "prompt_tokens": overhead_tokens + evidence_prompt_tokens(ev),
             "max_prompt_tokens": None,
             "bundle_size_bytes": 0,
         }
         try:
             log_stage("gate", "selector_complete", request_id=request_id, **meta)
+            log_stage("gate", "allowed_ids_preserved", request_id=request_id, allowed_ids_count=len(ev.allowed_ids or []))
         except Exception:
             pass
         return ev, meta
 
     max_prompt_tokens = max(256, int(context_window) - int(desired_completion_tokens) - int(guard_tokens))
 
-    # If already within budget, just set allowed_ids canonically
-    if overhead_tokens + evidence_prompt_tokens(ev) <= max_prompt_tokens:
+    # Check if already within budget; if so, return unchanged evidence
+    current_tokens = overhead_tokens + evidence_prompt_tokens(ev)
+    if current_tokens <= max_prompt_tokens:
+        # Already within budget; no truncation.
         try:
             from core_validator import canonical_allowed_ids as _canon
             aid = getattr(ev.anchor, "id", "") or ""
-            events = [e if isinstance(e, dict) else getattr(e, "model_dump", dict)(mode="python") for e in (ev.events or [])]
-            transitions = []
+            events_dicts = []
+            for _raw in (ev.events or []):
+                try:
+                    events_dicts.append(_as_event_dict(_raw))
+                except Exception:
+                    continue
             tr = getattr(ev, "transitions", None)
+            transitions = []
             if tr is not None:
                 transitions.extend(getattr(tr, "preceding", []) or [])
                 transitions.extend(getattr(tr, "succeeding", []) or [])
-                transitions = [t if isinstance(t, dict) else getattr(t, "model_dump", dict)(mode="python") for t in transitions]
-            ev.allowed_ids = _canon(aid, events, transitions)
+                _tmp = []
+                for _t in transitions:
+                    try:
+                        _tmp.append(_as_event_dict(_t))
+                    except Exception:
+                        continue
+                transitions = _tmp
+            _prompt_ids = _canon(aid, events_dicts, transitions)
         except Exception:
-            pass
+            _prompt_ids = []
         meta = {
-            "selector_truncation": False,
-            "total_neighbors_found": max(len(ev.allowed_ids or []) - 1, 0),
-            "final_evidence_count": len(ev.allowed_ids or []),
-            "dropped_evidence_ids": [],
-            "prompt_tokens": overhead_tokens + evidence_prompt_tokens(ev),
+            "prompt_selector_truncation": False,
+            "prompt_included_ids": _prompt_ids,
+            "prompt_excluded_ids": [],
+            "prompt_tokens": current_tokens,
             "max_prompt_tokens": max_prompt_tokens,
             "bundle_size_bytes": 0,
         }
@@ -223,59 +275,117 @@ def authoritative_truncate(
         return ev, meta
 
     # Deterministic prune loop (drop least-relevant events only)
+    try:
+        log_stage("gate", "prune_enter",
+                  request_id=request_id,
+                  prompt_tokens=current_tokens,
+                  max_prompt_tokens=max_prompt_tokens,
+                  events_count=len(ev.events or []))
+    except Exception:
+        pass
     dropped_ids: list[str] = []
-    # Build a ranked list of event dicts (most relevant first)
+    # Build a fixed drop order: from envelope['selection_order'] or evidence order
     try:
         events_dicts = []
-        for e in (ev.events or []):
+        for _raw in (ev.events or []):
             try:
-                events_dicts.append(e if isinstance(e, dict) else getattr(e, "model_dump", dict)(mode="python"))
+                events_dicts.append(_as_event_dict(_raw))
             except Exception:
-                events_dicts.append(dict(e))
-        ranked = rank_events(ev.anchor, events_dicts)
-        # We'll drop from the end (least relevant)
-        drop_order_ids = [d.get("id") for d in ranked if d.get("id")]
+                # Deterministically skip malformed items
+                continue
+        sel_order = (locals().get("envelope") or {}).get("selection_order") or []
+        if not sel_order:
+            sel_order = [d["id"] for d in events_dicts if d.get("id")]
+        drop_order_ids = list(sel_order)
     except Exception:
-        drop_order_ids = [ (getattr(e, "get", lambda k: None)("id") if isinstance(e, dict) else getattr(e, "id", None)) for e in (ev.events or []) ]
+        drop_order_ids = [ (e.get("id") if isinstance(e, dict) else getattr(e, "id", None)) for e in (ev.events or []) ]
         drop_order_ids = [i for i in drop_order_ids if i]
+    try:
+        log_stage("gate", "selection_order",
+                  request_id=request_id,
+                  source=("envelope" if (locals().get("envelope") or {}).get("selection_order") else "evidence_order"),
+                  count=len(drop_order_ids))
+    except Exception:
+        pass
     # Loop until within budget or no events left
+    def _get_id(it):
+        try:
+            return it.get("id") if isinstance(it, dict) else getattr(it, "id", None)
+        except Exception:
+            return None
+
     while overhead_tokens + evidence_prompt_tokens(ev) > max_prompt_tokens and drop_order_ids:
         victim_id = drop_order_ids.pop()
+        # Find and stub the first matching event
         try:
-            ev.events = [e for e in (ev.events or []) if ((e.get("id") if isinstance(e, dict) else getattr(e, "id", None)) != victim_id)]
-            dropped_ids.append(victim_id)
+            new_list = []
+            stubbed = False
+            for _e in (ev.events or []):
+                eid = _get_id(_e)
+                if not stubbed and eid == victim_id:
+                    new_list.append({"id": victim_id})
+                    stubbed = True
+                else:
+                    new_list.append(_e)
+            if stubbed:
+                ev.events = new_list
+                dropped_ids.append(victim_id)
+            # If already stubbed (no change), continue to next victim.
         except Exception:
-            # best effort removal
+            # best-effort stubbing
             pass
 
-    # Set canonical allowed_ids based on remaining items
+    # Preserve ev.allowed_ids: it's the full k=1 union computed upstream.
+
+    final_tokens = overhead_tokens + evidence_prompt_tokens(ev)
+    # Compute prompt-included ids from the trimmed evidence to make prompt≠payload explicit.
     try:
         from core_validator import canonical_allowed_ids as _canon
         aid = getattr(ev.anchor, "id", "") or ""
-        events = [e if isinstance(e, dict) else getattr(e, "model_dump", dict)(mode="python") for e in (ev.events or [])]
-        transitions = []
+        events_dicts = []
+        for _raw in (ev.events or []):
+            try:
+                events_dicts.append(_as_event_dict(_raw))
+            except Exception:
+                continue
         tr = getattr(ev, "transitions", None)
+        transitions = []
         if tr is not None:
             transitions.extend(getattr(tr, "preceding", []) or [])
             transitions.extend(getattr(tr, "succeeding", []) or [])
-            transitions = [t if isinstance(t, dict) else getattr(t, "model_dump", dict)(mode="python") for t in transitions]
-        ev.allowed_ids = _canon(aid, events, transitions)
+            _tmp = []
+            for _t in transitions:
+                try:
+                    _tmp.append(_as_event_dict(_t))
+                except Exception:
+                    continue
+            transitions = _tmp
+        _prompt_ids = _canon(aid, events_dicts, transitions)
     except Exception:
-        pass
+        _prompt_ids = []
 
-    neighbor_count = max(len(ev.allowed_ids or []) - 1, 0)
-    final_tokens = overhead_tokens + evidence_prompt_tokens(ev)
     meta = {
-        "selector_truncation": len(dropped_ids) > 0,
-        "total_neighbors_found": neighbor_count,
-        "final_evidence_count": len(ev.allowed_ids or []),
-        "dropped_evidence_ids": dropped_ids,
+        "prompt_truncation": len(dropped_ids) > 0,
+        "prompt_included_ids": _prompt_ids,
+        "prompt_excluded_ids": [{"id": i, "reason": "token_budget"} for i in dropped_ids],
         "prompt_tokens": final_tokens,
         "max_prompt_tokens": max_prompt_tokens,
         "bundle_size_bytes": 0,
     }
     try:
         log_stage("gate", "selector_complete", request_id=request_id, **meta)
+        log_stage("gate", "prune_exit",
+                  request_id=request_id,
+                  dropped=len(dropped_ids),
+                  final_prompt_tokens=final_tokens,
+                  max_prompt_tokens=max_prompt_tokens,
+                  remaining_events=len(ev.events or []))
+        # Strategic: sample IDs in logs for audit debugging without spamming
+        if dropped_ids:
+            logger.info("gate.prune_exit.ids",
+                        extra={"request_id": request_id,
+                               "dropped_ids_sample": dropped_ids[:10],
+                               "prompt_included_ids_sample": meta.get("prompt_included_ids", [])[:10]})
     except Exception:
         pass
     return ev, meta

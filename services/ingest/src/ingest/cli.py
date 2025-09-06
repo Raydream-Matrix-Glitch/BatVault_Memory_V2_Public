@@ -1,12 +1,12 @@
 import sys, os, glob, re, time, argparse, hashlib, platform
 from importlib import resources 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from core_logging import get_logger, log_stage, trace_span, log_event
 from core_observability.otel import setup_tracing
 from core_utils import compute_snapshot_etag_for_files, slugify_id, jsonx
 from core_storage import ArangoStore
 from core_config import get_settings
-from .pipeline.normalize import normalize_decision, normalize_event, normalize_transition, derive_backlinks
+from .pipeline.normalize import normalize_decision, normalize_event, normalize_transition, normalize_alias_edge, derive_backlinks
 from .pipeline.snippet_enricher import enrich_all as enrich_snippets
 from .pipeline.graph_upsert import upsert_all
 from .catalog.field_catalog import build_field_catalog, build_relation_catalog
@@ -32,15 +32,14 @@ ALIASES = {
     "timestamp": ["timestamp", "ts", "updated_at"],
     "option": ["option", "title", "decision", "choice"],
     "rationale": ["rationale", "why", "reasoning"],
-    "summary": ["summary", "headline", "title"],
+    "summary": ["summary", "headline"],
     "description": ["description", "content", "text", "body"],
     "supported_by": ["supported_by", "evidence", "events"],
     "based_on": ["based_on", "basedOn", "sources"],
     "transitions": ["transitions", "links"],
-    "led_to": ["led_to", "leads_to", "ledTo"],
-    "from": ["from", "src", "source"],
-    "to": ["to", "dst", "target"],
-    "relation": ["relation", "rel", "type"],
+    "from": ["from", "src", "source", "decision", "decision_id", "from_id"],
+    "to": ["to", "dst", "target", "event", "event_id", "to_id"],
+    "relation": ["relation", "rel"],
     "tags": ["tags", "labels"],
 }
 
@@ -50,21 +49,48 @@ def pick_alias(doc: dict, key: str):
             return doc[k], k
     return None, None
 
-def canonicalize(doc: dict) -> tuple[dict, dict]:
+def canonicalize(doc: dict, kind_hint: str | None = None) -> tuple[dict, dict]:
     """
     Returns (canon_doc, alias_hits) where canon_doc has canonical keys populated
     from the first alias present; original fields are retained.
     """
     out = dict(doc)
     hits: dict[str, str] = {}
-    for k in ALIASES.keys():
+    alias_map = dict(ALIASES)
+    if kind_hint == "alias_edge":
+        # Accept decision/event endpoint names for projections
+        alias_map["relation"] = ["relation", "rel", "kind"]
+        alias_map["from"] = ["from", "src", "source", "decision", "decision_id", "from_id"]
+        alias_map["to"]   = ["to", "dst", "target", "event", "event_id", "to_id"]
+    for k in alias_map.keys():
         if k in out:
             continue
-        val, used = pick_alias(doc, k)
+        for candidate in alias_map.get(k, [k]):
+            if candidate in doc:
+                val, used = doc[candidate], candidate
+                break
+        else:
+            val, used = (None, None)
         if used is not None:
             out[k] = val
             hits[k] = used
     return out, hits
+
+def _coerce_alias_edge_values(doc: dict) -> dict:
+    """
+    Coerce common alias-edge variants *before* schema validation.
+    - type: alias_event|alias|ALIAS|alias-of|alias_of -> ALIAS_OF
+    - relation: alias|ALIAS|alias-of|alias_of -> alias_of
+    """
+    out = dict(doc)
+    t = str(out.get("type") or "").strip().lower()
+    if t in ("alias_event", "alias", "alias-of", "alias_of"):
+        out["type"] = "ALIAS_OF"
+    r = str(out.get("relation") or "").strip().lower()
+    if r in ("alias", "alias-of", "alias_of"):
+        out["relation"] = "alias_of"
+        out.setdefault("type", "ALIAS_OF")
+    return out
 
 def load_schema(name: str) -> dict:
     """
@@ -84,10 +110,30 @@ def load_schema(name: str) -> dict:
 SC_DECISION = load_schema("decision")
 SC_EVENT = load_schema("event")
 SC_TRANSITION = load_schema("transition")
+SC_ALIAS_EDGE = load_schema("alias_edge")
+
+_FORMAT_CHECKER = FormatChecker()
+V_DECISION   = Draft202012Validator(SC_DECISION,   format_checker=_FORMAT_CHECKER)
+V_EVENT      = Draft202012Validator(SC_EVENT,      format_checker=_FORMAT_CHECKER)
+V_TRANSITION = Draft202012Validator(SC_TRANSITION, format_checker=_FORMAT_CHECKER)
+V_ALIAS_EDGE = Draft202012Validator(SC_ALIAS_EDGE, format_checker=_FORMAT_CHECKER)
+
+def _infer_kind_raw(path: str, doc: dict) -> str | None:
+    p = path.replace("\\", "/")
+    t = str(doc.get("type") or "").strip()
+    r = str(doc.get("relation") or "").strip()
+    if ("edges/aliases" in p) or (t.upper() == "ALIAS_OF") or (r.lower() == "alias_of") or (t.lower() in ("alias_event","alias","alias-of","alias_of")):
+        return "alias_edge"
+    if all(k in doc for k in ("from", "to")) and any(k in doc for k in ("relation", "rel", "type")):
+        return "transition"
+    if "option" in doc:
+        return "decision"
+    if ("summary" in doc) or ("description" in doc):
+        return "event"
+    return None
 
 def validate_doc(doc: dict, kind: str, path: str) -> list[str]:
-    sch = {"decision": SC_DECISION, "event": SC_EVENT, "transition": SC_TRANSITION}[kind]
-    v = Draft202012Validator(sch)
+    v = {"decision": V_DECISION, "event": V_EVENT, "transition": V_TRANSITION, "alias_edge": V_ALIAS_EDGE}[kind]
     errs = [f"{path}: {e.message}" for e in sorted(v.iter_errors(doc), key=lambda e: e.path)]
     return errs
 
@@ -108,7 +154,7 @@ def seed(path: str) -> int:
         )
         return 1
 
-    raw_decisions, raw_events, raw_transitions = {}, {}, {}
+    raw_decisions, raw_events, raw_transitions, raw_alias_edges = {}, {}, {}, {}
     errors = []
     alias_stats = {"hits": 0, "docs": 0}
     for p in files:
@@ -130,23 +176,34 @@ def seed(path: str) -> int:
             )
             continue
         # Canonicalize aliases BEFORE kind inference and schema validation
-        doc, hits = canonicalize(doc)
+        pre_kind = _infer_kind_raw(p, doc)
+        doc, hits = canonicalize(doc, pre_kind)
+        if pre_kind == "alias_edge":
+            before_t, before_r = doc.get("type"), doc.get("relation")
+            doc = _coerce_alias_edge_values(doc)
+            after_t, after_r = doc.get("type"), doc.get("relation")
+            if (before_t, before_r) != (after_t, after_r):
+                log_stage(logger, "ingest", "alias_edge_coerced",
+                          path=p, type_before=before_t, type_after=after_t,
+                          relation_before=before_r, relation_after=after_r)
         alias_stats["docs"] += 1
         alias_stats["hits"] += len(hits)
-        # Alias-aware kind inference
         kind = doc.get("kind") or (
-            "transition" if all(k in doc for k in ("from","to","relation"))
+            "alias_edge" if (("edges/aliases" in p.replace("\\", "/")) or (str(doc.get("type")).upper() == "ALIAS_OF") or (str(doc.get("relation")).lower() == "alias_of"))
+            else "transition" if all(k in doc for k in ("from","to","relation"))
             else "decision" if "option" in doc
             else "event" if ("summary" in doc or "description" in doc)
             else None
         )
-        if kind not in ("decision","event","transition"):
-            errors.append(f"{p}: cannot infer kind (expected decision/event/transition)"); continue
+        if kind not in ("decision","event","transition","alias_edge"):
+            errors.append(f"{p}: cannot infer kind (expected decision/event/transition/alias_edge)"); continue
         # Validate canonicalized doc against v2 schema
         errors.extend(validate_doc(doc, kind, p))
         if kind == "decision": raw_decisions[doc["id"]] = doc
         elif kind == "event": raw_events[doc["id"]] = doc
-        else: raw_transitions[doc["id"]] = doc
+        elif kind == "transition": raw_transitions[doc["id"]] = doc
+        elif kind == "alias_edge": raw_alias_edges[doc["id"]] = doc
+        else: errors.append(f"{p}: cannot infer kind (unknown)")
 
     if errors:
         # Emit validation and parse errors via structured logging; do not print to stderr.
@@ -162,6 +219,7 @@ def seed(path: str) -> int:
     decisions = {k: normalize_decision(v) for k, v in raw_decisions.items()}
     events = {k: normalize_event(v) for k, v in raw_events.items()}
     transitions = {k: normalize_transition(v) for k, v in raw_transitions.items()}
+    alias_edges = {k: normalize_alias_edge(v) for k, v in raw_alias_edges.items()}
 
     # Enrich (deterministic) — precompute node-level `snippet`
     enrich_snippets(decisions, events, transitions)
@@ -177,6 +235,11 @@ def seed(path: str) -> int:
             ri_errors.append(f"transition {t['id']} from missing decision '{t.get('from')}'")
         if t.get("to") not in decisions:
             ri_errors.append(f"transition {t['id']} to missing decision '{t.get('to')}'")
+    for a in alias_edges.values():
+        if a.get("from") not in decisions:
+            ri_errors.append(f"alias_edge {a['id']} from missing decision '{a.get('from')}'")
+        if a.get("to") not in events:
+            ri_errors.append(f"alias_edge {a['id']} to missing event '{a.get('to')}'")
     if ri_errors:
         for m in ri_errors:
             log_stage(logger, "ingest", "ri_error", error=m)
@@ -193,7 +256,7 @@ def seed(path: str) -> int:
     store = ArangoStore(settings.arango_url, settings.arango_root_user, settings.arango_root_password,
                         settings.arango_db, settings.arango_graph_name,
                         settings.arango_catalog_collection, settings.arango_meta_collection)
-    upsert_all(store, decisions, events, transitions, snapshot_etag)
+    upsert_all(store, decisions, events, transitions, alias_edges, snapshot_etag)
     store.set_snapshot_etag(snapshot_etag)
 
     # ---------- 🎯  content-addressable batch snapshot (spec §D) ----------
@@ -210,6 +273,8 @@ def seed(path: str) -> int:
                 "decisions": decisions,
                 "events": events,
                 "transitions": transitions,
+                "alias_edges": alias_edges,
+                "snapshot_etag": snapshot_etag,
             }
         ).encode("utf-8")
     )

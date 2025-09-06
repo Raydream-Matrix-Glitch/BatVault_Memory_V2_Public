@@ -53,6 +53,7 @@ __all__ = [
     "normalize_event",
     "normalize_decision",
     "normalize_transition",
+    "normalize_alias_edge",
     "mirror_option_to_title",
     "mirror_title_to_option",
 ]
@@ -344,6 +345,19 @@ def normalize_transition(doc: Dict[str, Any]) -> Dict[str, Any]:
     }
     return _common_normalise(doc, "transition", allowed)
 
+def normalize_alias_edge(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise an alias overlay edge document."""
+    allowed = {
+        "id", "from", "to",
+        "title", "tags", "x-extra",
+        "scope", "domain_from", "domain_to",
+        "relation", "type",
+        "snapshot_etag", "meta"
+    }
+    out = _common_normalise(doc, "alias_edge", allowed)
+    out["type"] = "ALIAS_OF"
+    return out
+
 # --- Evidence utilities promoted from gateway.evidence ------------------
 _CURRENCY_MAP = {
     "$": "USD", "usd": "USD",
@@ -424,10 +438,7 @@ def dedup_and_normalise_events(ev: "WhyDecisionEvidence") -> None:
 
     Steps performed:
       1. Remove duplicate IDs, preserving the first occurrence.
-      2. Collapse near‑identical events occurring on the same day by
-         constructing a canonical key from date+summary with digits,
-         currency symbols and punctuation stripped.
-      3. Attach ``normalized_amount`` and ``normalized_currency`` via
+      2. Attach ``normalized_amount`` and ``normalized_currency`` via
          :func:`normalise_event_amount`.
 
     The input evidence object is modified in place; nothing is returned.
@@ -451,30 +462,7 @@ def dedup_and_normalise_events(ev: "WhyDecisionEvidence") -> None:
             seen_ids.add(eid)
         deduped.append(item)
     events = deduped
-    # Step 2: deduplicate near‑identical events on the same day
-    try:
-        import re as _re
-        grouped: set[tuple] = set()
-        uniq: list[dict] = []
-        for item in events:
-            try:
-                ts = item.get("timestamp") or ""
-                date_part = ts.split("T")[0] if isinstance(ts, str) else str(ts)[:10]
-                summary = item.get("summary") or item.get("description") or ""
-                if not isinstance(summary, str):
-                    summary = str(summary)
-                key_text = _re.sub(r"[\\d$¥€£,\\.\\s]+", "", summary).lower()
-                dedup_key = (date_part, key_text)
-            except Exception:
-                dedup_key = (item.get("timestamp"), item.get("id"))
-            if dedup_key in grouped:
-                continue
-            grouped.add(dedup_key)
-            uniq.append(item)
-        events = uniq
-    except Exception:
-        pass
-    # Step 3: normalise monetary amounts
+    # Step 2: normalise monetary amounts
     for item in events:
         try:
             normalise_event_amount(item)

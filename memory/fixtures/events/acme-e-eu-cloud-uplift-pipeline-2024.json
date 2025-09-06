@@ -1,0 +1,14 @@
+{
+  "id": "acme-e-eu-cloud-uplift-pipeline-2024",
+  "summary": "EU pipeline shows cloud uplift potential",
+  "description": "Regional pipeline analysis indicates +23% ACV uplift for cloud upgrades vs like-for-like renewals.",
+  "timestamp": "2024-06-25T10:00:00Z",
+  "tags": ["pipeline", "acv", "cloud"],
+  "led_to": ["acme-sales-eu-shift-incentives-cloud-upgrades-2024", "acme-sales-eu-migration-swat-team-2024"],
+  "snippet": "+23% ACV uplift for cloud upgrades.",
+  "domain": "acme/region_eu",
+  "importance": 0.72,
+  "sensitivity": "low",
+  "namespaces": ["public", "internal"],
+  "roles_allowed": ["staff", "manager", "director", "exec"]
+}

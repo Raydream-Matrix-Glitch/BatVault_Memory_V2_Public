@@ -10,6 +10,61 @@ from core_logging import get_logger, log_stage
 
 logger = get_logger("artifact_index")
 
+def build_named_bundles(artefacts: Dict[str, bytes], bundle_map: Dict[str, list[str]]) -> Tuple[Dict[str, bytes], bytes]:
+    """
+    Build multiple named .tar.gz bundles from the given artefacts.
+
+    :param artefacts: mapping of filename -> bytes
+    :param bundle_map: mapping of bundle_name -> list of filenames to include
+    :return: (bundles: dict[str, bytes], meta_bytes)
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    bundles: Dict[str, bytes] = {}
+    meta = {"generated_at": now, "bundles": {}}
+    for name, names in bundle_map.items():
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for fn in names:
+                blob = artefacts.get(fn)
+                if blob is None:
+                    continue
+                info = tarfile.TarInfo(name=fn)
+                info.size = len(blob)
+                tar.addfile(info, io.BytesIO(blob))
+        payload = buf.getvalue()
+        bundles[name] = payload
+        meta["bundles"][name] = {"size_bytes": len(payload), "files": names}
+    meta_bytes = jsonx.dumps(meta).encode("utf-8")
+    return bundles, meta_bytes
+
+def upload_named_bundles(client, bucket: str, request_id: str, bundles: Dict[str, bytes], meta_bytes: bytes) -> None:
+    """
+    Upload multiple bundles and a shared meta sidecar to object storage.
+    """
+    # Ensure bucket exists
+    try:
+        client.make_bucket(bucket)
+    except Exception:
+        pass  # already exists
+    for name, blob in bundles.items():
+        client.put_object(
+            bucket,
+            f"{request_id}/{name}.tar.gz",
+            io.BytesIO(blob),
+            length=len(blob),
+            content_type="application/gzip",
+        )
+    # Per-request meta for list views
+    client.put_object(
+        bucket,
+        f"{request_id}/_index.json",
+        io.BytesIO(meta_bytes),
+        length=len(meta_bytes),
+        content_type="application/json",
+    )
+    log_stage(logger, "artifacts", "named_bundles_upload_ok",
+              request_id=request_id, bundle_count=len(bundles))
+
 def build_bundle_and_meta(artefacts: Dict[str, bytes]) -> Tuple[bytes, bytes]:
     """
     Build a .tar.gz bundle of the given artefacts and a compact meta.json describing them.

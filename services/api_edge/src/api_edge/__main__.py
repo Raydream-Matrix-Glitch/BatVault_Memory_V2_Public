@@ -9,9 +9,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core_utils.uvicorn_entry import run
-from core_config.constants import HEALTH_PORT as PORT
 
 if __name__ == "__main__":
-    run("api_edge.app:app", port=PORT, log_level="info", access_log=False)
-
-PORT = int(os.getenv("BATVAULT_HEALTH_PORT", "8080"))
+    run("api_edge.app:app", port=int(os.getenv("API_EDGE_PORT","8080")), log_level="info", access_log=False)

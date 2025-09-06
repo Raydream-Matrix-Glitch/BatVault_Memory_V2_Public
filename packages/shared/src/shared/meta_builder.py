@@ -1,88 +1,49 @@
-"""
-Pure helper for constructing canonical meta objects.
-
-This module exposes a single function, :func:`build_meta`, which
-accepts a :class:`core_models.meta_inputs.MetaInputs` instance and a
-request identifier.  It normalises fingerprint prefixes, instantiates
-a validated :class:`core_models.models.MetaInfo` and emits a structured
-log entry.  No I/O or side effects beyond logging are performed.
-"""
-
 from typing import Any, Dict
-
 from core_logging import get_logger, log_stage
 from core_models.meta_inputs import MetaInputs
 from core_models.models import MetaInfo
 
-
 _logger = get_logger("shared.meta_builder")
 
-
-def _normalise_prompt_fingerprint(fp: str) -> str:
+def build_meta(meta: MetaInputs, request_id: str) -> MetaInfo:
     """
-    Normalise the prompt fingerprint to include a ``sha256:`` prefix.
-
-    If *fp* already begins with ``sha256:``, it is returned unchanged.
-    Otherwise the prefix is added.  The hash portion itself is *not*
-    recomputed: callers must provide the correct digest.
+    Deterministic assembly of the canonical MetaInfo (new nested schema).
     """
-    if fp.lower().startswith("sha256:"):
-        return fp
-    return f"sha256:{fp}"
-
-
-def build_meta(inputs: MetaInputs, *, request_id: str) -> MetaInfo:
-    """
-    Construct a canonical :class:`MetaInfo` from the supplied
-    :class:`MetaInputs`.
-
-    This helper is deterministic and idempotent: invoking it multiple
-    times with equivalent input will yield deep-equal outputs.  It does
-    not perform any network or disk I/O.  The only observable side
-    effect is a structured ``meta.built`` log entry.
-
-    Parameters
-    ----------
-    inputs:
-        A validated :class:`MetaInputs` instance containing all
-        telemetry fields required to construct a ``MetaInfo``.
-    request_id:
-        The current request identifier to include in audit logs.
-
-    Returns
-    -------
-    MetaInfo
-        A validated meta object ready for inclusion in a response.
-    """
-    # Ensure the fingerprint has the expected prefix; do not recompute.
-    prompt_fp = _normalise_prompt_fingerprint(inputs.prompt_fingerprint)
-    # Assemble a dict for construction; we do not modify the original inputs.
-    data: Dict[str, Any] = inputs.model_dump(mode="python")
-    data["prompt_fingerprint"] = prompt_fp
-    # Surface the request id in the public-safe meta block for the UI.
-    data["request_id"] = request_id
-
-    # Instantiate MetaInfo; Pydantic validates and forbids extras.
-    meta = MetaInfo(**data)
-
-    # Emit structured info log for auditability.  Include key fields.
+    # One concise audit log for the drawer
     try:
         log_stage(
-            _logger,
-            "meta",
-            "built",
+            "meta", "summary",
             request_id=request_id,
-            prompt_fingerprint=meta.prompt_fingerprint,
-            gateway_version=meta.gateway_version,
-            selector_model_id=meta.selector_model_id,
-            events_total=meta.events_total,
-            events_truncated=meta.events_truncated,
-            retries=meta.retries,
-            fallback_used=meta.fallback_used,
-            fallback_reason=meta.fallback_reason,
+            policy_id=meta.policy.policy_id,
+            prompt_id=meta.policy.prompt_id,
+            prompt_fp=meta.fingerprints.prompt_fp,
+            bundle_fp=meta.fingerprints.bundle_fp,
+            snapshot_etag=meta.fingerprints.snapshot_etag,
+            llm_mode=meta.policy.llm.mode,
+            retries=meta.runtime.retries,
+            fallback_used=meta.runtime.fallback_used,
+            fallback_reason=meta.runtime.fallback_reason,
+            pool_total=meta.evidence_counts.pool.total if hasattr(meta.evidence_counts.pool, "total") else None,
+            prompt_total=meta.evidence_counts.prompt_included.total if hasattr(meta.evidence_counts.prompt_included, "total") else None,
+            payload_total=meta.evidence_counts.payload_serialized.total if hasattr(meta.evidence_counts.payload_serialized, "total") else None,
+            prompt_truncation=meta.truncation_metrics.prompt_truncation,
         )
     except Exception:
-        # Logging must never raise; swallow all failures
         pass
 
-    return meta
+    # Pydantic will validate and forbid extras at this boundary.
+    payload: Dict[str, Any] = {
+        "request": meta.request.model_dump(),
+        "policy": meta.policy.model_dump(),
+        "budgets": meta.budgets.model_dump(),
+        "fingerprints": meta.fingerprints.model_dump(),
+        "evidence_counts": meta.evidence_counts.model_dump(),
+        "evidence_sets": meta.evidence_sets.model_dump(),
+        "selection_metrics": meta.selection_metrics.model_dump(),
+        "truncation_metrics": meta.truncation_metrics.model_dump(),
+        "runtime": meta.runtime.model_dump(),
+        "validator": meta.validator.model_dump(),
+        "load_shed": meta.load_shed,
+        "policy_trace": meta.policy_trace,
+    }
+    return MetaInfo(**payload)

@@ -1,0 +1,14 @@
+{
+  "id": "acme-e-customer-ai-demand-2022",
+  "summary": "Customers request AI features across product lines",
+  "description": "Top 200 accounts asked for AI summarization, extraction, and co-pilot features.",
+  "timestamp": "2022-07-20T10:30:00Z",
+  "tags": ["ai", "customer_demand"],
+  "led_to": ["acme-corp-unify-cloud-platform-2022", "acme-corp-adopt-gpu-platform-2023"],
+  "snippet": "AI feature demand spiking in enterprise accounts.",
+  "domain": "acme/corporate",
+  "importance": 0.77,
+  "sensitivity": "high",
+  "namespaces": ["internal", "confidential"],
+  "roles_allowed": ["director", "exec"]
+}

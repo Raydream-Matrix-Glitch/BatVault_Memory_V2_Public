@@ -1,9 +1,0 @@
-{
-  "id": "trans-phil-2011-2013",
-  "from": "philips-exit-tv-2011",
-  "to": "philips-led-lighting-focus-2013",
-  "relation": "causal",
-  "reason": "Exiting TVs redirected R&D toward LED technologies, directly enabling the 2013 LED-lighting focus decision.",
-  "timestamp": "2013-01-15T00:00:00Z",
-  "x-extra": {}
-}

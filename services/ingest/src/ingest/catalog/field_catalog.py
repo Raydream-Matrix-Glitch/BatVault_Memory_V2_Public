@@ -59,5 +59,4 @@ def build_field_catalog(decisions: Dict, events: Dict, transitions: Dict) -> Dic
     return catalog
 
 def build_relation_catalog() -> list[str]:
-    # Minimal relation catalog for Stage-2
-    return ["LED_TO", "CAUSAL_PRECEDES", "CHAIN_NEXT"]
+    return ["LED_TO", "CAUSAL_PRECEDES", "CHAIN_NEXT", "ALIAS_OF"]

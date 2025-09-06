@@ -1,0 +1,12 @@
+{
+  "id": "alias-acme-p1-to-sales",
+  "type": "alias_event",
+  "decision_id": "acme-prod-pivot-cloud-only-tiers-2024",
+  "event_id": "acme-e-alias-pivot-cloud-only-2024",
+  "scope": "projection",
+  "domain_from": "acme/product",
+  "domain_to": "acme/region_eu",
+  "x-extra": {
+    "note": "Graph overlay: product decision projected as regional event"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "id": "acme-e-partner-ecosystem-readiness-2024",
+  "summary": "Partner ecosystem cloud-ready",
+  "description": "Top ISVs validated cloud connectors and marketplace listings aligned to new tiers.",
+  "timestamp": "2024-03-18T11:00:00Z",
+  "tags": ["partners", "ecosystem"],
+  "led_to": ["acme-prod-pivot-cloud-only-tiers-2024", "acme-prod-sunset-onprem-connectors-2024"],
+  "snippet": "ISVs validated cloud connectors and listings.",
+  "domain": "acme/product",
+  "importance": 0.7,
+  "sensitivity": "medium",
+  "namespaces": ["internal"],
+  "roles_allowed": ["manager", "director", "exec"]
+}

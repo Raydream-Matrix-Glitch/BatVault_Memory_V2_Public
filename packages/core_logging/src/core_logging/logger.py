@@ -58,7 +58,7 @@ _RESERVED: set[str] = {
     "name","msg","args","levelname","levelno",
     "pathname","filename","module","exc_info","exc_text","stack_info",
     "lineno","funcName","created","msecs","relativeCreated",
-    "thread","threadName","processName","process",
+    "thread","threadName","processName","process","message","asctime",
 }
 
 # Top‑level fields allowed by the B5 log‑envelope (§B5 tech‑spec)
@@ -160,6 +160,8 @@ class StructuredLogger(logging.Logger):
     ) -> None:
         if kwargs:                              # merge kw-args → extra-dict
             extra = {**(extra or {}), **kwargs}
+        # Sanitize to avoid LogRecord collisions (e.g., "message")
+        extra = _sanitize_extra(extra)
         super()._log(
             level,
             msg,
@@ -216,14 +218,14 @@ def get_logger(name: str = "app", level: str | None = None) -> logging.Logger:
     return logger
 
 def log_event(logger: logging.Logger, event: str, **kwargs: Any) -> None:
-    logger.info(event, extra=kwargs)
+    logger.info(event, extra=_sanitize_extra(kwargs))
 
 # ---------------------------------------------------------------------------#
 # Internal helper – emit exactly one structured log line                      #
 # ---------------------------------------------------------------------------#
 def _emit_stage_log(logger: logging.Logger, stage: str, event: str, **extras: Any):
     payload = {"stage": stage, **extras}
-    logger.info(event, extra={k: v for k, v in payload.items() if k not in _RESERVED})
+    logger.info(event, extra=_sanitize_extra(payload))
 
 # ---------------------------------------------------------------------------#
 # log_stage – imperative **and** decorator utility (§B5 tech-spec)           #
@@ -358,15 +360,6 @@ class _TraceSpan:
         except Exception:
             pass
 
-    # make span attributes available to call-sites even when they use
-    # `with trace_span(...) as sp:`.  When OTEL is not initialised this is a no-op.
-    def set_attribute(self, key: str, value: Any) -> None:
-        try:
-            if self._span is not None:
-                self._span.set_attribute(key, value)  # type: ignore[attr-defined]
-        except Exception:
-            pass
-
     def __call__(self, fn):
         """
         Decorator entry-point.
@@ -403,3 +396,23 @@ def trace_span(name: str, *, logger: logging.Logger | None = None, **fixed):
     named *app* so call-sites stay boiler-plate free.
     """
     return _TraceSpan(name, logger or get_logger("app"), **fixed)
+
+def _sanitize_extra(extra: Dict[str, Any] | None) -> Dict[str, Any]:
+    """
+    Remove/rename keys in `extra` that would collide with LogRecord attributes.
+    - `message` is remapped to `message_extra` to preserve content.
+    - all other collisions are namespaced as `meta_<key>`.
+    """
+    if not extra:
+        return {}
+    safe: Dict[str, Any] = {}
+    for k, v in extra.items():
+        lk = str(k)
+        if lk in _RESERVED:
+            if lk == "message":
+                safe["message_extra"] = v
+            else:
+                safe[f"meta_{lk}"] = v
+        else:
+            safe[lk] = v
+    return safe

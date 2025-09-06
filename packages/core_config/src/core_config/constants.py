@@ -1,10 +1,15 @@
 import os
 import warnings
+from typing import Optional
 
 
 # Legacy byte caps (kept for backward-compat in logs only)
 MAX_PROMPT_BYTES = int(os.getenv("MAX_PROMPT_BYTES", "8192"))
 SELECTOR_TRUNCATION_THRESHOLD = int(os.getenv("SELECTOR_TRUNCATION_THRESHOLD", "6144"))
+
+# HTTP retry/backoff controls
+HTTP_RETRY_BASE_MS = int(os.getenv("HTTP_RETRY_BASE_MS", "50"))
+HTTP_RETRY_JITTER_MS = int(os.getenv("HTTP_RETRY_JITTER_MS", "200"))
 
 # -------- Token-aware budgets (new) -----------------------------------
 # Total context window of the control model (e.g., 2048).
@@ -16,6 +21,18 @@ CONTROL_COMPLETION_TOKENS = int(os.getenv("CONTROL_COMPLETION_TOKENS", "512"))
 CONTROL_PROMPT_GUARD_TOKENS = int(os.getenv("CONTROL_PROMPT_GUARD_TOKENS", "32"))
 LLM_MIN_COMPLETION_TOKENS = int(os.getenv("LLM_MIN_COMPLETION_TOKENS", "16"))
 GATE_SAFETY_HEADROOM_TOKENS = int(os.getenv("GATE_SAFETY_HEADROOM_TOKENS", "128"))
+# Unified short-answer character cap:
+# Prefer SHORT_ANSWER_MAX_CHARS; fall back to legacy ANSWER_CHAR_CAP to keep older envs working.
+# If neither is set, default to 320 to match historical behavior.
+SHORT_ANSWER_MAX_CHARS = int(os.getenv("SHORT_ANSWER_MAX_CHARS") or os.getenv("ANSWER_CHAR_CAP", "320"))
+
+# Maximum number of sentences permitted in short answers.
+# Prefer new SHORT_ANSWER_MAX_SENTENCES; fall back to legacy ANSWER_SENTENCE_CAP; default 2.
+try:
+    _sent_env: Optional[str] = os.getenv("SHORT_ANSWER_MAX_SENTENCES") or os.getenv("ANSWER_SENTENCE_CAP") or "2"
+    SHORT_ANSWER_MAX_SENTENCES = int(_sent_env)
+except Exception:
+    SHORT_ANSWER_MAX_SENTENCES = 2
 
 # -------- Gate shrink knobs (deterministic) -------------------------------
 GATE_COMPLETION_SHRINK_FACTOR = float(os.getenv("GATE_COMPLETION_SHRINK_FACTOR", "0.8"))

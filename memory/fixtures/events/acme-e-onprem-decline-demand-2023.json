@@ -1,0 +1,14 @@
+{
+  "id": "acme-e-onprem-decline-demand-2023",
+  "summary": "On-prem SKU demand declines",
+  "description": "Win/loss analysis shows on-prem requests down 35% YoY; feature lag cited.",
+  "timestamp": "2023-10-10T13:00:00Z",
+  "tags": ["portfolio", "demand"],
+  "led_to": ["acme-corp-descope-onprem-2024"],
+  "snippet": "On-prem requests down 35% YoY.",
+  "domain": "acme/corporate",
+  "importance": 0.75,
+  "sensitivity": "high",
+  "namespaces": ["internal", "confidential"],
+  "roles_allowed": ["director", "exec"]
+}

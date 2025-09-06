@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 import httpx
 from core_utils import jsonx
 
-from core_config.constants import timeout_for_stage
+from core_config.constants import timeout_for_stage, HTTP_RETRY_BASE_MS, HTTP_RETRY_JITTER_MS
 from core_observability.otel import inject_trace_context
 
 from core_logging import get_logger
@@ -103,7 +103,7 @@ async def fetch_json(method: str,
         except Exception as e:
             last_exc = e
             if attempt < max(0, int(retry)):
-                await asyncio.sleep(0.05 + 0.2 * (attempt % 3))
+                await asyncio.sleep((HTTP_RETRY_BASE_MS + HTTP_RETRY_JITTER_MS * (attempt % 3)) / 1000.0)
                 continue
             break
     assert last_exc is not None

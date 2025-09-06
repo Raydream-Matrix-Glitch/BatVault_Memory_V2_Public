@@ -526,6 +526,10 @@ class ArangoStore:
         rel_type: str,
         payload: Dict[str, Any],
     ) -> None:
+        # tolerate stub-mode when DB is unavailable
+        self._connect()
+        if self.db is None or not hasattr(self.db, "collection"):
+            return
         safe_key = self._safe_key(edge_id)
         if safe_key != edge_id:
             logger.info("edge_key_sanitised", extra={"raw": edge_id, "sanitised": safe_key, "stage": "storage"})
@@ -556,6 +560,61 @@ class ArangoStore:
     def _cache_key(self, *parts: str) -> str:
         etag = self.get_snapshot_etag() or "noetag"
         return ":".join((etag, *parts))
+
+    # ---------------------------- Bulk upserts ----------------------------
+    def bulk_upsert_nodes_fast(self, docs: List[Dict[str, Any]]) -> int:
+        """Best-effort bulk replace into `nodes` collection."""
+        self._connect()
+        if self.db is None:
+            return 0
+        _docs = []
+        for d in docs:
+            dd = dict(d)
+            if "_key" in dd:
+                dd["_key"] = self._safe_key(str(dd["_key"]))
+            _docs.append(dd)
+        try:
+            coll = self.db.collection("nodes")
+            if hasattr(coll, "import_bulk"):
+                res = coll.import_bulk(_docs, on_duplicate="replace")
+                return int(res.get("created", 0)) + int(res.get("updated", 0))
+        except Exception as exc:
+            log_stage(logger, "storage", "bulk_upsert_nodes_fallback", error=str(exc))
+        n = 0
+        for d in _docs:
+            try:
+                self.db.collection("nodes").insert(d, overwrite=True)
+                n += 1
+            except Exception:
+                pass
+        return n
+
+    def bulk_upsert_edges_fast(self, docs: List[Dict[str, Any]]) -> int:
+        """Best-effort bulk replace into `edges` collection."""
+        self._connect()
+        if self.db is None:
+            return 0
+        _docs = []
+        for d in docs:
+            dd = dict(d)
+            if "_key" in dd:
+                dd["_key"] = self._safe_key(str(dd["_key"]))
+            _docs.append(dd)
+        try:
+            coll = self.db.collection("edges")
+            if hasattr(coll, "import_bulk"):
+                res = coll.import_bulk(_docs, on_duplicate="replace")
+                return int(res.get("created", 0)) + int(res.get("updated", 0))
+        except Exception as exc:
+            log_stage(logger, "storage", "bulk_upsert_edges_fallback", error=str(exc))
+        n = 0
+        for d in _docs:
+            try:
+                self.db.collection("edges").insert(d, overwrite=True)
+                n += 1
+            except Exception:
+                pass
+        return n
 
     # ------------------------------------------------------------
     # Catalog API
@@ -672,8 +731,8 @@ class ArangoStore:
         n = self.get_node(node_id)
         if not n or n.get("type") != "decision":
             return None
-        return {
-            "id": n["_key"],
+        out: Dict[str, Any] = {
+            "id": n.get("_key"),
             "option": n.get("option"),
             "rationale": n.get("rationale"),
             "timestamp": n.get("timestamp"),
@@ -684,12 +743,32 @@ class ArangoStore:
             "transitions": n.get("transitions", []),
         }
 
+        # Merge any existing x-extra and other non-canonical keys
+        extra: Dict[str, Any] = {}
+        if isinstance(n.get("x-extra"), dict):
+            extra.update(n.get("x-extra") or {})
+        _exclude = {
+            "_key","_id","_rev","id","x-extra","snapshot_etag","meta","type",
+            "option","rationale","timestamp","decision_maker","tags","supported_by","based_on","transitions",
+        }
+        for k, v in n.items():
+            if k in _exclude:
+                continue
+            extra[k] = v
+        if extra:
+            out["x-extra"] = extra
+            try:
+                log_stage(logger, "enrich", "x_extra_preserved", node_type="decision", node_id=node_id, extra_count=len(extra))
+            except Exception:
+                pass
+        return out
+
     def get_enriched_event(self, node_id: str) -> Optional[Dict[str, Any]]:
         n = self.get_node(node_id)
         if not n or n.get("type") != "event":
             return None
-        return {
-            "id": n["_key"],
+        out: Dict[str, Any] = {
+            "id": n.get("_key"),
             "summary": n.get("summary"),
             "description": n.get("description"),
             "timestamp": n.get("timestamp"),
@@ -698,12 +777,31 @@ class ArangoStore:
             "snippet": n.get("snippet"),
         }
 
+        extra: Dict[str, Any] = {}
+        if isinstance(n.get("x-extra"), dict):
+            extra.update(n.get("x-extra") or {})
+        _exclude = {
+            "_key","_id","_rev","id","x-extra","snapshot_etag","meta","type",
+            "summary","description","timestamp","tags","led_to","snippet",
+        }
+        for k, v in n.items():
+            if k in _exclude:
+                continue
+            extra[k] = v
+        if extra:
+            out["x-extra"] = extra
+            try:
+                log_stage(logger, "enrich", "x_extra_preserved", node_type="event", node_id=node_id, extra_count=len(extra))
+            except Exception:
+                pass
+        return out
+
     def get_enriched_transition(self, node_id: str) -> Optional[Dict[str, Any]]:
         n = self.get_node(node_id)
         if not n or n.get("type") != "transition":
             return None
-        return {
-            "id": n["_key"],
+        out: Dict[str, Any] = {
+            "id": n.get("_key"),
             "from": n.get("from"),
             "to": n.get("to"),
             "relation": n.get("relation"),
@@ -711,6 +809,25 @@ class ArangoStore:
             "timestamp": n.get("timestamp"),
             "tags": n.get("tags", []),
         }
+
+        extra: Dict[str, Any] = {}
+        if isinstance(n.get("x-extra"), dict):
+            extra.update(n.get("x-extra") or {})
+        _exclude = {
+            "_key","_id","_rev","id","x-extra","snapshot_etag","meta","type",
+            "from","to","relation","reason","timestamp","tags",
+        }
+        for k, v in n.items():
+            if k in _exclude:
+                continue
+            extra[k] = v
+        if extra:
+            out["x-extra"] = extra
+            try:
+                log_stage(logger, "enrich", "x_extra_preserved", node_type="transition", node_id=node_id, extra_count=len(extra))
+            except Exception:
+                pass
+        return out
 
     # ------------------------------------------------------------
     # Redis-backed caching utilities
@@ -792,14 +909,18 @@ class ArangoStore:
                 cached = {**cached, "node_id": cached["anchor"]}
             return cached
         aql = """
-        LET anchor = DOCUMENT('nodes', @anchor)
-        LET outgoing = (FOR v,e IN 1..1 OUTBOUND anchor GRAPH @graph RETURN {node: v, edge: e})
-        LET incoming = (FOR v,e IN 1..1 INBOUND  anchor GRAPH @graph RETURN {node: v, edge: e})
-        LET sup = (
-            FOR sid IN anchor.supported_by
-              LET ev = DOCUMENT('nodes', sid)
-              FILTER ev != NULL RETURN { node: ev, edge: { relation: 'LED_TO' } }
-        )
+        LET anchor   = DOCUMENT('nodes', @anchor)
+        LET outgoing = (anchor == null ? [] : (FOR v,e IN 1..1 OUTBOUND anchor GRAPH @graph RETURN {node: v, edge: e}))
+        LET incoming = (anchor == null ? [] : (FOR v,e IN 1..1 INBOUND  anchor GRAPH @graph RETURN {node: v, edge: e}))
+        // Seen node keys from real graph edges (prefer these)
+        LET seen = UNION_DISTINCT(outgoing[*].node._key, incoming[*].node._key)
+        // Backfill from `supported_by` only when no explicit LED_TO edge exists
+        LET sup = (anchor == null ? [] : (
+          FOR sid IN anchor.supported_by
+            LET ev = DOCUMENT('nodes', sid)
+            FILTER ev != NULL AND POSITION(seen, ev._key, true) == false
+            RETURN { node: ev, edge: { relation: 'LED_TO', _from: ev._id, _to: anchor._id } }
+        ))
         RETURN { anchor: anchor, neighbors: UNIQUE(APPEND(APPEND(outgoing, incoming), sup)) }
         """
         cursor = self.db.aql.execute(aql, bind_vars={"anchor": anchor_id, "graph": self._graph_name})
@@ -838,6 +959,39 @@ class ArangoStore:
                 if n.get("node") and n.get("edge")
             ],
         }
+        # ---- Neighbor de-duplication (prefer richer edge metadata) ----
+        _neighbors = result.get("neighbors") or []
+        _before = len(_neighbors)
+        _by_id = {}
+        def _score(item):
+            try:
+                _edge = item.get("edge") or {}
+                # Prefer entries with a computed direction (derived from _from/_to)
+                return 1 if (_edge.get("direction") is not None) else 0
+            except Exception:
+                return 0
+        for _n in _neighbors:
+            _id = _n.get("id")
+            if not _id:
+                continue
+            _prev = _by_id.get(_id)
+            if (_prev is None) or (_score(_n) > _score(_prev)):
+                _by_id[_id] = _n
+        _deduped = list(_by_id.values())
+        if len(_deduped) != _before:
+            try:
+                log_stage(logger, "expand", "dedup_neighbors",
+                          before=_before, after=len(_deduped),
+                          dropped_ids=[i for i in set([n.get("id") for n in _neighbors]) if i not in _by_id])
+            except Exception:
+                pass
+        result["neighbors"] = _deduped
+        # If the anchor was not found, surface a structured log for debuggability.
+        if anchor_doc is None:
+            try:
+                log_stage(logger, "expand", "anchor_not_found", anchor_id=anchor_id)
+            except Exception:
+                pass
         self._cache_set(cache_key, result, get_settings().cache_ttl_expand_sec)
         return result
 

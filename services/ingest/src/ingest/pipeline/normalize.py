@@ -17,6 +17,7 @@ try:
         normalize_event as _shared_normalize_event,
         normalize_decision as _shared_normalize_decision,
         normalize_transition as _shared_normalize_transition,
+        normalize_alias_edge as _shared_normalize_alias_edge,
     )
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
@@ -161,6 +162,11 @@ def normalize_transition(t: dict) -> dict:
         out["x-extra"] = x_extra
     # Delegate to shared normaliser
     return _shared_normalize_transition(out)
+
+def normalize_alias_edge(d: dict) -> dict:
+    """Normalise an alias overlay edge for ingestion."""
+    # No ID slugging – fixture authors control alias edge IDs
+    return _shared_normalize_alias_edge(dict(d))
 
 def normalize_tags(tags: list[str]) -> list[str]:
     """

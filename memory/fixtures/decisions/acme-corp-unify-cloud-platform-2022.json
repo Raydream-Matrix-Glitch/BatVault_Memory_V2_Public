@@ -1,0 +1,55 @@
+{
+  "id": "acme-corp-unify-cloud-platform-2022",
+  "option": "Migrate core SaaS to a unified cloud platform (multi-tenant, shared control plane)",
+  "rationale": "Flatten infra cost curves, standardize reliability and security, and unlock rapid feature delivery across products.",
+  "timestamp": "2022-09-15T15:00:00Z",
+  "decision_maker": "CEO",
+  "tags": ["platform_strategy", "cost_optimization", "reliability"],
+  "supported_by": [
+    "acme-e-infra-cost-curves-2021-2022",
+    "acme-e-reliability-incidents-2021",
+    "acme-e-customer-ai-demand-2022"
+  ],
+  "based_on": [],
+  "transitions": [
+    "trans-acme-a1-to-a2",
+    "trans-acme-a1-to-a3"
+  ],
+  "domain": "acme/corporate",
+  "importance": 0.92,
+  "sensitivity": "high",
+  "namespaces": ["internal", "confidential"],
+  "roles_allowed": ["director", "exec"],
+  "x-extra": {
+    "kpis": [
+      {
+        "name": "Infra cost per request",
+        "unit": "USD/request",
+        "baseline": 0.008,
+        "target": 0.004,
+        "window": "2023-2024"
+      },
+      {
+        "name": "Availability (SLO)",
+        "unit": "%",
+        "baseline": 99.80,
+        "target": 99.95,
+        "window": "2023-2024"
+      },
+      {
+        "name": "Deployment frequency",
+        "unit": "deploys/day",
+        "baseline": 2,
+        "target": 10
+      }
+    ],
+    "earnings_impact_estimate": {
+      "revenue_uplift_pct": 3.5,
+      "opex_savings_musd": 24
+    },
+    "kpi_tracking_id": "KPI-PLAT-2022-09",
+    "policy_hints": {
+      "sensitivity_reason": "Strategic platform move with financial impact"
+    }
+  }
+}

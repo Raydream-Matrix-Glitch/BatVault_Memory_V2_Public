@@ -1,5 +1,6 @@
 from __future__ import annotations
 import time, uuid, os, re
+from datetime import datetime, timezone
 from typing import Any, Tuple, Dict  # Mapping and List are unused
 
 from core_utils import jsonx
@@ -19,7 +20,6 @@ from core_models.models import (
     MetaInfo,
 )
 from core_models.meta_inputs import MetaInputs
-from shared.normalize import normalise_event_amount as _normalise_event_amount  # promoted helper
 from shared import dedup_and_normalise_events as _shared_dedup_and_normalise_events
 from gateway import selector as _selector
 from gateway.inference_router import last_call as _inference_last_call
@@ -27,8 +27,9 @@ from gateway.inference_router import sanitize_fallback_reason as _sanitize_fallb
 from .prompt_envelope import build_prompt_envelope
 from .templater import finalise_short_answer
 from core_validator import validate_response as _core_validate_response
-from core_validator import canonical_allowed_ids
 from gateway.inference_router import llm_call
+from core_config.constants import SELECTOR_MODEL_ID
+from .load_shed import should_load_shed
 import inspect
 
 # Import metadata helpers to construct canonical meta information.  The
@@ -47,8 +48,8 @@ logger.propagate = False
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _compute_supporting_ids(ev: WhyDecisionEvidence) -> list[str]:
-    """Compute deterministic supporting_ids for the given evidence.
+def _compute_cited_ids(ev: WhyDecisionEvidence) -> list[str]:
+    """Compute deterministic cited_ids for the given evidence.
 
     Ordering:
       [anchor] + [top 3 events by selector.rank_events] + [preceding first] + [succeeding first]
@@ -112,16 +113,16 @@ def _compute_supporting_ids(ev: WhyDecisionEvidence) -> list[str]:
     if first_pre_id and first_pre_id in allowed and first_pre_id not in support:
         support.append(first_pre_id)
     # Succeeding transition
-    first_suc_id: str | None = None
+    first_suc_id = None
+    # Prefer citing the succeeding **decision** (transition.to), not the transition edge
     try:
-        suc_list = list(getattr(ev.transitions, "succeeding", []) or [])
+        for tr in list(getattr(ev.transitions, "succeeding", []) or []):
+            to_id = tr.get("to") if isinstance(tr, dict) else getattr(tr, "to", None)
+            if to_id:
+                first_suc_id = to_id
+                break
     except Exception:
-        suc_list = []
-    for tr in suc_list:
-        tid = tr.get("id") if isinstance(tr, dict) else getattr(tr, "id", None)
-        if tid:
-            first_suc_id = tid
-            break
+        pass
     if first_suc_id and first_suc_id in allowed and first_suc_id not in support:
         support.append(first_suc_id)
     return support
@@ -200,15 +201,15 @@ try:
 except _md.PackageNotFoundError:
     _GATEWAY_VERSION = "unknown"
 
-from core_config.constants import SELECTOR_MODEL_ID
-from .load_shed import should_load_shed
-
-
 # ───────────────────── main entry-point ─────────────────────────
 @trace_span("builder", logger=logger)
 async def build_why_decision_response(
     req: "AskIn",                          # forward-declared (defined in app.py)
     evidence_builder,                      # EvidenceBuilder instance (singleton passed from app.py)
+    *,
+    source: str = "ask",                   # "ask" | "query" – used for policy/logging
+    fresh: bool = False,                   # bypass caches when gathering evidence
+    policy_headers: dict | None = None,    # pass policy headers through to Memory API
 ) -> Tuple[WhyDecisionResponse, Dict[str, bytes], str]:
     """
     Assemble Why-Decision response and audit artefacts.
@@ -217,13 +218,15 @@ async def build_why_decision_response(
     t0      = time.perf_counter()
     req_id  = req.request_id or uuid.uuid4().hex
     arte: Dict[str, bytes] = {}
+    settings = get_settings()
 
     # ── evidence (k = 1 collect) ───────────────────────────────
     ev: WhyDecisionEvidence
     if req.evidence is not None:
         ev = req.evidence
     elif req.anchor_id:
-        maybe = evidence_builder.build(req.anchor_id)
+        # Pass policy headers through to EvidenceBuilder → Memory API
+        maybe = evidence_builder.build(req.anchor_id, fresh=fresh, policy_headers=policy_headers)
         ev = await maybe if inspect.isawaitable(maybe) else maybe
         if ev is None:
 
@@ -244,7 +247,8 @@ async def build_why_decision_response(
     # callers provide their own evidence stubs.  See tests covering
     # deduplication and amount normalisation for rationale.
     try:
-        _dedup_and_normalise_events(ev)
+        if req.evidence is not None:
+            _dedup_and_normalise_events(ev)
     except Exception:
         pass
 
@@ -285,17 +289,37 @@ async def build_why_decision_response(
                     ev_trans.append(t.model_dump(mode="python"))
                 except Exception:
                     ev_trans.append(dict(t))
-        ev.allowed_ids = canonical_allowed_ids(
-            getattr(ev.anchor, "id", None) or "",
-            ev_events,
-            ev_trans,
-        )
     except Exception as e:
         log_stage("builder", "allowed_ids_canonicalization_failed",
                   error=str(e), request_id=getattr(req, "request_id", None))
         raise
-    # Persist the final evidence with empty collections omitted
-    arte["evidence_post.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)).encode()
+    # Strategic logging: how many neighbor *decision* ids made it into allowed_ids
+    try:
+        _base_ids = set(
+            [
+                getattr(ev.anchor, "id", None),
+                *[
+                    (e.get("id") if isinstance(e, dict) else getattr(e, "id", None))
+                    for e in (ev_events or [])
+                ],
+                *[
+                    (t.get("id") if isinstance(t, dict) else getattr(t, "id", None))
+                    for t in (ev_trans or [])
+                ],
+            ]
+        )
+        _neighbor_count = len([x for x in (ev.allowed_ids or []) if x and x not in _base_ids])
+        log_stage(
+            "builder",
+            "allowed_ids_neighbor_decisions",
+            request_id=req_id,
+            neighbor_decision_ids=_neighbor_count,
+            allowed_ids=len(ev.allowed_ids or []),
+        )
+    except Exception:
+        pass
+    # Persist canonicalised, pre-gate evidence (post-dedupe, pre-trim)
+    arte["evidence_canonical.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)).encode()
     try:
         log_stage("builder", "evidence_final_persisted",
                   request_id=req_id,
@@ -346,29 +370,27 @@ async def build_why_decision_response(
         evidence=ev.model_dump(mode="python", exclude_none=True),
         snapshot_etag=getattr(ev, "snapshot_etag", "unknown"),
         intent=req.intent,
+        endpoint=source,
         allowed_ids=ev.allowed_ids,
         retries=getattr(ev, "_retry_count", 0),
     )
     from gateway.budget_gate import run_gate as _run_gate
     gate_plan, trimmed_evidence = _run_gate(pre_envelope, ev, request_id=req_id, model_name=None)
-    # Persist trimmed evidence & re-canonicalise allowed_ids to drop removed items
     try:
-        ev = trimmed_evidence if isinstance(trimmed_evidence, WhyDecisionEvidence) \
+        ev_prompt = trimmed_evidence if isinstance(trimmed_evidence, WhyDecisionEvidence) \
              else WhyDecisionEvidence.model_validate(trimmed_evidence)
-        ev_events = []
-        for e in (ev.events or []):
-            ev_events.append(e if isinstance(e, dict) else getattr(e, "model_dump", dict)(mode="python"))
-        ev_trans = []
-        for t in list(getattr(ev.transitions, "preceding", []) or []) + list(getattr(ev.transitions, "succeeding", []) or []):
-            ev_trans.append(t if isinstance(t, dict) else getattr(t, "model_dump", dict)(mode="python"))
-        ev.allowed_ids = canonical_allowed_ids(
-            getattr(ev.anchor, "id", None) or "",
-            ev_events,
-            ev_trans,
-        )
+        # Normalise empty transition lists on the prompt copy only (omit null arrays in prompt JSON)
+        try:
+            if not (getattr(ev_prompt.transitions, "preceding", []) or []):
+                ev_prompt.transitions.preceding = None  # type: ignore
+            if not (getattr(ev_prompt.transitions, "succeeding", []) or []):
+                ev_prompt.transitions.succeeding = None  # type: ignore
+        except Exception:
+            pass
     except Exception as e:
-        log_stage("builder", "allowed_ids_recanonicalize_failed",
+        log_stage("builder", "prompt_evidence_prepare_failed",
                   error=str(e), request_id=req_id)
+        ev_prompt = ev  # safe fallback
     # Normalise empty transition lists to None before serialising the post-gate evidence.
     # When a field is None Pydantic can omit it from the JSON (exclude_none=True).
     try:
@@ -392,8 +414,11 @@ async def build_why_decision_response(
         )
     _events_total = len(_ranked_all)
     _events_truncated_flag = _events_total > 10
-    # Keep the response events to top 10 (bundle artefacts already captured above retain the full list)
-    ev.events = _ranked_all[:10]
+    # Keep the first 10 events with full detail; append id-only stubs for the rest.
+    head = _ranked_all[:10]
+    tail_ids = [e.get("id") if isinstance(e, dict) else getattr(e, "id", None) for e in _ranked_all[10:]]
+    tail = [{"id": tid} for tid in tail_ids if tid]
+    ev.events = head + tail
     # Rebuild allowed_ids after shaping events via the canonical helper
     try:
         from core_validator import canonical_allowed_ids as _canon
@@ -406,6 +431,10 @@ async def build_why_decision_response(
             ev_trans.extend(getattr(tr, "succeeding", []) or [])
             ev_trans = [t if isinstance(t, dict) else getattr(t, "model_dump", dict)(mode="python") for t in ev_trans]
         ev.allowed_ids = _canon(aid, ev_events, ev_trans)
+        try:
+            log_stage('builder','allowed_ids_preserved', request_id=req_id, count=len(ev.allowed_ids or []))
+        except Exception:
+            pass
     except Exception:
         pass
     # Extract selector/gate metrics (if provided by selector)
@@ -421,16 +450,22 @@ async def build_why_decision_response(
     # ── canonical prompt envelope + fingerprint ────────────────
     envelope = build_prompt_envelope(
         question=f"Why was decision {ev.anchor.id} made?",
-        evidence=ev.model_dump(mode="python", exclude_none=True),
+        evidence=ev_prompt.model_dump(mode="python", exclude_none=True),
         snapshot_etag=getattr(ev, "snapshot_etag", "unknown"),
+        endpoint=source,
         intent=req.intent,
         allowed_ids=ev.allowed_ids,
         retries=getattr(ev, "_retry_count", 0),
     )
-    # Fingerprints from the gate (single source of truth for prompt)
+    # Fingerprints (single source of truth for prompt + bundle)
     prompt_fp: str = (gate_plan.fingerprints or {}).get("prompt") or "unknown"
     bundle_fp: str = envelope.get("_fingerprints", {}).get("bundle_fingerprint") or "unknown"
     snapshot_etag_fp: str = envelope.get("_fingerprints", {}).get("snapshot_etag") or "unknown"
+    try:
+        log_stage("meta", "fingerprints", request_id=req_id,
+                  prompt_fp=prompt_fp, bundle_fp=bundle_fp, snapshot_etag=snapshot_etag_fp)
+    except Exception:
+        pass
 
     # ── answer generation with JSON‑only LLM and deterministic fallback ──
     raw_json: str | None = None
@@ -443,16 +478,20 @@ async def build_why_decision_response(
         # If the caller provided an answer already, skip LLM invocation.
         ans = req.answer
     else:
-        from core_config import get_settings
         settings = get_settings()
-        # Spec: “LLM does one thing only … and only when llm_mode != off”
-        # Values: off|on|auto (treat auto as on here; routing still handles load-shed)
-        from .load_shed import should_load_shed
-        use_llm = ((settings.llm_mode or "off").lower() != "off") and (not should_load_shed())
+        # Endpoint-aware LLM gating: ask/query may override the global llm_mode.
+        # Values: off|on|auto (auto is treated as on unless load-shed)
+        try:
+            effective_mode = (settings.ask_llm_mode if source == "ask" else settings.query_llm_mode) or settings.llm_mode
+        except Exception:
+            effective_mode = getattr(settings, "llm_mode", "off")
+        use_llm = ((effective_mode or "off").lower() != "off") and (not should_load_shed())
         # Strategic log (B5 envelope): makes the gate visible in traces & audit
         try:
             log_stage("prompt", "llm_gate",
-                      llm_mode=settings.llm_mode,
+                      llm_mode=getattr(settings, "llm_mode", None),
+                      endpoint_mode=effective_mode,
+                      source=source,
                       load_shed=should_load_shed(),
                       use_llm=use_llm,
                       policy_model=getattr(settings, "vllm_model_name", None))
@@ -461,12 +500,13 @@ async def build_why_decision_response(
                 log_stage("llm", "shed", reason="load_shed_flag", request_id=req_id)
         except Exception:
             pass
-        # If the LLM is explicitly disabled by config, record that clearly and mark fallback.
+        # If the LLM is disabled by endpoint/global config, record & mark fallback.
         if not use_llm:
             try:
                 log_stage("llm", "disabled",
                     request_id=req_id,
-                    llm_mode=settings.llm_mode,
+                    llm_mode=effective_mode,
+                    source=source,
                     reason="llm_mode_off",
                 )
             except Exception:
@@ -563,10 +603,10 @@ async def build_why_decision_response(
                 # No LLM expected; if no explicit reason already set assign ``llm_off``
                 if not fallback_reason:
                     fallback_reason = "llm_off"
-            # Same richer supporting_ids logic for the “no raw_json” branch
-            # Compute supporting ids deterministically
+            # Same richer cited_ids logic for the “no raw_json” branch
+            # Compute cited ids deterministically
             try:
-                support = _compute_supporting_ids(ev)
+                support = _compute_cited_ids(ev)
             except Exception:
                 support = []
                 try:
@@ -575,7 +615,7 @@ async def build_why_decision_response(
                         support.append(aid)
                 except Exception:
                     support = []
-            ans = WhyDecisionAnswer(short_answer="", supporting_ids=support)
+            ans = WhyDecisionAnswer(short_answer="", cited_ids=support)
             arte["llm_raw.json"] = b"{}"
         else:
             arte["llm_raw.json"] = raw_json.encode()
@@ -599,8 +639,7 @@ async def build_why_decision_response(
             except Exception as e:
                 # Parsing or validation failed – treat as a fallback.  Leave the
                 # short answer empty so the templater can synthesise a deterministic
-                # fallback.  Populate supporting_ids based on the anchor or
-                # allowed_ids.
+                # fallback.  Populate cited_ids based on the anchor or allowed_ids.
                 llm_fallback = True
                 fallback_reason = "parse_error"
                 try:
@@ -612,10 +651,10 @@ async def build_why_decision_response(
                     )
                 except Exception:
                     pass
-                # Build richer supporting_ids from evidence (anchor + events + transitions),
+                # Build richer cited_ids from evidence (anchor + events + transitions),
                 # keeping ordering compatible with allowed_ids and deduping.
                 try:
-                    support = _compute_supporting_ids(ev)
+                    support = _compute_cited_ids(ev)
                 except Exception:
                     support = []
                     try:
@@ -625,7 +664,7 @@ async def build_why_decision_response(
                     except Exception:
                         support = []
 
-                ans = WhyDecisionAnswer(short_answer="", supporting_ids=support)
+                ans = WhyDecisionAnswer(short_answer="", cited_ids=support)
                 arte["llm_raw.json"] = b"{}"
 
     changed_support = False
@@ -702,38 +741,24 @@ async def build_why_decision_response(
     except Exception:
         _sel_metrics_pre = {}
 
-    _meta_pre = MetaInfo(
-        policy_id=_policy_id_pre,
-        prompt_id=_prompt_id_pre,
-        prompt_fingerprint=prompt_fp,
-        bundle_fingerprint=bundle_fp,
-        bundle_size_bytes=int(len(arte.get("evidence_post.json", b""))),
-        prompt_tokens=int(getattr(gate_plan, "prompt_tokens", 0)),
-        max_tokens=int(getattr(gate_plan, "max_tokens", 0)),
-        evidence_tokens=int(getattr(gate_plan, "evidence_tokens", 0)),
-        snapshot_etag=snapshot_etag_fp,
-        fallback_used=bool(llm_fallback),
-        fallback_reason=fallback_reason if llm_fallback else None,
-        retries=int(retry_count),
-        gateway_version=_gw_version_pre,
-        selector_model_id=SELECTOR_MODEL_ID,
-        latency_ms=int((time.perf_counter() - t0) * 1000.0),
-        validator_error_count=0,
-        evidence_metrics=dict(_sel_metrics_pre) if _sel_metrics_pre else {},
-    )
-    try:
-        log_stage("builder", "meta_prepared_pre_validation",
-                  request_id=req_id, policy_id=_policy_id_pre, prompt_id=_prompt_id_pre,
-                  snapshot_etag=snapshot_etag_fp)
-    except Exception:
-        pass
-
     resp = WhyDecisionResponse(
         intent=req.intent,
         evidence=ev,
         answer=ans,
         completeness_flags=flags,
-        meta=_meta_pre,
+        meta=MetaInfo(
+            request={},
+            policy={},
+            budgets={},
+            fingerprints={},
+            evidence_counts={},
+            evidence_sets={},
+            selection_metrics={"ranking_policy": selector_policy, "scores": sel_scores},
+            truncation_metrics={},
+            runtime={},
+            validator={},
+            load_shed=False,
+        ),
     )
     # Validate and normalise the response using the core validator
     # Invoke the validator via the module's global namespace to honour monkey‑patching of
@@ -768,11 +793,23 @@ async def build_why_decision_response(
     except Exception:
         pass
     # Post-process the short answer to replace stubs and enforce length
-    ans, finalise_changed = finalise_short_answer(resp.answer, resp.evidence)
-    # Recompute supporting_ids after finalising answer
+    # Determine if a permission note should be appended based on policy_trace
+    _perm_note = False
     try:
-        if ans is not None:
-            ans.supporting_ids = _compute_supporting_ids(ev)
+        _pt = getattr(ev, "_policy_trace", {}) or {}
+        _reasons = dict(_pt.get("reasons_by_id") or {})
+        _perm_note = any((str(v).startswith("acl:")) for v in _reasons.values())
+    except Exception:
+        _perm_note = False
+    ans, finalise_changed = finalise_short_answer(resp.answer, resp.evidence, append_permission_note=_perm_note)
+    # Recompute cited_ids after finalising answer
+    try:
+        if ans is not None and (not llm_fallback):
+            ans.cited_ids = _compute_cited_ids(ev)
+            try:
+                log_stage("builder", "cited_ids_recomputed_for_llm", request_id=req_id, count=len(getattr(ans, "cited_ids", []) or []))
+            except Exception:
+                pass
     except Exception:
         pass
     # Combine all error messages.  Structured errors originate from the core
@@ -816,13 +853,12 @@ async def build_why_decision_response(
     gw_version = os.getenv("GATEWAY_VERSION", _GATEWAY_VERSION)
 
     # Determine fallback_used: true if templater/stub used OR **fatal** validation issues
-    # Fatal per spec: JSON parse/schema failure, supporting_ids ⊄ allowed_ids, missing mandatory IDs
+    # Fatal per spec: JSON parse/schema failure, cited_ids ⊄ allowed_ids, missing mandatory IDs
     fatal_codes = {
         "LLM_JSON_INVALID",
         "schema_error",
-        "supporting_ids_not_subset",
-        "supporting_ids_missing_transition",
-        "anchor_missing_in_supporting_ids",
+        "cited_ids_removed_invalid",
+        "cited_ids_missing_anchor",
     }
     fatal_validation = any((e.get("code") in fatal_codes) for e in (validator_errs or []))
     any_validation   = bool(validator_errs)
@@ -857,17 +893,35 @@ async def build_why_decision_response(
     except Exception:
         cleaned_metrics = sel_meta or {}
 
-    # Assemble canonical meta via the shared builder.  Wrap raw values into
-    # MetaInputs to forbid unexpected keys and normalise the fingerprint prefix.
-    # Determine whether a snapshot is available.  A known snapshot ETag implies
-    # availability; the special "unknown" marker means no snapshot could be
-    # retrieved.  Expose this flag in the meta for downstream consumers.
-    _snapshot_available = False
+    # ---- New canonical meta (Pool vs Prompt vs Payload) ----
+    # Pool = ev.allowed_ids; Prompt = IDs from gate trim meta; Payload = IDs serialized in response (ev)
+    from core_validator import canonical_allowed_ids as _canon_ids
+    _anchor_id = getattr(ev.anchor, "id", None) or "unknown"
+    _pool_ids  = list(getattr(ev, "allowed_ids", []) or [])
+    # prompt ids come from gate meta (authoritative for what LLM sees)
+    _prompt_ids = list((cleaned_metrics or {}).get("prompt_included_ids") or [])
+    # payload ids recomputed from the evidence we will serialize
     try:
-        if snapshot_etag_fp and snapshot_etag_fp != "unknown":
-            _snapshot_available = True
+        _payload_ids = _canon_ids(_anchor_id,
+                                  [e if isinstance(e, dict) else e.model_dump(mode="python") for e in (ev.events or [])],
+                                  (getattr(ev.transitions, "preceding", []) or []) + (getattr(ev.transitions, "succeeding", []) or []))
     except Exception:
-        _snapshot_available = False
+        _payload_ids = _pool_ids[:]
+
+    # Classify validator outputs into warnings vs errors for accurate reporting
+    WARNING_CODES = {
+        "unknown_event_keys_stripped",
+        "unknown_transition_keys_stripped",
+        "unknown_anchor_keys_stripped",
+        "timestamp_normalised",
+        "tags_normalised",
+    }
+    _warning_codes_present = sorted({e.get("code") for e in (errs or []) if e.get("code") in WARNING_CODES})
+    _error_count = sum(1 for e in (errs or []) if e.get("code") not in WARNING_CODES)
+    try:
+        log_stage("validator", "counts", request_id=req_id, error_count=_error_count, warnings=_warning_codes_present)
+    except Exception:
+        pass
 
     # ---- Trace correlation (trace_id/span_id) ----
     _trace_id = None
@@ -889,35 +943,182 @@ async def build_why_decision_response(
     except Exception:
         pass
 
+    # Counts (typed)
+    def _counts(ids: list[str], ev_obj) -> dict:
+        try:
+            pre = list(getattr(ev_obj.transitions, "preceding", []) or [])
+            suc = list(getattr(ev_obj.transitions, "succeeding", []) or [])
+            events_n = len(getattr(ev_obj, "events", []) or [])
+            trans_n = len(pre) + len(suc)
+            total = len(ids or [])
+            anchor_n = 1 if _anchor_id else 0
+            neighbors_n = max(total - (anchor_n + events_n + trans_n), 0)
+            return {
+                "anchor": anchor_n,
+                "events": events_n,
+                "transitions": trans_n,
+                "neighbors": neighbors_n,
+                "total": total,
+            }
+        except Exception:
+            total = len(ids or [])
+            anchor_n = 1 if _anchor_id else 0
+            neighbors_n = max(total - (anchor_n + 0 + 0), 0)
+            return {"anchor": anchor_n, "events": 0, "transitions": 0, "neighbors": neighbors_n, "total": total}
+
+    # Selection metrics
+    try:
+        from gateway.selector import rank_events as _rank
+        ranked = _rank(ev.anchor, [e if isinstance(e, dict) else e.model_dump(mode="python") for e in (ev.events or [])])
+        ranked_event_ids = [d.get("id") for d in ranked if isinstance(d, dict)]
+        selector_policy = "sim_desc__ts_iso_desc__id_asc"
+    except Exception:
+        ranked_event_ids = []
+        selector_policy = SELECTOR_MODEL_ID
+
+    # Gate logs → truncation passes
+    passes = []
+    try:
+        for entry in (gate_plan.logs or []):
+            step = entry.get("step")
+            action = "render" if step in ("render", "render_retry") else "rank_and_trim"
+            passes.append({
+                "prompt_tokens": int(entry.get("prompt_tokens", 0)),
+                "max_prompt_tokens": int(entry.get("max_prompt_tokens", 0)) if entry.get("max_prompt_tokens") is not None else None,
+                "action": "render" if step in ("render", "render_retry") else "rank_and_trim",
+            })
+    except Exception:
+        pass
+
+    # M6 — Selector confidence & explainability
+    # Use prompt_included_ids when available; otherwise fall back to pool_ids.
+    try:
+        _candidate_ids = list(_prompt_ids or _pool_ids or [])
+    except Exception:
+        _candidate_ids = []
+    _event_docs_by_id: Dict[str, dict] = {}
+    try:
+        for _e in (ev_events or []):
+            _eid = _e.get("id") if isinstance(_e, dict) else getattr(_e, "id", None)
+            if _eid and (_candidate_ids and _eid in _candidate_ids):
+                _event_docs_by_id[_eid] = _e if isinstance(_e, dict) else getattr(_e, "model_dump", dict)(mode="python")
+    except Exception:
+        _event_docs_by_id = {}
+    try:
+        sel_scores = _selector.compute_scores(ev.anchor, list(_event_docs_by_id.values()))
+    except Exception:
+        sel_scores = {}
+    try:
+        log_stage("selector", "metrics", request_id=req_id, ranking_policy=selector_policy, scored=len(sel_scores))
+    except Exception:
+        pass
+# Build new meta inputs
+    _ts_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     meta_inputs = MetaInputs(
-        policy_id=_policy_id,
-        prompt_id=_prompt_id,
-        prompt_fingerprint=prompt_fp,
-        bundle_fingerprint=bundle_fp,
-        bundle_size_bytes=int(len(arte.get("evidence_post.json", b""))),
-        prompt_tokens=int(getattr(gate_plan, "prompt_tokens", 0)),
-        max_tokens=int(getattr(gate_plan, "max_tokens", 0)),
-        evidence_tokens=int(getattr(gate_plan, "evidence_tokens", 0)),
-        snapshot_etag=snapshot_etag_fp,
-        gateway_version=gw_version,
-        selector_model_id=SELECTOR_MODEL_ID,
-        fallback_used=fallback_used,
-        fallback_reason=fallback_reason_clean,
-        retries=int(retry_count),
-        latency_ms=int((time.perf_counter() - t0) * 1000),
-        validator_error_count=len(errs),
-        evidence_metrics=cleaned_metrics,
-        trace_id=_trace_id,
-        span_id=_span_id,
-        validator_warnings=sorted({e.get('code') for e in (validator_errs or []) if e.get('code') not in fatal_codes}) if validator_errs else [],
-        load_shed=should_load_shed(),
-        events_total=int(_events_total),
-        events_truncated=bool(_events_truncated_flag),
-        snapshot_available=_snapshot_available,
+        request={
+            "intent": req.intent,
+            "anchor_id": _anchor_id,
+            "request_id": req_id,
+            "trace_id": _trace_id,
+            "span_id": _span_id,
+            "ts_utc": _ts_utc,
+        },
+        policy={
+            "policy_id": _policy_id, "prompt_id": _prompt_id,
+            "allowed_ids_policy": {"mode": "include_all"},
+            "llm": {"mode": (settings.ask_llm_mode if source == "ask" else settings.query_llm_mode) or "off",
+                    "model": getattr(_inference_last_call, "get", lambda *_: None)("model")},
+            "gateway_version": gw_version, "selector_policy_id": selector_policy,
+            "env": {"cite_all_ids": bool(getattr(settings, "cite_all_ids", False)),
+                    "load_shed": bool(getattr(settings, "load_shed_enabled", False))}
+        },
+        budgets={
+            "context_window": int(getattr(settings, "vllm_max_model_len", 1920)),
+            "desired_completion_tokens": int(getattr(settings, "llm_max_tokens", 256)),
+            "guard_tokens": int(getattr(settings, "control_prompt_guard_tokens", 32)) if hasattr(settings, "control_prompt_guard_tokens") else 32,
+            "overhead_tokens": int(getattr(gate_plan, "overhead_tokens", 0)),
+        },
+        fingerprints={"prompt_fp": prompt_fp, "bundle_fp": bundle_fp, "snapshot_etag": snapshot_etag_fp},
+        evidence_counts={
+            # Pool: everything discovered (k=1 expansions etc.) and allowed
+            "pool": _counts(_pool_ids, ev),
+            # Prompt: only what actually made it into the prompt after token budgeting
+            "prompt_included": _counts(_prompt_ids or _pool_ids, trimmed_evidence if _prompt_ids else ev),
+            # Payload: what is serialized back to client
+            "payload_serialized": _counts(_payload_ids, ev),
+        },
+        evidence_sets={
+            "pool_ids": _pool_ids,
+            # IDs included in the prompt (post-trim). If no trim happened, equals pool.
+            "prompt_included_ids": _prompt_ids or _pool_ids,
+            # Structured reasons from budget gate (e.g., {"id": "...", "reason": "token_budget"})
+            "prompt_excluded_ids": (cleaned_metrics or {}).get("prompt_excluded_ids", []),
+            "payload_included_ids": _payload_ids,
+            "payload_excluded_ids": [],
+            "payload_source": "pool",  # LLM mode is off; payloads are sourced from pool
+        },
+        # Keep ranked_event_ids for audit; scores can be added later by selector when available
+        selection_metrics={"ranking_policy": selector_policy, "ranked_event_ids": ranked_event_ids, "scores": {}},
+        truncation_metrics={
+            "passes": passes,
+            "selector_truncation": bool((cleaned_metrics or {}).get("selector_truncation")),
+            "prompt_selector_truncation": bool((cleaned_metrics or {}).get("prompt_selector_truncation")),
+        },
+        runtime={
+            "latency_ms_total": int((time.perf_counter() - t0) * 1000),
+            "stage_latencies_ms": {},
+            "fallback_used": bool(llm_fallback),
+            "fallback_reason": fallback_reason_clean,
+            "retries": int(retry_count),
+        },
+        validator={"error_count": _error_count, "warnings": _warning_codes_present},
+        load_shed=False,
     )
 
     # Build the canonical MetaInfo once; idempotent by design.
     meta_obj = build_meta(meta_inputs, request_id=req_id)
+
+    # ---- M3: enrich meta with policy_trace + downloads (dict-level, no model changes) ----
+    try:
+        policy_trace_val = getattr(ev, "_policy_trace", {}) or {}
+    except Exception:
+        policy_trace_val = {}
+    # Compute download gating based on actor role; directors/execs may access full bundles.
+    try:
+        actor_role = (getattr(meta_obj, "actor", {}) or {}).get("role")
+    except Exception:
+        actor_role = None
+    allow_full = str(actor_role).lower() in ("director", "exec")
+    downloads_manifest = {
+        "artifacts": [
+            {
+                "name": "bundle_view",
+                "allowed": True,
+                "reason": None,
+                "href": f"/v2/bundles/{req_id}/download?name=bundle_view"
+            },
+            {
+                "name": "bundle_full",
+                "allowed": bool(allow_full),
+                "reason": None if allow_full else "acl:sensitivity_exceeded",
+                "href": f"/v2/bundles/{req_id}/download?name=bundle_full"
+            },
+        ]
+    }
+    # Work on a plain dict so we don't depend on MetaInfo extra fields
+    meta_dict = meta_obj.model_dump()
+    meta_dict["policy_trace"] = policy_trace_val
+    meta_dict["downloads"] = downloads_manifest
+    # Populate payload_excluded_ids from policy_trace (acl/redaction guards)
+    try:
+        _reasons = dict(policy_trace_val.get("reasons_by_id") or {})
+        _payload_excl = [{"id": k, "reason": v} for k, v in _reasons.items() if isinstance(v, str) and v.startswith("acl:")]
+        meta_dict.setdefault("evidence_sets", {}).setdefault("payload_excluded_ids", [])
+        meta_dict["evidence_sets"]["payload_excluded_ids"] = _payload_excl
+        if _payload_excl:
+            log_stage("builder", "payload_exclusions_recorded", request_id=req_id, count=len(_payload_excl))
+    except Exception:
+        pass
 
     try:
         # Extract the snapshot etag from the evidence or fallback to the meta value.
@@ -964,12 +1165,21 @@ async def build_why_decision_response(
         except Exception:
             pass
 
+    # Strategic: single audit log of pool/prompt/payload cardinalities
+    try:
+        log_stage("meta", "pool_prompt_payload",
+                  request_id=req_id,
+                  pool=len(meta_inputs.evidence_sets.pool_ids),
+                  prompt=len(meta_inputs.evidence_sets.prompt_included_ids),
+                  payload=len(meta_inputs.evidence_sets.payload_included_ids))
+    except Exception:
+        pass
     resp = WhyDecisionResponse(
         intent=req.intent,
         evidence=ev,
         answer=ans,
         completeness_flags=flags,
-        meta=meta_obj,
+        meta=meta_obj.model_dump(),
         bundle_url=bundle_url,
     )
     arte["response.json"]         = resp.model_dump_json().encode()
@@ -996,4 +1206,21 @@ async def build_why_decision_response(
     if _unk_anchor_f:
         _validator_report_f["unknown_anchor_keys_removed"] = sorted(_unk_anchor_f)
     arte["validator_report.json"] = jsonx.dumps(_validator_report_f).encode("utf-8")
+    # Persist canonical meta as a sidecar artefact for the audit drawer
+    try:
+        arte["_meta.json"] = jsonx.dumps(meta_dict).encode("utf-8")
+    except Exception:
+        pass
+
+    # Return response with enriched meta (dict)
+    resp = WhyDecisionResponse(
+        intent=req.intent,
+        evidence=ev,
+        answer=ans,
+        completeness_flags=flags,
+        meta=meta_dict,
+        bundle_url=bundle_url,
+    )
+    # Keep response.json aligned with enriched meta
+    arte["response.json"] = resp.model_dump_json().encode()
     return resp, arte, req_id

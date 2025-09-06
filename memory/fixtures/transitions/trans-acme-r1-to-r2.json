@@ -1,0 +1,13 @@
+{
+  "id": "trans-acme-r1-to-r2",
+  "from": "acme-sales-eu-shift-incentives-cloud-upgrades-2024",
+  "to":   "acme-sales-eu-migration-swat-team-2024",
+  "relation": "causal",
+  "reason": "Incentive shift exposed migration gaps; formed a regional swat team to accelerate upgrades.",
+  "timestamp": "2024-07-10T09:00:00Z",
+  "domain": "acme/region_eu",
+  "tags": ["causal","region_to_region"],
+  "x-extra": {
+    "edge_type": "CAUSAL_PRECEDES"
+  }
+}

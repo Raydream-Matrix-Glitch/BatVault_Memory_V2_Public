@@ -9,7 +9,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core_utils.sse import stream_answer_with_final, stream_chunks
-from core_storage.artifact_index import build_bundle_and_meta, upload_bundle_and_meta
+from core_storage.artifact_index import (
+    build_bundle_and_meta, upload_bundle_and_meta, build_named_bundles, upload_named_bundles)
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict, model_validator
 from core_utils.ids import compute_request_id, generate_request_id
 
@@ -51,10 +52,39 @@ from core_config.constants import TIMEOUT_SEARCH_MS, TIMEOUT_EXPAND_MS
 settings        = get_settings()
 logger          = get_logger("gateway"); logger.propagate = False
 
+# ---- Policy header extraction ---------------------------------------------
+def _extract_policy_headers(request: Request) -> dict:
+    """
+    Collect pass-through policy/ACL headers to forward to the Memory API.
+    We do not modify or validate values here; ownership stays with memory_api.
+    """
+    keys = [
+        "X-User-Id","X-User-Roles","X-User-Namespaces",
+        "X-Policy-Version","X-Policy-Key",
+        "X-Request-Id","X-Trace-Id",
+        "X-Domain-Scopes","X-Edge-Allow","X-Max-Hops","X-Sensitivity-Ceiling",
+    ]
+    hdrs = {}
+    try:
+        for k in keys:
+            v = request.headers.get(k) or request.headers.get(k.lower())
+            if v is not None:
+                hdrs[k] = v
+    except Exception:
+        # Never break hot path on header parsing
+        pass
+    return hdrs
+
 _LOG_NO_ACTIVE_SPAN = os.getenv('GATEWAY_DEBUG_NO_ACTIVE_SPAN') == '1'
 
 _SEARCH_MS      = TIMEOUT_SEARCH_MS
 _EXPAND_MS      = TIMEOUT_EXPAND_MS
+
+# Files included in the minimal "bundle_view"
+VIEW_BUNDLE_FILES = [
+    "_meta.json", "envelope.json", "evidence_canonical.json", "response.json", "validator_report.json", "plan.json"
+]
+# "bundle_full" includes every artefact we persisted (raw + pre/post)
 
 # ---- Application & router --------------------------------------------------
 app    = FastAPI(title="BatVault Gateway", version="0.1.0")
@@ -98,6 +128,85 @@ async def _warm_policy_registry() -> None:  # pragma: no cover - startup hook
         except Exception:
             pass
         return
+
+# ── vLLM warmup (optional, env-driven) ─────────────────────────────────────
+@app.on_event("startup")
+async def _warm_control_model() -> None:  # pragma: no cover - startup hook
+    """
+    Optionally issue tiny chat completions at startup to keep the control model
+    'hot' and reduce first-request latency spikes.
+
+    Env:
+      GATEWAY_WARMUP_ENABLED=0|1
+      GATEWAY_WARMUP_REQUESTS=1
+      GATEWAY_WARMUP_MAX_TOKENS=1
+      GATEWAY_WARMUP_DELAY_MS=0
+      GATEWAY_WARMUP_BLOCKING=0
+      WARMUP_ENDPOINT= (override; defaults to CONTROL_MODEL_ENDPOINT)
+      GATEWAY_WARMUP_PROMPT=warmup
+    """
+    try:
+        if os.getenv("GATEWAY_WARMUP_ENABLED", "0") != "1":
+            try:
+                log_stage("warmup", "llm_skipped")
+            except Exception:
+                pass
+            return
+        # Resolve adapter at runtime (keeps warmup provider-agnostic)
+        s = get_settings()
+        adapter = os.getenv("GATEWAY_WARMUP_ADAPTER") or getattr(s, "llm_provider", None) or "vllm"
+        if adapter == "openai":
+            from gateway.llm_adapters.openai_chat import generate_async as _gen  # type: ignore
+        elif adapter == "anthropic":
+            from gateway.llm_adapters.anthropic import generate_async as _gen  # type: ignore
+        else:
+            from gateway.llm_adapters.vllm import generate_async as _gen
+        endpoint   = os.getenv("WARMUP_ENDPOINT") or s.control_model_endpoint
+        n_requests = max(1, int(os.getenv("GATEWAY_WARMUP_REQUESTS", "1")))
+        max_tokens = max(1, int(os.getenv("GATEWAY_WARMUP_MAX_TOKENS", "1")))
+        delay_ms   = max(0, int(os.getenv("GATEWAY_WARMUP_DELAY_MS", "0")))
+        blocking   = os.getenv("GATEWAY_WARMUP_BLOCKING", "0") == "1"
+        prompt     = (os.getenv("GATEWAY_WARMUP_PROMPT") or "warmup").strip() or "warmup"
+
+        def _envelope() -> dict:
+            # Minimal envelope sufficient for our system+user schema prompt
+            return {
+                "policy": {"model": getattr(s, "vllm_model_name", None) or "default"},
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "object",
+                                   "properties": {"short_answer": {"type": "string"}},
+                                   "required": ["short_answer"]}
+                    },
+                    "required": ["answer"]
+                },
+                "question": prompt,
+                "meta": {"warmup": True}
+            }
+
+        async def _do():
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
+            tasks = [_gen(endpoint, _envelope(), temperature=0.0, max_tokens=max_tokens)
+                     for _ in range(n_requests)]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            ok = sum(1 for r in results if not isinstance(r, Exception))
+            try:
+                log_stage("warmup", "llm_warmed",
+                          endpoint=endpoint, ok=ok, total=len(results), max_tokens=max_tokens)
+            except Exception:
+                pass
+
+        if blocking:
+            await _do()
+        else:
+            asyncio.create_task(_do())
+    except Exception as exc:
+        try:
+            log_stage("warmup", "llm_warm_failed", error=str(exc))
+        except Exception:
+            pass
 
 # ---- Evidence builder & caches --------------------------------------------
 _evidence_builder = EvidenceBuilder()
@@ -234,10 +343,17 @@ def _minio_put_batch(request_id: str, artefacts: dict[str, bytes]) -> None:
     log_stage("artifacts", "minio_put_batch_ok",
               request_id=request_id, count=len(artefacts), bytes_total=total_bytes)
 
-    # Build and upload a compact bundle and sidecar meta so MinIO shows size/last-modified
+    # Build and upload named bundles (view/full) and sidecar index
     try:
-        bundle_bytes, meta_bytes = build_bundle_and_meta(artefacts)
-        upload_bundle_and_meta(client, settings.minio_bucket, request_id, bundle_bytes, meta_bytes)
+        # Ensure _meta.json is available in artefacts
+        if "_meta.json" not in artefacts:
+            pass
+        bundle_map = {
+            "bundle_view": [fn for fn in VIEW_BUNDLE_FILES if fn in artefacts],
+            "bundle_full": sorted(list(artefacts.keys())),
+        }
+        named_bundles, meta_bytes = build_named_bundles(artefacts, bundle_map)
+        upload_named_bundles(client, settings.minio_bucket, request_id, named_bundles, meta_bytes)
     except Exception as exc:
         # Non-fatal, emit structured warning and continue
         log_stage("artifacts", "index_build_or_upload_failed", request_id=request_id, error=str(exc))
@@ -310,11 +426,7 @@ async def request_logging_middleware(request: Request, call_next):
     log_stage("request", "request_start", request_id=req_id,
               path=request.url.path, method=request.method)
     try:
-        log_stage("request", "v2_query_start",
-                  request_id=req_id,
-                  llm_mode=getattr(settings, "llm_mode", "unknown"),
-                  stream=bool(stream),
-                  text_len=len(q))
+        log_stage("request", "request_start", request_id=req_id, path=request.url.path, method=request.method)
     except Exception:
         pass
 
@@ -359,7 +471,11 @@ async def request_logging_middleware(request: Request, call_next):
     except Exception:
         pass
     log_stage("request", "request_end",
-              request_id=req_id, latency_ms=dt_s * 1000.0, status_code=resp.status_code)
+              request_id=req_id,
+              latency_ms=dt_s * 1000.0,
+              status_code=resp.status_code,
+              source=("ask" if str(request.url.path).endswith("/ask")
+                      else ("query" if str(request.url.path).endswith("/query") else "other")))
     resp.headers["x-request-id"] = req_id
     return resp
 
@@ -544,10 +660,30 @@ async def ask(
     request: Request,
     stream: bool = Query(False),
     include_event: bool = Query(False),
+    fresh: bool = Query(False),
 ):
 
+    if fresh:
+        try:
+            log_stage("cache", "bypass", request_id=req.request_id or "", source="ask", reason="fresh=true")
+        except Exception:
+            pass
+    # Collect policy headers and ensure required request/trace ids are present.
+    _ph = _extract_policy_headers(request)
+    try:
+        if not _ph.get("X-Request-Id"):
+            _ph["X-Request-Id"] = req.request_id or compute_request_id()
+    except Exception:
+        _ph["X-Request-Id"] = compute_request_id()
+    try:
+        if not _ph.get("X-Trace-Id"):
+            # We don’t have a tracer handle here; fall back to the request id to preserve determinism.
+            _ph["X-Trace-Id"] = _ph["X-Request-Id"]
+    except Exception:
+        pass
+
     resp, artefacts, req_id = await build_why_decision_response(
-        req, _evidence_builder
+        req, _evidence_builder, source="ask", fresh=fresh, policy_headers=_ph,
     )
     want_stream = bool(stream) or ("text/event-stream" in (request.headers.get("accept","").lower()))
     try:
@@ -614,7 +750,7 @@ async def ask(
             if etag:
                 headers["x-snapshot-etag"] = etag
         try:
-            log_stage("request", "v2_query_end",
+            log_stage("request", "v2_ask_end",
                       request_id=req_id,
                       fallback_used=bool(resp.meta.get("fallback_used", False)))
         except Exception:
@@ -645,7 +781,7 @@ async def ask(
     except Exception:
         pass
     try:
-        log_stage("request", "v2_query_end",
+        log_stage("request", "v2_ask_end",
                   request_id=req_id,
                   fallback_used=bool(resp.meta.get("fallback_used", False)))
     except Exception:
@@ -659,6 +795,7 @@ async def v2_query(
     req: QueryIn,
     stream: bool = Query(False),
     include_event: bool = Query(False),
+    fresh: bool = Query(False),
 ):
     if should_load_shed():
         ra = getattr(settings, "load_shed_retry_after_seconds", 1)
@@ -748,11 +885,17 @@ async def v2_query(
             ev = await _evidence_builder.build(
                 anchor["id"],
                 include_neighbors=include_neighbors,
+                fresh=fresh,
             )
         else:
-            ev = await _evidence_builder.build(anchor["id"])
+            ev = await _evidence_builder.build(anchor["id"], fresh=fresh)
     except TypeError:
-        ev = await _evidence_builder.build(anchor["id"])
+        ev = await _evidence_builder.build(anchor["id"], fresh=fresh)
+    if fresh:
+        try:
+            log_stage("cache", "bypass", request_id=req.request_id or "", source="query", reason="fresh=true")
+        except Exception:
+            pass
 
     helper_payloads: dict = routing_info.get("results", {}) if routing_info else {}
     neighbours: List[dict] = []
@@ -885,7 +1028,10 @@ async def v2_query(
         request_id=req.request_id,
     )
     resp, artefacts, req_id = await build_why_decision_response(
-        ask_payload, _evidence_builder
+        ask_payload, _evidence_builder,
+        source="query",
+        fresh=fresh,
+        policy_headers=_extract_policy_headers(request),
     )
     try:
         if resolver_path:
@@ -963,6 +1109,12 @@ async def v2_query(
                 etag = None
             if etag:
                 headers["x-snapshot-etag"] = etag
+        try:
+            log_stage("request", "v2_query_end",
+                      request_id=req_id,
+                      fallback_used=bool(resp.meta.get("fallback_used", False)))
+        except Exception:
+            pass
         return StreamingResponse(
             stream_answer_with_final(
                 resp.answer.short_answer,
@@ -998,10 +1150,16 @@ async def v2_query(
             headers["x-canary"] = "true" if can else "false"
     except Exception:
         pass
+    try:
+        log_stage("request", "v2_query_end",
+                  request_id=req_id,
+                  fallback_used=bool(resp.meta.get("fallback_used", False)))
+    except Exception:
+        pass
     return JSONResponse(content=resp.model_dump(), headers=headers)
 
 @router.post("/bundles/{request_id}/download", include_in_schema=False)
-async def download_bundle(request_id: str, format: str = Query("json", pattern="^(json|tar)$")):
+async def download_bundle(request_id: str, name: str = Query("bundle_view", pattern="^(bundle_view|bundle_full)$")):
     """Return a presigned URL for the archived bundle when possible.
 
     Attempts to generate a real presigned GET for `<request_id>.bundle.tar.gz` in MinIO.
@@ -1009,8 +1167,8 @@ async def download_bundle(request_id: str, format: str = Query("json", pattern="
     is unavailable, not publicly reachable, or the object is missing.
     """
     expires_sec = 600
-    # Prefer the exec-friendly TAR proxy by default
-    url = f"/v2/bundles/{request_id}.tar"
+    # Prefer the exec-friendly TAR proxy by default; include name so the proxy can filter
+    url = f"/v2/bundles/{request_id}.tar?name={name}"
     try:
         client = minio_client()
         if client is not None:
@@ -1035,12 +1193,13 @@ async def download_bundle(request_id: str, format: str = Query("json", pattern="
                 except Exception as _exc:
                     log_stage("bundle", "download.public_client_init_failed", request_id=request_id, error=str(_exc))
                 if pub_client:
+                    # Presign the *named* bundle object
                     url = pub_client.presigned_get_object(
                         settings.minio_bucket,
-                        f"{request_id}.bundle.tar.gz",
+                        f"{request_id}/{name}.tar.gz",
                         expires=_td(seconds=expires_sec),
                     )
-                    log_stage("bundle", "download.presigned_minio_public", request_id=request_id)
+                    log_stage("bundle", "download.presigned_minio_public", request_id=request_id, bundle=name)
                 else:
                     # No public endpoint configured → keep internal proxy URL (works through API Edge)
                     log_stage("bundle", "download.fallback_proxy_used", request_id=request_id)
@@ -1052,8 +1211,13 @@ async def download_bundle(request_id: str, format: str = Query("json", pattern="
         pass
     return JSONResponse(content={"url": url, "expires_in": expires_sec})
 
+# Convenience GET alias for linkable UIs
+@router.get("/bundles/{request_id}/download", include_in_schema=False)
+async def download_bundle_get(request_id: str, name: str = Query("bundle_view", pattern="^(bundle_view|bundle_full)$")):
+    return await download_bundle(request_id, name)
+
 @router.get("/bundles/{request_id}", include_in_schema=False)
-async def get_bundle(request_id: str):
+async def get_bundle(request_id: str, name: str = Query("bundle_view", pattern="^(bundle_view|bundle_full)$")):
     """Stream the exact JSON artefact bundle for a request.
 
     The bundle consists of the pre‑, post‑ and final evidence dumps,
@@ -1064,6 +1228,10 @@ async def get_bundle(request_id: str):
     identifier is unknown.
     """
     bundle = _load_bundle_dict(request_id)
+    # Filter artefacts for minimal view bundle unless full explicitly requested
+    if name == "bundle_view":
+        allowed = set(VIEW_BUNDLE_FILES)
+        bundle = {k: v for k, v in (bundle or {}).items() if k in allowed}
     if not bundle:
         raise HTTPException(status_code=404, detail="bundle not found")
     content: dict[str, Any] = {}
@@ -1085,6 +1253,7 @@ async def get_bundle(request_id: str):
             "bundle",
             "download.served",
             request_id=request_id,
+            bundle=name,
             size=len(jsonx.dumps(content).encode("utf-8")),
         )
     except Exception:
@@ -1109,7 +1278,7 @@ async def get_bundle(request_id: str):
     return JSONResponse(content=content, headers=headers)
 
 @router.get("/bundles/{request_id}.tar", include_in_schema=False)
-async def get_bundle_tar(request_id: str):
+async def get_bundle_tar(request_id: str, name: str = Query("bundle_view", pattern="^(bundle_view|bundle_full)$")):
     """Return the artefact bundle as a TAR archive (exec-friendly).
     Pull from hot cache; fall back to MinIO when needed."""
     bundle = _load_bundle_dict(request_id)
@@ -1259,7 +1428,7 @@ app.include_router(router)
 async def _start_load_shed_refresher() -> None:
     try:
         log_stage("init", "sse_helper_selected", sse_module="core_utils.sse")
-        start_background_refresh()
+        start_background_refresh(int(os.getenv("GATEWAY_LOAD_SHED_REFRESH_MS","300")))
     except Exception:
         pass
 

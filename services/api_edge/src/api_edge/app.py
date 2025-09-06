@@ -5,8 +5,11 @@ import time
 from typing import Dict
 
 from core_http.client import get_http_client
-from core_config.constants import timeout_for_stage
+from core_config.constants import (
+    timeout_for_stage, TIMEOUT_LLM_MS, TIMEOUT_ENRICH_MS, TIMEOUT_VALIDATE_MS
+)
 import httpx
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
@@ -47,6 +50,10 @@ async def lifespan(app: FastAPI):
     core_metrics.gauge("api_edge_ttfb_seconds_latest", 0.0)
     core_metrics.counter("api_edge_fallback_total", 0)
     core_metrics.counter("api_edge_http_5xx_total", 0)
+    try:
+        log_stage(logger, "init", "config", upstream_base=_API_EDGE_UPSTREAM_BASE, rl_exclude_paths=list(_RL_EXCLUDE_PATHS))
+    except Exception:
+        pass
     yield            # ─ app is running ─
     # (optional) graceful-shutdown logic goes here
 
@@ -79,6 +86,31 @@ def _current_trace_id() -> str | None:
 settings: Settings = get_settings()
 logger = get_logger("api_edge")
 logger.propagate = True
+# Upstream base for Gateway (env-driven)
+_API_EDGE_UPSTREAM_BASE = os.getenv("API_EDGE_UPSTREAM_BASE", "http://gateway:8081").rstrip("/")
+# Rate-limit exclude paths (env-driven; supports values with or without leading '/')
+_RL_EXCLUDE_PATHS = tuple(
+    (p if p.startswith("/") else f"/{p}")
+    for p in [pp.strip() for pp in os.getenv("EDGE_RL_EXCLUDE_PATHS",
+           os.getenv("API_RATE_LIMIT_EXCLUDE_PATHS", "/healthz,/readyz,/metrics")).split(",")]
+    if p
+)
+# Edge→Gateway proxy timeout (env-driven). Default: 1.2×(LLM+ENRICH+VALIDATE) stage budgets.
+_EDGE_PROXY_TIMEOUT_MS = int(os.getenv(
+    "EDGE_PROXY_TIMEOUT_MS",
+    str(int(1.2 * (TIMEOUT_LLM_MS + TIMEOUT_ENRICH_MS + TIMEOUT_VALIDATE_MS)))
+))
+
+# Multiplier for retry timeouts when the initial proxy call times out.  When the
+# first attempt to the Gateway exceeds the configured timeout the API Edge
+# performs a single retry with an extended deadline.  Introducing the
+# ``EDGE_PROXY_RETRY_MULTIPLIER`` environment variable allows operators to
+# increase or decrease the retry timeout proportionally.  Invalid or missing
+# values fall back to a default of 1.5.
+try:
+    _EDGE_PROXY_RETRY_MULTIPLIER = float(os.getenv("EDGE_PROXY_RETRY_MULTIPLIER", "1.5"))
+except Exception:
+    _EDGE_PROXY_RETRY_MULTIPLIER = 1.5
 
 # ────────────────────────────────────────────────────────────────────────────
 # 3. Production-grade middlewares
@@ -98,21 +130,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- 3.2 Lightweight rate limit (token-bucket) -----------------------------
-# Env defaults: ~60 tokens capacity, refilling ~30 tokens/sec (dev-safe).
-# Excludes /healthz, /readyz, /metrics by default.
-try:
-    from api_edge.rate_limit import RateLimitMiddleware
-    app.add_middleware(
-        RateLimitMiddleware,
-        capacity=int(os.getenv("EDGE_RL_CAPACITY", "60")),
-        refill_per_sec=float(os.getenv("EDGE_RL_REFILL_PER_SEC", "30")),
-        exclude_paths=("healthz", "readyz", "metrics"),
-    )
-except Exception:
-    # If middleware import fails in tests, skip silently.
-    pass
-
 # ---- 3.2 Lightweight token-bucket rate-limit -------------------------------
 rate_def = settings.api_rate_limit_default or "5/second"
 _m = re.match(r"(?P<count>\d+)/(?P<unit>second|minute|hour)", rate_def.strip())
@@ -124,13 +141,7 @@ app.add_middleware(
     capacity=_count,
     refill_per_sec=_count / _seconds,
     # Ops paths that must never throttle; overridable via env
-    exclude_paths=tuple(
-        p.strip()
-        for p in os.getenv(
-            "API_RATE_LIMIT_EXCLUDE_PATHS", "/healthz,/readyz,/metrics"
-        ).split(",")
-        if p.strip()
-    ),
+    exclude_paths=_RL_EXCLUDE_PATHS,
 )
 
 # ---- 3.3 Auth stub ---------------------------------------------------------
@@ -255,11 +266,8 @@ def metrics() -> Response:  # pragma: no cover
 async def check_gateway_ready() -> bool:
     """Returns True iff Gateway /readyz returns status: ready."""
     try:
-        client = get_http_client(timeout_ms=int(1000*timeout_for_stage('enrich')))
-        r = await client.get(
-            "http://gateway:8081/readyz",
-            headers=inject_trace_context({}),
-        )
+        client = get_http_client(timeout_ms=_EDGE_PROXY_TIMEOUT_MS)
+        r = await client.get(f"{_API_EDGE_UPSTREAM_BASE}/readyz", headers=inject_trace_context({}))
         return r.status_code == 200 and r.json().get("status") == "ready"
     except Exception:
         return False
@@ -284,9 +292,9 @@ attach_health_routes(
 # ────────────────────────────────────────────────────────────────────────────
 @app.get("/ops/minio/bucket", include_in_schema=False)
 async def ensure_bucket():
-    client = get_http_client(timeout_ms=int(1000 * timeout_for_stage('enrich')))
+    client = get_http_client(timeout_ms=_EDGE_PROXY_TIMEOUT_MS)
     r = await client.post(
-        "http://gateway:8081/ops/minio/ensure-bucket",
+        f"{_API_EDGE_UPSTREAM_BASE}/ops/minio/ensure-bucket",
         headers=inject_trace_context({}),
     )
     return JSONResponse(status_code=r.status_code, content=r.json())
@@ -357,7 +365,7 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
     """
     # Compose upstream URL including original query string.
     query = request.url.query
-    upstream_url = f"http://gateway:8081{path}"
+    upstream_url = f"{_API_EDGE_UPSTREAM_BASE}{path}"
     if query:
         upstream_url = f"{upstream_url}?{query}"
     # Propagate only auth and request‑id headers.
@@ -375,10 +383,11 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
     # Determine if streaming is requested.
     stream_flag = request.query_params.get("stream")
     is_stream = str(stream_flag).lower() in {"1", "true", "yes"}
-    # Instantiate client per request.
-    client = get_http_client(timeout_ms=int(1000*timeout_for_stage('enrich')))
+    # Use a single env-driven timeout for all edge→gateway calls.
+    edge_timeout_ms = _EDGE_PROXY_TIMEOUT_MS
+    client = get_http_client(timeout_ms=edge_timeout_ms)
     if is_stream:
- # Streaming: forward and relay SSE (httpx 0.27: use send(..., stream=True)).
+        # Streaming: forward and relay SSE (httpx 0.27: use send(..., stream=True)).
         try:
             req_up = client.build_request(
                 method.upper(),
@@ -388,10 +397,17 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
             )
             upstream = await client.send(req_up, stream=True)
         except Exception as e:
+            # Structured signal for observability: why did the proxy fail?
             try:
-                logger.info(
-                    "request_error",
-                    extra={"service": "api_edge", "stage": "request", "meta": {"error": str(e)}},
+                log_stage(
+                    logger,
+                    "request",
+                    "proxy_error",
+                    request_id=req_id,
+                    route=path,
+                    upstream=upstream_url,
+                    reason=type(e).__name__,
+                    timeout_ms=edge_timeout_ms,
                 )
             except Exception:
                 pass
@@ -452,7 +468,7 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
             media_type=content_type,
             headers=headers_out,
         )
-    # Non-streaming: simple proxy.
+    # Non-streaming: simple proxy with a one-shot retry on timeout.
     try:
         resp = await client.request(
             method.upper(),
@@ -460,15 +476,46 @@ async def _proxy_to_gateway(request: Request, *, method: str, path: str):
             content=body,
             headers=inject_trace_context(headers),
         )
+    except httpx.TimeoutException as exc:
+        # Allow the gateway to finish its templater fallback path deterministically.
+        try:
+            log_stage(
+                logger,
+                "request",
+                "proxy_timeout_retry",
+                request_id=req_id,
+                route=path,
+                upstream=upstream_url,
+                timeout_ms=edge_timeout_ms,
+                retry_timeout_ms=int(edge_timeout_ms * _EDGE_PROXY_RETRY_MULTIPLIER),
+                retries=1,
+            )
+            # Use the configured multiplier when constructing the retry client.
+            client2 = get_http_client(timeout_ms=int(edge_timeout_ms * _EDGE_PROXY_RETRY_MULTIPLIER))
+            resp = await client2.request(
+                method.upper(), upstream_url, content=body, headers=inject_trace_context(headers)
+            )
+        except Exception as exc2:
+            log_stage(
+                logger,
+                "request",
+                "proxy_error",
+                request_id=req_id,
+                route=path,
+                upstream=upstream_url,
+                reason=f"{type(exc2).__name__}",
+            )
+            return JSONResponse(status_code=502, content={"detail": "upstream_error"})
     except Exception as exc:
-        # Upstream failure.
-        logger.warning(
-            "gateway_proxy_error",
-            extra={
-                "request_id": req_id,
-                "route": path,
-                "error": str(exc),
-            },
+        # Upstream failure (non-timeout).
+        log_stage(
+            logger,
+            "request",
+            "proxy_error",
+            request_id=req_id,
+            route=path,
+            upstream=upstream_url,
+            reason=f"{type(exc).__name__}",
         )
         return JSONResponse(status_code=502, content={"detail": "upstream_error"})
     finally:

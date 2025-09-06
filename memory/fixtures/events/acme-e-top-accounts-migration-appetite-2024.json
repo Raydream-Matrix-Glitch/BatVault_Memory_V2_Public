@@ -1,0 +1,14 @@
+{
+  "id": "acme-e-top-accounts-migration-appetite-2024",
+  "summary": "Top accounts indicate migration appetite",
+  "description": "55/100 top accounts signal willingness to move to cloud within 12 months if tooling provided.",
+  "timestamp": "2024-03-10T09:30:00Z",
+  "tags": ["customer_success", "migration"],
+  "led_to": ["acme-prod-pivot-cloud-only-tiers-2024", "acme-prod-sunset-onprem-connectors-2024"],
+  "snippet": "55% of top accounts ready to migrate with tooling.",
+  "domain": "acme/product",
+  "importance": 0.78,
+  "sensitivity": "medium",
+  "namespaces": ["internal"],
+  "roles_allowed": ["manager", "director", "exec"]
+}

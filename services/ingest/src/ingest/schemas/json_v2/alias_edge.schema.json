@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AliasEdge@v2",
+  "type": "object",
+  "required": ["id", "from", "to"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$" },
+    "from": { "type": "string" },
+    "to": { "type": "string" },
+    "type": { "type": "string", "enum": ["ALIAS_OF"] },
+    "relation": { "type": "string", "enum": ["alias_of"] },
+    "title": { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "scope": { "type": "string" },
+    "domain_from": { "type": "string" },
+    "domain_to": { "type": "string" },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "x-extra": { "type": "object", "additionalProperties": true }
+  },
+  "additionalProperties": true
+}

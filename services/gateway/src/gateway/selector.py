@@ -8,6 +8,7 @@ from core_logging import get_logger
 from shared.tokens import estimate_text_tokens
 
 logger = get_logger("gateway.selector")
+logger.propagate = False
 
 def bundle_size_bytes(ev: WhyDecisionEvidence) -> int:
     """
@@ -61,7 +62,7 @@ def _sim(a: str | None, b: str | None) -> float:
 def rank_events(anchor: WhyDecisionAnchor, events: list[dict]) -> list[dict]:
     """Deterministically rank events for Answer/Response policies.
 
-    Order: similarity desc → timestamp asc (ISO) → id asc.
+    Order: similarity DESC → timestamp DESC (ISO) → id ASC.
     """
     if not events:
         return []
@@ -72,16 +73,20 @@ def rank_events(anchor: WhyDecisionAnchor, events: list[dict]) -> list[dict]:
             return float(_sim(txt, _anchor.rationale or ""))
         def _ts_iso(ev: dict) -> str:
             return ev.get("timestamp") or ""
-        ranked = sorted(
-            list(events),
-            key=lambda e: (-_sim_text(e), _ts_iso(e), e.get("id") or ""),
-        )
+        # Stable multi-pass sort:
+        #   1) id ASC
+        #   2) timestamp DESC
+        #   3) similarity DESC
+        ranked = list(events)
+        ranked.sort(key=lambda e: (e.get("id") or ""))                       # id ASC
+        ranked.sort(key=lambda e: (_ts_iso(e) or ""), reverse=True)          # ts DESC
+        ranked.sort(key=lambda e: (_sim_text(e)), reverse=True)              # sim DESC
         logger.info(
             "selector.rank_events",
             extra={
                 "count": len(ranked),
                 "anchor_id": getattr(_anchor, "id", None),
-                "policy": "sim_desc__ts_iso_asc__id_asc",
+                "policy": "sim_desc__ts_iso_desc__id_asc",
             },
         )
         return ranked
@@ -97,4 +102,57 @@ def rank_events(anchor: WhyDecisionAnchor, events: list[dict]) -> list[dict]:
             extra={"count": len(ranked), "policy": "ts_desc__id_asc"},
         )
         return ranked
+    
+def compute_scores(anchor: WhyDecisionAnchor, items: list[dict]) -> Dict[str, Dict[str, float]]:
+    """Compute per-ID confidence signals used for explainability.
+
+    Emits a mapping: {id: {sim, recency_days, importance}}.
+    - sim:       Jaccard similarity between item text and anchor rationale (0..1).
+    - recency_days: Absolute days between anchor.timestamp and item.timestamp. 0 if unknown.
+    - importance:   Fixture prior from the item (0..1), default 0.0.
+    """
+    scores: Dict[str, Dict[str, float]] = {}
+    if not items:
+        return scores
+    try:
+        _anchor = anchor or WhyDecisionAnchor(id="unknown")
+        # Parse anchor timestamp once
+        try:
+            a_ts = _anchor.timestamp or None
+            a_dt = dt.datetime.fromisoformat(a_ts.replace("Z", "+00:00")) if a_ts else None
+        except Exception:
+            a_dt = None
+
+        for it in items:
+            if not isinstance(it, dict):
+                try:
+                    it = it.model_dump(mode="python")  # type: ignore[attr-defined]
+                except Exception:
+                    it = dict(it)  # best-effort
+            _id = it.get("id")
+            if not _id:
+                continue
+            text = (it.get("summary") or it.get("description") or "").strip()
+            sim = float(_sim(text, getattr(_anchor, "rationale", None) or ""))  # type: ignore[name-defined]
+            imp = float(it.get("importance") or 0.0)
+            # Recency in days (absolute), default 0 when missing timestamps
+            r_days: float = 0.0
+            try:
+                ts = it.get("timestamp") or None
+                if ts and a_dt is not None:
+                    i_dt = dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    r_days = abs((a_dt - i_dt).days)
+            except Exception:
+                r_days = 0.0
+            scores[_id] = {"sim": sim, "recency_days": float(r_days), "importance": imp}
+        # Strategic: log a tiny sample for the audit drawer without flooding logs
+        try:
+            sample = [{"id": k, **v} for k, v in list(scores.items())[:3]]
+            logger.info("selector.metrics.scores", extra={"anchor_id": getattr(_anchor, "id", None), "sample": sample, "count": len(scores)})
+        except Exception:
+            pass
+    except Exception:
+        # Defensive: never fail the request because of metrics
+        logger.warning("selector.metrics.error", extra={"reason": "compute_scores_failed"})
+    return scores
 

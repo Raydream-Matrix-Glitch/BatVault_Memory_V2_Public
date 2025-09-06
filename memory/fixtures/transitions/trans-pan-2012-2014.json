@@ -1,9 +1,0 @@
-{
-  "id": "trans-pan-2012-2014",
-  "from": "panasonic-exit-plasma-2012",
-  "to": "panasonic-automotive-infotainment-acquisition-2014",
-  "relation": "causal",
-  "reason": "Resources reallocated to automotive electronics M&A",
-  "timestamp": "2014-08-12T13:00:00Z",
-  "x-extra": {}
-}

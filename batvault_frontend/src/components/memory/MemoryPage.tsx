@@ -158,7 +158,7 @@ export default function MemoryPage() {
   }, [finalData]);
 
   // Extract supplementary answer fields for UI enhancements
-  const citationIds: string[] = finalData?.answer?.supporting_ids ?? [];
+  const citationIds: string[] = finalData?.answer?.cited_ids ?? finalData?.answer?.supporting_ids ?? [];
   const fallbackUsed: boolean | undefined = finalData?.meta?.fallback_used;
   // Derive a label describing the path taken (deterministic fallback or model).
   const pathLabel: string = fallbackUsed ? "Deterministic" : "Model";
@@ -260,11 +260,11 @@ export default function MemoryPage() {
   }, [rankedEvents, selectedTags]);
 
   // Build receipts strip separately (prevents nested useMemo).
-  // Order: anchor → all supporting_ids (no cap).
+  // Order: anchor → all cited_ids (preferred) / supporting_ids (fallback) (no cap).
   const receipts: string[] = useMemo(() => {
     const ids = new Set<string>();
     if (anchorId) ids.add(anchorId); // anchor from evidence
-    (finalData?.answer?.supporting_ids ?? []).forEach((id: string) => ids.add(id));
+    ((finalData?.answer?.cited_ids ?? finalData?.answer?.supporting_ids) ?? []).forEach((id: string) => ids.add(id));
     return Array.from(ids);
   }, [anchorId, finalData]);
 

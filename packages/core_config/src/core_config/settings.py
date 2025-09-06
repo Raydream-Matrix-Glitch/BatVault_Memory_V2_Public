@@ -83,10 +83,21 @@ class Settings(BaseSettings):
 
     # LLM / embeddings
     llm_mode: str = Field(default="off", alias="LLM_MODE")
+    # Endpoint-specific policy overrides
+    ask_llm_mode: str = Field(default="off", alias="ASK_LLM_MODE")
+    query_llm_mode: str = Field(default="auto", alias="QUERY_LLM_MODE")
     enable_embeddings: bool = Field(default=False, alias="ENABLE_EMBEDDINGS")
 
     # Evidence heuristics
     enable_day_summary_dedup: bool = Field(default=False, alias="ENABLE_DAY_SUMMARY_DEDUP")
+    # Answer shaping
+    answer_char_cap: int = Field(default=420, alias="ANSWER_CHAR_CAP")
+    answer_sentence_cap: int = Field(default=3, alias="ANSWER_SENTENCE_CAP")
+    because_event_count: int = Field(default=2, alias="BECAUSE_EVENT_COUNT")
+
+    # Canonical answer budgets (prefer these; legacy kept for back-compat)
+    short_answer_max_chars: int = Field(default=320, alias="SHORT_ANSWER_MAX_CHARS")
+    short_answer_max_sentences: int = Field(default=2, alias="SHORT_ANSWER_MAX_SENTENCES")
 
     # ── API-edge rate-limiting (A-1) ─────────────────────────────────
     api_rate_limit_default: str = Field(

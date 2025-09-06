@@ -3,8 +3,20 @@ import re
 from core_logging import get_logger
 from core_models.models import WhyDecisionEvidence, WhyDecisionAnswer
 from core_validator import canonical_allowed_ids
+from core_config import get_settings
+from core_config.constants import (
+    SHORT_ANSWER_MAX_CHARS as _CHAR_CAP_DEFAULT,
+    SHORT_ANSWER_MAX_SENTENCES as _SENT_CAP_DEFAULT,
+)
+from gateway import selector as _selector
 
 logger = get_logger("gateway.templater")
+
+def _resolve_caps() -> tuple[int, int]:
+    s = get_settings()
+    char_cap = int(getattr(s, "short_answer_max_chars", None) or getattr(s, "answer_char_cap", None) or _CHAR_CAP_DEFAULT)
+    sent_cap = int(getattr(s, "short_answer_max_sentences", None) or getattr(s, "answer_sentence_cap", None) or _SENT_CAP_DEFAULT)
+    return max(1, char_cap), max(1, sent_cap)
 
 _ALIAS_RE = re.compile(r"^[AET]\d+$")
 
@@ -61,7 +73,7 @@ def _det_short_answer(
         f"Decision {anchor_disp}: {events_n} event(s), "
         f"{preceding_n} preceding, {succeeding_n} succeeding. "
         f"Cited {supporting_n}/{allowed_n} evidence item(s)."
-    )[:320]
+    )[:_resolve_caps()[0]]
 
 def deterministic_short_answer(*args, **kwargs):  # type: ignore[override]
     """Polymorphic deterministic short answer.
@@ -69,7 +81,7 @@ def deterministic_short_answer(*args, **kwargs):  # type: ignore[override]
     When passed a WhyDecisionEvidence instance as the first argument, this
     helper computes a counts-based summary derived from the evidence.
     When passed explicit numeric arguments (anchor_id, events_n, …), it
-    defers to the counts-based version.  Truncation to 320 characters
+    defers to the counts-based version.  Truncation uses the configured character cap
     is applied uniformly.
     """
     if args and isinstance(args[0], WhyDecisionEvidence):
@@ -79,7 +91,7 @@ def deterministic_short_answer(*args, **kwargs):  # type: ignore[override]
             len(ev.events or []),
             len(getattr(ev.transitions, "preceding", []) or []),
             len(getattr(ev.transitions, "succeeding", []) or []),
-            len(getattr(ev, "supporting_ids", []) or []),
+            len(getattr(ev, "cited_ids", []) or []),
             len(ev.allowed_ids or []),
         )
     return _det_short_answer(*args, **kwargs)
@@ -97,7 +109,7 @@ def validate_and_fix(
     validator now owns the canonical enforcement logic.
     """
     allowed = set(allowed_ids)
-    orig_support = list(answer.supporting_ids or [])
+    orig_support = list(answer.cited_ids or [])
     support = [x for x in orig_support if x in allowed]
     changed = len(support) != len(orig_support)
     if anchor_id not in support:
@@ -105,13 +117,16 @@ def validate_and_fix(
         changed = True
     errs: List[str] = []
     if changed:
-        errs.append(
-            "supporting_ids adjusted to fit allowed_ids and include anchor"
-        )
-    answer.supporting_ids = support
+        errs.append("cited_ids adjusted to fit allowed_ids and include anchor")
+    answer.cited_ids = support
+    # Back-compat: keep legacy field mirrored during migration
+    try:
+        answer.supporting_ids = list(support)
+    except Exception:
+        pass
     return answer, changed, errs
 
-def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
+def _compose_fallback_answer(ev: WhyDecisionEvidence) -> tuple[str, list[str]]:
     """Compose a deterministic, human-readable fallback answer.
 
     Two-step template:
@@ -152,6 +167,47 @@ def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
     else:
         lead = f"{rationale}." if rationale else ""
     lead = lead.strip()
+
+    # Collect citations and optional because-clause
+    cited_ids: list[str] = []
+    try:
+        anchor_id = getattr(getattr(ev, "anchor", None), "id", None)
+        if anchor_id:
+            cited_ids.append(anchor_id)
+    except Exception:
+        pass
+
+    because_clause = ""
+    try:
+        # Normalise events to dicts and rank them; then take top-k for the clause
+        events: list[dict] = []
+        for e in (ev.events or []):
+            ed = e if isinstance(e, dict) else (e.model_dump(mode="python"))
+            # Only consider real event nodes
+            if (ed.get("type") or ed.get("entity_type") or "").lower() == "event":
+                events.append(ed)
+        ranked = _selector.rank_events(ev.anchor, events)
+        try:
+            s = get_settings()
+            k = int(getattr(s, "because_event_count", 2))
+        except Exception:
+            k = 2
+        chosen = ranked[:max(0, k)]
+        reasons: list[str] = []
+        for ed in chosen:
+            # Prefer concise text; trim trailing punctuation to avoid ".."
+            phrase = (ed.get("summary") or ed.get("snippet") or ed.get("description") or "").strip()
+            if phrase and phrase[-1] in ".;,:":
+                phrase = phrase[:-1].rstrip()
+            if phrase:
+                reasons.append(phrase)
+            _eid = ed.get("id")
+            if _eid and _eid not in cited_ids:
+                cited_ids.append(_eid)
+        if reasons:
+            because_clause = " Because " + "; ".join(reasons) + "."
+    except Exception:
+        because_clause = ""
     # Next pointer – use the first succeeding transition if available
     next_sent: str = ""
     try:
@@ -183,6 +239,13 @@ def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
                     label = to_id.strip()
             if label:
                 next_sent = f" Next: {label}."
+                try:
+                    # record cited transition id
+                    _tid = to_id if isinstance(to_id, str) else None
+                    if _tid and _tid not in cited_ids:
+                        cited_ids.append(_tid)
+                except Exception:
+                    pass
             else:
                 try:
                     logger.info("templater.next_pointer_omitted", extra={"reason": "no_title_or_nonhuman_to"})
@@ -190,26 +253,41 @@ def _compose_fallback_answer(ev: WhyDecisionEvidence) -> str:
                     pass
     except Exception:
         pass
-    # Construct answer – append Next only if it fits the 320-char cap
-    if next_sent:
-        if len(lead) + len(next_sent) <= 320:
-            answer = (lead + next_sent).strip()
-            try:
-                logger.info("templater.next_pointer_added", extra={"lead_len": len(lead), "next_len": len(next_sent)})
-            except Exception:
-                pass
-        else:
-            # Omit Next when it would be truncated mid-word
-            answer = lead
+    # Construct answer – append because-clause and Next if within caps (env-driven)
+    char_cap, sent_cap = _resolve_caps()
+
+    answer = lead
+    if because_clause and len(answer) + len(because_clause) <= char_cap:
+        answer = (answer + because_clause).strip()
+    if next_sent and len(answer) + len(next_sent) <= char_cap:
+        answer = (answer + next_sent).strip()
+        try:
+            logger.info("templater.next_pointer_added", extra={"lead_len": len(lead), "next_len": len(next_sent)})
+        except Exception:
+            pass
     else:
         answer = lead
-    # Final clamp to max length (lead may still exceed cap)
-    if len(answer) > 320:
-        answer = answer[:320]
-    return answer.strip()
+
+    # Optional tail to hint at more context
+    try:
+        remaining = max(0, len(set(getattr(ev, "allowed_ids", []) or [])) - len(set(cited_ids)))
+    except Exception:
+        remaining = 0
+    tail = " More in timeline." if remaining > 0 else ""
+    if tail and len(answer) + len(tail) <= char_cap:
+        answer = (answer + tail).strip()
+        try:
+            logger.info("templater.tail_added", extra={"remaining": remaining})
+        except Exception:
+            pass
+    if len(answer) > char_cap:
+        answer = answer[:char_cap]
+    return answer.strip(), cited_ids
 
 def finalise_short_answer(
-    answer: WhyDecisionAnswer, evidence: WhyDecisionEvidence
+    answer: WhyDecisionAnswer,
+    evidence: WhyDecisionEvidence,
+    append_permission_note: bool = False,
 ) -> Tuple[WhyDecisionAnswer, bool]:
     """Post-process the short answer to remove stubs and enforce length.
 
@@ -222,11 +300,24 @@ def finalise_short_answer(
     changed = False
     s = answer.short_answer or ""
     if not s or s.strip().upper().startswith("STUB ANSWER"):
-        # Generate deterministic fallback via modern composer
-        new_s = _compose_fallback_answer(evidence)
+        # Generate deterministic fallback via modern composer (also returns planned citations)
+        (new_s, planned_citations) = _compose_fallback_answer(evidence)
         if new_s != s:
             answer.short_answer = new_s
             changed = True
+        # Mirror planned citations to both fields
+        try:
+            answer.cited_ids = list(planned_citations)
+        except Exception:
+            pass
+        try:
+            answer.supporting_ids = list(planned_citations)
+        except Exception:
+            pass
+        try:
+            logger.info("templater.citations_planned", extra={"count": len(planned_citations)})
+        except Exception:
+            pass
         s = new_s
     # Scrub any raw evidence IDs from prose (post-model safety)
     try:
@@ -283,8 +374,40 @@ def finalise_short_answer(
             changed = True
     except Exception:
         pass
-    # Enforce maximum length
-    if s and len(s) > 320:
-        answer.short_answer = s[:320]
-        changed = True
+# Append a one-liner permission note when the policy withheld items.
+        try:
+            if append_permission_note:
+                note = " Note: Some evidence was withheld due to your permissions."
+                # Append only if not already present (idempotent).
+                if isinstance(s, str) and note.strip() not in s:
+                    s_before = s
+                    s = (s or "") + note
+                    try:
+                        logger.info("templater.permission_note_appended", extra={"appended": True})
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+# Enforce sentence count and maximum length (env-driven; canonical with legacy fallback)
+    char_cap, sent_cap = _resolve_caps()
+    if s:
+        # Sentence clamp first, then character clamp
+        parts = re.split(r'(?<=[.!?])\s+', s.strip())
+        if len(parts) > sent_cap:
+            s_new = " ".join(parts[:sent_cap]).strip()
+            if s_new != s:
+                try:
+                    logger.info("templater.sentences_clamped", extra={"from": len(parts), "to": sent_cap})
+                except Exception:
+                    pass
+                s = s_new
+        if len(s) > char_cap:
+            s = s[:char_cap]
+            try:
+                logger.info("templater.chars_clamped", extra={"to": char_cap})
+            except Exception:
+                pass
+        if s != answer.short_answer:
+            answer.short_answer = s
+            changed = True
     return answer, changed

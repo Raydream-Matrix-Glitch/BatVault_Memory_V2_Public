@@ -1,0 +1,10 @@
+{
+  "id": "trans-acme-a1-to-a3",
+  "from": "acme-corp-unify-cloud-platform-2022",
+  "to": "acme-corp-descope-onprem-2024",
+  "relation": "causal",
+  "reason": "Cloud standardization reduced value of maintaining on-prem SKU.",
+  "timestamp": "2024-02-12T14:00:00Z",
+  "domain": "acme/corporate",
+  "x-extra": {}
+}

@@ -1,0 +1,31 @@
+{
+  "id": "role-staff",
+  "role": "staff",
+  "display_name": "Staff (IC)",
+  "description": "Frontline individual contributor. Sees regional story and safe projections (alias events) only.",
+  "namespaces": ["public", "internal"],
+  "domain_scopes": ["acme/region_*"],
+  "sensitivity_ceiling": "low",
+  "edge_allowlist": [
+    "CAUSAL_PRECEDES", "ALIAS_OF"
+  ],
+  "field_visibility": {
+    "decision": {
+      "visible_fields": ["option", "timestamp", "tags", "domain"],
+      "rationale_visible": false,
+      "supporting_events_visible": false
+    },
+    "event": {
+      "visible_fields": ["summary", "timestamp", "snippet", "tags", "domain"],
+      "allow_alias_projection": true
+    }
+  },
+  "x-extra": {
+    "audit_tags": ["demo", "visibility:regional-only"],
+    "header_template": {
+      "X-User-Roles": "staff",
+      "X-User-Namespaces": "public,internal"
+    },
+    "notes": "Staff should NOT access corporate or product decisions directly; relies on alias events projected into regional domains."
+  }
+}

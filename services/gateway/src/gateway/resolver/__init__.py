@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import inspect
 from typing import Dict, Any
@@ -20,7 +21,21 @@ from core_config import get_settings
 from core_config.constants import TTL_RESOLVER_CACHE_SEC as CACHE_TTL
 
 settings = get_settings()
+logger = get_logger("gateway.resolver")
+logger.propagate = False
 
+# ---------------------------------------------------------------------------
+# Dynamic configuration
+#
+# The BM25 resolver limits the number of candidate documents to a fixed
+# constant.  Historically this value was hard‑coded to 24.  Operators may
+# wish to tune this limit depending on the size of the index or latency
+# requirements.  The ``RESOLVER_BM25_TOPK`` environment variable allows for
+# such tuning.  Non‑integer or missing values will fall back to 24.
+try:
+    _BM25_TOPK = int(os.getenv("RESOLVER_BM25_TOPK", "24"))
+except Exception:
+    _BM25_TOPK = 24
 
 # ---------------------------------------------------------------------------#
 # Redis connection (optional – falls back to None when Redis is unavailable) #
@@ -30,8 +45,6 @@ try:
     _redis = get_redis_pool()
 except Exception:                       # pragma: no-cover (local pytest)
     _redis = None
-
-logger = get_logger("gateway.resolver")
 
 # ---------------------------------------------------------------------------#
 # Cache helpers – swallow Redis errors so tests run w/o a live server        #
@@ -144,7 +157,7 @@ async def resolve_decision_text(
             search_fn = search_bm25
         candidates = await search_fn(
             text,
-            k=24,
+            k=_BM25_TOPK,
             request_id=request_id,
             snapshot_etag=snapshot_etag,
         )

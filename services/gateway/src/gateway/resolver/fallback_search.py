@@ -13,6 +13,7 @@ from core_http.client import get_http_client
 from core_config.constants import timeout_for_stage
 
 logger = get_logger("gateway.resolver.fallback_search")
+logger.propagate = False
 settings = get_settings()
 
 # ── Local fixture helper ────────────────────────────────────────────────

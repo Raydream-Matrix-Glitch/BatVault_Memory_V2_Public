@@ -10,6 +10,7 @@ import core_metrics, time
 from core_http.client import get_http_client
 from core_config.constants import timeout_for_stage
 import os
+_INGEST_UPSTREAM_BASE = os.getenv("INGEST_UPSTREAM_BASE", "http://gateway:8081").rstrip("/")
 from fastapi.responses import JSONResponse, Response
 import inspect
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -82,7 +83,7 @@ async def _ping_gateway_ready() -> bool:
     try:
         c = get_http_client(timeout_ms=int(1000*timeout_for_stage('enrich')))
         r = await c.get(
-            "http://gateway:8081/readyz",
+            f"{_INGEST_UPSTREAM_BASE}/readyz",
             headers=inject_trace_context({}),
         )
         return r.status_code == 200 and r.json().get("status") == "ready"

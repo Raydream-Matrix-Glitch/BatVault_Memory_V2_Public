@@ -32,7 +32,9 @@ export interface EvidenceBundle {
 
 export interface WhyDecisionAnswer {
   short_answer: string;
+  /** Cited evidence IDs actually referenced by the answer (subset of allowed_ids). */
   supporting_ids: string[];
+  cited_ids?: string[];
   rationale_note?: string;
 }
 

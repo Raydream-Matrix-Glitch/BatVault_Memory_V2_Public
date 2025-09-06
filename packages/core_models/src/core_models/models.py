@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, field_validator, ConfigDict, model_validator
 from core_utils import slugify_tag
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 import re
 
 
@@ -78,52 +78,23 @@ class _DictLikeMixin:
             raise KeyError(key)
 
 class MetaInfo(_DictLikeMixin, BaseModel):
-    """
-    Canonical, JSON-first meta block (single source of truth).
-    Exactly one occurrence per field; validated before serialization.
-    """
-    # Request identifier for correlating bundles and presigns
-    request_id: Optional[str] = None
-    policy_id: str
-    prompt_id: str
-    prompt_fingerprint: str  # "sha256:<hex>"
-    bundle_fingerprint: str
-    bundle_size_bytes: int
-    prompt_tokens: int
-    evidence_tokens: int
-    max_tokens: int
-    snapshot_etag: str
-    fallback_used: bool
-    fallback_reason: Optional[str] = None  # e.g., "llm_off", "parse_error", "style_violation"
-    retries: int
-    gateway_version: str
-    selector_model_id: Optional[str] = None
-    latency_ms: int
-    validator_error_count: int
-    # Compact, public-safe list of validator warning codes
-    validator_warnings: List[str] = Field(default_factory=list)
-    # ---- Natural-language routing (for /v2/query) ----
-    function_calls: Optional[List[str]] = None
-    routing_confidence: Optional[float] = None
-    routing_model_id: Optional[str] = None
-    # Trace correlation for UI audit drawer
-    trace_id: Optional[str] = None
-    span_id: Optional[str] = None
-    evidence_metrics: Dict[str, Any] = Field(default_factory=dict)  # {step, selector_truncation, total_neighbors_found, final_evidence_count, dropped_evidence_ids}
+    """Canonical, JSON-first meta block (single source of truth)."""
+    request: Dict[str, Any]
+    policy: Dict[str, Any]
+    budgets: Dict[str, Any]
+    fingerprints: Dict[str, Any]
+    evidence_counts: Dict[str, Any]
+    evidence_sets: Dict[str, Any]
+    selection_metrics: Dict[str, Any]
+    truncation_metrics: Dict[str, Any]
+    runtime: Dict[str, Any]
+    validator: Dict[str, Any]
+    policy_trace: Dict[str, Any] = Field(default_factory=dict)
     load_shed: bool = False
-    # Event result shaping
-    events_total: Optional[int] = None
-    events_truncated: Optional[bool] = None
-    snapshot_available: Optional[bool] = None
-
-    # Path taken by the resolver when hydrating the anchor.  This field is
-    # populated by the Gateway app for diagnostic purposes and may be
-    # omitted from responses when not applicable.  It is defined on the
-    # canonical MetaInfo model to permit dynamic assignment without
-    # violating the "extra=forbid" constraint.
+    downloads: Dict[str, Any] = Field(default_factory=dict)
+    # Optional diagnostic hint for internal debugging
     resolver_path: Optional[str] = None
-
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", exclude_none=True)
 
 
 class WhyDecisionTransitions(BaseModel):
@@ -160,7 +131,21 @@ class WhyDecisionEvidence(BaseModel):
 
 class WhyDecisionAnswer(BaseModel):
     short_answer: str
-    supporting_ids: List[str]
+    # New canonical field: ids actually cited in the short answer
+    cited_ids: List[str] = Field(default_factory=list)
+    # Back-compat: accept/emit legacy field when present; mirrored to cited_ids
+    supporting_ids: List[str] = Field(default_factory=list, exclude=True)
+
+    @model_validator(mode="after")
+    def _mirror_legacy_supporting_ids(self):
+        # If only legacy field is set, mirror it into cited_ids
+        if (not self.cited_ids) and self.supporting_ids:
+            object.__setattr__(self, "cited_ids", list(self.supporting_ids))
+        # Always keep supporting_ids in sync when present (for downstream consumers)
+        if self.cited_ids and self.supporting_ids != self.cited_ids:
+            object.__setattr__(self, "supporting_ids", list(self.cited_ids))
+        return self
+
     model_config = ConfigDict(extra='forbid')
 
 class CompletenessFlags(BaseModel):

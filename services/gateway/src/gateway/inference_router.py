@@ -1,4 +1,5 @@
 import random
+import os
 import time
 from typing import Any, Dict, Optional, Tuple
 from core_utils import jsonx  # canonical JSON serializer
@@ -23,6 +24,21 @@ def _adapter_name(adapter: Any) -> str:
 # Exposed for headers in /v2/* responses
 last_call: Dict[str, Any] = {}
 
+# ---------------------------------------------------------------------------
+# Runtime configuration
+#
+# The maximum length of the ``short_answer`` field emitted by the LLM is capped
+# to avoid extremely verbose responses leaking through to clients.  Previous
+# implementations hard‑coded this limit at 320 characters.  This introduces a
+# small amount of flexibility by allowing operators to override the cap via
+# an environment variable.  If ``SHORT_ANSWER_MAX_CHARS`` is unset or
+# malformed, a default of 320 is applied.
+_MAX_SHORT_ANSWER_CHARS = 320
+try:
+    _MAX_SHORT_ANSWER_CHARS = int(os.getenv("SHORT_ANSWER_MAX_CHARS", "320"))
+except Exception:
+    _MAX_SHORT_ANSWER_CHARS = 320
+
 # Canonicalize fallback reasons so downstream contracts stay stable.
 _ALLOWED_FALLBACKS = {
     "llm_off","endpoint_unreachable","timeout","http_error","parse_error","stub_answer","no_raw_json","llm_unavailable",
@@ -36,9 +52,12 @@ def sanitize_fallback_reason(reason: Optional[str]) -> str:
     return "http_error" if "http" in r else "llm_unavailable"
 
 def _safety_clamp(envelope: Dict[str, Any], raw_json: str, *, request_id: Optional[str] = None) -> str:
-    """Final clamp: enforce supporting_ids ⊆ allowed_ids and cap short_answer ≤ 320 characters.
-    If parsing fails, return the original string unchanged.  Uses the shared
-    JSON helpers to guarantee canonical handling.
+    """Final clamp: enforce citations (cited_ids/supporting_ids) ⊆ allowed_ids and cap short_answer length.
+
+    This helper parses the raw JSON returned by the LLM, ensures that any
+    ``cited_ids`` (preferred) / ``supporting_ids`` (legacy) emitted are a subset of the envelope’s
+    and truncates overly long ``short_answer`` strings to the configured
+    maximum length.  Should parsing fail, the original string is returned unchanged.
     """
     try:
         # Always parse using the shared JSON loader; this enforces sorted keys and
@@ -47,26 +66,34 @@ def _safety_clamp(envelope: Dict[str, Any], raw_json: str, *, request_id: Option
         data = jsonx.loads(raw_json or "{}")
         if not isinstance(data, dict):
             return raw_json
+        clamped = False
         allowed = set((envelope or {}).get("allowed_ids") or [])
-        # supporting_ids
-        sup = data.get("supporting_ids") or data.get("answer", {}).get("supporting_ids")
+        # cited_ids (preferred) / supporting_ids (legacy)
+        sup = (data.get("cited_ids") or data.get("answer", {}).get("cited_ids") or
+                data.get("supporting_ids") or data.get("answer", {}).get("supporting_ids"))
         if isinstance(sup, list):
             filtered = [x for x in sup if x in allowed]
+            if filtered != sup:
+                clamped = True
             if "answer" in data and isinstance(data["answer"], dict):
+                # Write both for backward compatibility
+                data["answer"]["cited_ids"] = filtered
                 data["answer"]["supporting_ids"] = filtered
             else:
+                data["cited_ids"] = filtered
                 data["supporting_ids"] = filtered
         # short_answer trim
         short = data.get("short_answer") or (data.get("answer", {}) or {}).get("short_answer")
-        if isinstance(short, str) and len(short) > 320:
-            short = short[:320].rstrip()
+        if isinstance(short, str) and len(short) > _MAX_SHORT_ANSWER_CHARS:
+            trimmed = short[:_MAX_SHORT_ANSWER_CHARS].rstrip()
+            clamped = True
             if "answer" in data and isinstance(data["answer"], dict):
-                data["answer"]["short_answer"] = short
+                data["answer"]["short_answer"] = trimmed
             else:
-                data["short_answer"] = short
+                data["short_answer"] = trimmed
         out = jsonx.dumps(data)
         try:
-            log_stage("inference", "safety_clamp", request_id=request_id, clamped=False)
+            log_stage("inference", "safety_clamp", request_id=request_id, clamped=clamped)
         except Exception:
             pass
         return out

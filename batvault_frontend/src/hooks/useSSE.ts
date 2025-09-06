@@ -14,6 +14,19 @@ export function useSSE() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [finalData, setFinalData] = useState<any>(null);
+  // Normalize citations to keep both fields present during the migration.
+  const normalizeCitations = (p: any) => {
+    try {
+      if (p && p.answer) {
+        const c = Array.isArray(p.answer?.cited_ids)
+          ? p.answer.cited_ids
+          : (Array.isArray(p.answer?.supporting_ids) ? p.answer.supporting_ids : []);
+        p.answer.cited_ids = Array.isArray(c) ? c : [];
+        p.answer.supporting_ids = Array.isArray(c) ? c : [];
+      }
+    } catch { /* ignore */ }
+    return p;
+  };
   // Track the abort controller so that consumers can cancel ongoing requests.
   const abortRef = useRef<AbortController | null>(null);
 
@@ -38,7 +51,7 @@ export function useSSE() {
         setTimeout(() => {
           setTokens([]);
           setFinalData({
-            answer: { short_answer: "Test answer.", supporting_ids: [] },
+            answer: { short_answer: "Test answer.", cited_ids: [], supporting_ids: [] },
             evidence: {
               anchor: { id: "dec-1", snippet: "Anchor evidence.", tags: ["anchor"] },
               events: [
@@ -76,7 +89,7 @@ export function useSSE() {
         setTimeout(() => {
           setTokens([]);
           setFinalData({
-            answer: { short_answer: "Test answer.", supporting_ids: [] },
+            answer: { short_answer: "Test answer.", cited_ids: [], supporting_ids: [] },
             evidence: {
               anchor: { id: "dec-1", snippet: "Decision", tags: ["strategy"], based_on: [] },
               events: [
@@ -119,7 +132,7 @@ export function useSSE() {
           try {
             const payload = await res.json();
             setTokens([]);
-            setFinalData(payload);
+            setFinalData(normalizeCitations(payload));
           } catch (e: any) {
             setError(e instanceof Error ? e : new Error(String(e)));
             throw e;
@@ -174,7 +187,7 @@ export function useSSE() {
                 });
               } else {
                 // Final event; stream finished
-                setFinalData(payload);
+                setFinalData(normalizeCitations(payload));
                 setIsStreaming(false);
                 // Fire global trace callback if audit metadata present
                 try {
@@ -222,7 +235,7 @@ export function useSSE() {
         const leftover = buffer.trim();
         if (leftover) {
           try {
-            setFinalData(JSON.parse(leftover));
+            setFinalData(normalizeCitations(JSON.parse(leftover)));
           } catch {/* ignore */}
         }
         setIsStreaming(false);

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import Tab from "./ui/Tab";
 import Button from "./ui/Button";
 import { logEvent } from "../../utils/logger";
@@ -41,6 +42,10 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
   answer,
   bundle_url,
 }) => {
+
+  // Ensure portal targets document.body (avoids clipping by transformed/overflow parents)
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => { setMounted(true); }, []);
 
   // Lazy prompt artifacts loaded from the bundle when not present in meta
   const [bundlePrompt, setBundlePrompt] = useState<{ envelope?: any; rendered?: string; raw?: any } | null>(null);
@@ -141,15 +146,35 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
   const preceding = (evidence as any)?.transitions?.preceding ?? [];
   const succeeding = (evidence as any)?.transitions?.succeeding ?? [];
 
-  // Determine classes for drawer visibility. Increase width to accommodate all tabs
-  // and ensure it doesn't cut off the last tab. On small screens, it still slides
-  // in from the right with a fixed width (~28rem).
-  const drawerClasses = `fixed top-0 bottom-0 right-0 m-0 h-screen w-[32rem] max-w-[96vw] bg-black/80 backdrop-blur-md border-l border-vaultred/40 shadow-neon-red transform transition-transform duration-300 z-50 ${
-    open ? "translate-x-0" : "translate-x-full"
+  // Determine classes for drawer visibility. The drawer is positioned off‑canvas
+  // on the right when closed and slides into view when `open` is true. It
+  // explicitly sets `top` and `bottom` so it stretches the full height of the
+  // viewport, and uses a dark translucent backdrop with a subtle neon shadow.
+  const drawerClasses = `fixed top-0 bottom-0 right-0 m-0 bg-black/80 backdrop-blur-md border-l border-vaultred/40 shadow-neon-red transform transition-transform duration-300 z-50 ${
+  open ? "translate-x-0" : "translate-x-full"
   }`;
 
-  return (
-    <div className={drawerClasses + " flex flex-col"} data-testid="audit-drawer">
+  // Inline style overrides. Tailwind sometimes tree‑shakes arbitrary values like
+  // `w-[32rem]` or `max-w-[96vw]` when they appear in template strings. To
+  // guarantee consistent sizing without relying on Tailwind's arbitrary value
+  // detection, define the drawer dimensions here. These values mirror the
+  // intended 32 rem width and 96 vw maximum width from the original classes.
+  const drawerStyle: React.CSSProperties = {
+    width: "48rem",       // widened to 48rem (~768px) so Fingerprints tab content is never cut off
+    maxWidth: "98vw",      // Prevent the drawer from exceeding the viewport on very small screens
+    height: "100vh",       // Ensure the drawer spans the entire viewport height
+    zIndex: 9999,          // Render above any app surfaces
+  };
+
+  const drawerRoot = (
+    // Apply inline dimensions via the `style` prop to guarantee the desired
+    // width and height regardless of whether Tailwind strips arbitrary
+    // utilities. See `drawerStyle` above for details.
+    <div
+      className={drawerClasses + " flex flex-col"}
+      data-testid="audit-drawer"
+      style={drawerStyle}
+    >
       <div className="flex flex-col h-full">
       <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
         <h2 className="text-xl font-bold text-vaultred">Audit</h2>
@@ -414,11 +439,11 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
               </div>
             )}
             {/* Cited evidence IDs from the short answer */}
-            {answer?.supporting_ids && answer.supporting_ids.length > 0 && (
+            {((answer?.cited_ids?.length ?? 0) > 0 || (answer?.supporting_ids?.length ?? 0) > 0) && (
               <div className="mt-4">
                 <h4 className="text-sm font-semibold text-vaultred mb-1">Cited in short answer</h4>
                 <ul className="list-disc list-inside text-xs text-copy space-y-1">
-                  {answer.supporting_ids.map((cid) => (
+                  {(answer.cited_ids ?? answer.supporting_ids)?.map((cid) => (
                     <li key={cid} className="font-mono break-all">{cid}</li>
                   ))}
                 </ul>
@@ -526,6 +551,7 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
       </div>
     </div>
   );
+return mounted ? createPortal(drawerRoot, document.body) : null;
 };
 
 export default AuditDrawer;

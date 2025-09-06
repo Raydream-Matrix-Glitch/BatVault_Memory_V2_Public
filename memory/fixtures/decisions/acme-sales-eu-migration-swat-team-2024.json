@@ -1,0 +1,26 @@
+{
+  "id": "acme-sales-eu-migration-swat-team-2024",
+  "option": "Stand up migration SWAT for at-risk on-prem accounts",
+  "rationale": "Hands-on migration support to reduce renewal risk and accelerate cloud adoption.",
+  "timestamp": "2024-08-01T09:30:00Z",
+  "decision_maker": "Regional Sales Manager (EU)",
+  "tags": ["sales", "migration", "customer_success"],
+  "supported_by": [
+    "acme-e-eu-renewals-risk-onprem-2024",
+    "acme-e-eu-cloud-uplift-pipeline-2024",
+    "acme-e-alias-pivot-cloud-only-2024"
+  ],
+  "based_on": ["acme-sales-eu-shift-incentives-cloud-upgrades-2024"],
+  "transitions": [],
+  "domain": "acme/region_eu",
+  "importance": 0.78,
+  "sensitivity": "low",
+  "namespaces": ["public", "internal"],
+  "roles_allowed": ["staff", "manager", "director", "exec"],
+  "x-extra": {
+    "kpis": [
+      {"name": "At-risk accounts recovered", "unit": "count", "baseline": 0, "target": 60},
+      {"name": "Avg migration cycle time", "unit": "days", "baseline": 90, "target": 45}
+    ]
+  }
+}

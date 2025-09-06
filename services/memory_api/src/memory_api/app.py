@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Response, HTTPException, Request
 import os
 from fastapi.responses import JSONResponse
+import re
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span
@@ -13,11 +14,14 @@ from typing import Dict, List, Tuple, Optional
 from functools import lru_cache
 import inspect
 from core_http.client import get_http_client
-from core_config.constants import timeout_for_stage
+from core_config.constants import timeout_for_stage, TTL_EXPAND_CACHE_SEC
+from .policy import compute_effective_policy, filter_and_mask_neighbors, field_mask
 import asyncio
-import re
 import time
 import core_metrics
+import os
+import threading
+from collections import OrderedDict
 
 # ---------------------------------------------------------------------------
 # Legacy module alias needed by unit tests that monkey-patch `embed()` on
@@ -29,6 +33,49 @@ import core_storage.arangodb as arango_mod  # noqa: F401
 settings = get_settings()
 logger = get_logger("memory_api")
 logger.propagate = False
+
+# -----------------------------
+# Pre-selector LRU+TTL cache
+# -----------------------------
+class _TTLCache:
+    def __init__(self, maxsize: int = 2048, ttl_sec: int = 60):
+        self.maxsize = maxsize
+        self.ttl_sec = ttl_sec
+        self._data = OrderedDict()  # key -> (value, ts)
+        self._lock = threading.Lock()
+    def get(self, key: str):
+        now = time.time()
+        with self._lock:
+            entry = self._data.get(key)
+            if not entry:
+                return None
+            val, ts = entry
+            if (now - ts) > self.ttl_sec:
+                # expired
+                try:
+                    del self._data[key]
+                except KeyError:
+                    pass
+                return None
+            self._data.move_to_end(key)
+            return val
+    def put(self, key: str, value):
+        now = time.time()
+        with self._lock:
+            if key in self._data:
+                self._data.move_to_end(key)
+            self._data[key] = (value, now)
+            if len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
+def _cache_key(snapshot_etag: str, policy_key: str, node_id: str) -> str:
+    return f"{snapshot_etag}|{policy_key}|{node_id}"
+
+PRESELECT_CACHE = _TTLCache(
+    maxsize=int(os.getenv("MEMORY_PRESELECTOR_CACHE_SIZE", "2048") or "2048"),
+    ttl_sec=int(os.getenv("MEMORY_PRESELECTOR_CACHE_TTL_SEC", str(TTL_EXPAND_CACHE_SEC)) or str(TTL_EXPAND_CACHE_SEC)),
+)
+
 app = FastAPI(title="BatVault Memory_API", version="0.1.0")
 # Initialise tracing before wrapping the application so spans have real IDs
 setup_tracing(os.getenv('OTEL_SERVICE_NAME') or 'memory_api')
@@ -504,139 +551,177 @@ async def resolve_text(payload: dict, response: Response):
     return _json_response_with_etag(doc, etag)
 
 @app.post("/api/graph/expand_candidates")
-async def expand_candidates(payload: dict, response: Response):
+async def expand_candidates(payload: dict, response: Response, request: Request):
     # Honour monkey-patched `store` in unit tests
     _clear_store_cache()
 
-    # ------------------------------------------------------------------ #
-    # Ensure *etag* is always bound, even when the store raises and we   #
-    # fall back to a dummy-document.  This removes the UnboundLocalError #
-    # surfaced by test_expand_anchor_with_underscore.                    #
-    # ------------------------------------------------------------------ #
+    # Ensure *etag* is always bound, even when the store raises and we
+    # fall back to a dummy-document.
     etag: Optional[str] = None
-    # Milestone-4 contract: `node_id` is canonical, but keep `anchor`
-    node_id = payload.get("node_id") or payload.get("anchor")
-    k = int(payload.get("k", 1))
+    original_key = None
+    if isinstance(payload, dict):
+        for k in ("node_id", "anchor_id", "decision_ref"):
+            if k in payload and payload.get(k):
+                node_id = payload.get(k)
+                original_key = k
+                break
+        else:
+            node_id = None
+    else:
+        node_id = None
+
     if not node_id:
-        raise HTTPException(status_code=400, detail="node_id is required")
+        raise HTTPException(status_code=400, detail="node_id or anchor_id is required")
+    # Accept both plain Arango `_key` *and* fully-qualified IDs like `decisions/<key>` or `nodes/<key>`.
+    # We store everything under the unified `nodes` collection, keyed by `<key>`, so strip any prefix.
+    if isinstance(node_id, str) and "/" in node_id:
+        original = node_id
+        node_id = node_id.split("/", 1)[1]
+        if original != node_id:
+            # Use consistent naming in logs and record which key we accepted.
+            log_stage(
+                logger, "expand", "normalized_node_id",
+                original=original, normalized=node_id, input_key=original_key
+            )
+    elif original_key in ("anchor_id", "decision_ref"):
+        # If we didn't need to normalize but we did accept an alias key, log it for audits.
+        log_stage(logger, "expand", "accepted_alias_key", input_key=original_key, node_id=node_id)
+    # Hard fail early on obviously invalid IDs to avoid AQL errors
+    if not is_slug(node_id):
+        log_stage(logger, "expand", "input_error", reason="invalid_node_id_format", node_id=node_id, input_key=original_key)
+        raise HTTPException(status_code=400, detail="invalid node_id (expected slug, got path or illegal chars)")
+    # Always bound to 1 for the demo (policy may request lower).
+    k = 1
+    # Storage fetch: neighbors around anchor + snapshot etag
     def _work():
         st = store()
-        return st.expand_candidates(node_id, k=k), st.get_snapshot_etag()
+        return st.expand_candidates(node_id, k=k), st.get_snapshot_etag(), st
     try:
         with trace_span("memory.expand_candidates", node_id=node_id, k=k):
-            doc, etag = await asyncio.wait_for(asyncio.to_thread(_work), timeout=timeout_for_stage("expand"))
+            doc, etag, st = await asyncio.wait_for(asyncio.to_thread(_work), timeout=timeout_for_stage("expand"))
     except asyncio.TimeoutError:
-        # Do **not** bubble a 504; honour the v2 contract by replying 200 with a
-        # deterministic, empty payload.  The caller can inspect `meta.fallback_reason`
-        # to see that a timeout occurred.
-        log_stage(logger, "expand", "timeout_fallback",
-                  request_id=payload.get("request_id"))
-        doc = {
-            "node_id": node_id,
-            "anchor":  node_id,                 # legacy alias
-            "neighbors": [],
-            "meta": {"fallback_reason": "timeout"},
-        }
-        etag = None
-    except Exception as e:
-        # Unit-test friendly fallback: return empty neighbors (no DB required).  When
-        # an unexpected exception occurs (e.g., database unavailable), the caller
-        # should be able to inspect a fallback_reason in the response meta.  We
-        # categorise all unexpected errors as "db_unavailable".
+        log_stage(logger, "expand", "timeout_fallback", request_id=payload.get("request_id"))
+        doc, st = {"node_id": node_id, "neighbors": []}, store()
+    except Exception as e:  # pragma: no cover — defensive guardrail
         log_stage(logger, "expand", "fallback_empty", error=type(e).__name__)
-        doc  = {"node_id": None,
-                "neighbors": {"events": [], "transitions": []},
-                "meta": {"fallback_reason": "db_unavailable"}}
-        etag = None 
-
-    # ---- 🔒 Contract normalisation (Milestone-2) ---- #
-    #
-    # Required keys:
-    #   • anchor         – string | null, always present
-    #   • neighbors      – list (flattened), even when store returns the legacy
-    #                      {"events": [...], "transitions": [...]} shape
-    #   • meta           – dict (optionally empty)
-    #
-    if not isinstance(doc, dict):
-        doc = {}
-
-    # Normalise ID – prefer explicit value from store, fall back to request
-    node_value = doc.get("node_id") if isinstance(doc, dict) else None
-    if node_value is None:
-        node_value = doc.get("anchor") if isinstance(doc, dict) else None
-    if node_value is None:
-        node_value = node_id
-
-    # Neighbors – flatten legacy dicts into a single list
-    raw_neighbors = doc.get("neighbors", [])
-    if isinstance(raw_neighbors, dict):
-        raw_neighbors = (raw_neighbors.get("events") or []) + \
-                        (raw_neighbors.get("transitions") or [])
-    # Ensure the field is always a list
-    if not isinstance(raw_neighbors, list):
-        raw_neighbors = []
-
-    # Extract any existing meta information from the document.  Per the
-    # contract, meta must always be a dictionary (optionally empty).
-    # If the store returned a non-dict or missing meta value we normalise
-    # it to an empty dict.  Defining this object up front avoids
-    # NameError when building the response.
-    meta_obj: dict = {}
-    if isinstance(doc, dict):
-        maybe_meta = doc.get("meta")
-        if isinstance(maybe_meta, dict):
-            meta_obj = maybe_meta
-
-    # Assemble the canonical result payload.  We always include
-    # node_id/anchor, a flattened neighbours list and a meta object.
+        doc, st = {"node_id": node_id, "neighbors": []}, store()
+    # Normalise contract keys from storage
     result = {
-        "node_id":  node_value,
-        "anchor":   node_value,
-        "neighbors": raw_neighbors,
-        "meta":      meta_obj,
+        "node_id": (doc.get("node_id") or doc.get("anchor")),
+        "neighbors": list(doc.get("neighbors") or []),
+        "meta": dict(doc.get("meta") or {}),
     }
-    # Determine the effective snapshot_etag: prefer the one returned from the store;
-    # otherwise fall back to any existing meta.snapshot_etag; default to "unknown".
-    if etag:
-        safe_etag = etag
-    else:
-        # Derive the ETag from any existing snapshot_etag in the meta
-        # object; fall back to "unknown" when absent.  meta_obj is always
-        # a dict after the normalisation above.
-        safe_etag = meta_obj.get("snapshot_etag") if isinstance(meta_obj, dict) else None
-        if not safe_etag:
-            safe_etag = "unknown"
-    if not isinstance(result["meta"], dict):
-        result["meta"] = {}
-    result["meta"]["snapshot_etag"] = safe_etag
-    # Flag snapshot availability explicitly.  If the ETag could not be
-    # retrieved from Arango this flag will be False.  Downstream callers
-    # differentiate between a missing snapshot and the legacy "unknown"
-    # marker.
-    result["meta"]["snapshot_available"] = bool(safe_etag and safe_etag != "unknown")
-    result["meta"]["ok"] = True
-    result["meta"]["neighbor_count"] = len(result.get("neighbors") or [])
-    result["meta"]["k"] = k
+    # -------------------------
+    # 🔐 Policy Pre-Selector
+    # -------------------------
+    # Resolve effective policy from request headers (fail closed on missing role)
+    try:
+        policy = compute_effective_policy({k: v for k, v in request.headers.items()})
+        log_stage(
+            logger, "policy", "resolved",
+            role=policy.get("role"),
+            namespaces=",".join(policy.get("namespaces") or []),
+            scopes=",".join(policy.get("domain_scopes") or []),
+            edge_types=",".join(policy.get("edge_allowlist") or []),
+            sensitivity=policy.get("sensitivity_ceiling"),
+            policy_key=policy.get("policy_key"),
+            policy_version=policy.get("policy_version"),
+            policy_fp=policy.get("policy_fp"),
+            user_id=policy.get("user_id"),
+            request_id=policy.get("request_id"),
+            trace_id=policy.get("trace_id"),
+        )
+    except Exception as e:
+        # Log with context so the culprit (e.g., missing role file) is obvious in traces
+        try:
+            from .policy import _policy_dir
+            log_stage(
+                logger, "policy", "resolve_error",
+                error=type(e).__name__, error_message=str(e), policy_dir=_policy_dir()
+            )
+        except Exception:
+            log_stage(logger, "policy", "resolve_error", error=type(e).__name__, error_message=str(e))
+        raise HTTPException(status_code=400, detail=f"policy_error:{type(e).__name__}:{str(e)}")
+    # Derive the final snapshot etag; if unknown, we skip caching
+    safe_etag = (etag or (result.get("meta") or {}).get("snapshot_etag")) or "unknown"
+
+    # Optional cache bypass for debugging
+    hdrs_lc = {str(k).lower(): v for k, v in request.headers.items()}
+    cache_bypass = (hdrs_lc.get("x-cache-bypass") or "0").strip() in ("1", "true", "yes")
+
+    # 🔁 Cache check (etag+policy+node scope)
+    cache_key = None
+    if (safe_etag != "unknown") and not cache_bypass:
+        cache_key = _cache_key(safe_etag, policy.get("policy_key"), result["node_id"])
+        cached = PRESELECT_CACHE.get(cache_key)
+        if cached is not None:
+            log_stage(
+                logger, "preselector", "cache_hit",
+                node_id=node_id, snapshot_etag=safe_etag, policy_key=policy.get("policy_key"),
+                neighbors=cached.get("meta", {}).get("neighbor_count", 0)
+            )
+            return _json_response_with_etag(cached, safe_etag)
+
+    # Mask the anchor document according to role visibility
+    try:
+        anchor_doc = st.get_node(result["node_id"])
+    except Exception:
+        anchor_doc = None
+    masked_anchor = field_mask(anchor_doc or {"id": result["node_id"], "type": (anchor_doc or {}).get("type")}, policy)
+    # Apply edge allowlist + ACL to neighbors, and field mask per role
+    included_neighbors, policy_trace = filter_and_mask_neighbors(result.get("neighbors") or [], st, policy)
+    # Compose final CandidateSet
+    candidate_set = {
+        "anchor": masked_anchor,
+        "neighbors": included_neighbors or [],
+        "meta": {
+            "snapshot_etag": safe_etag,
+            "snapshot_available": bool(safe_etag and safe_etag != "unknown"),
+            "policy_key": policy.get("policy_key"),
+            "policy_fp": policy.get("policy_fp"),
+            "policy": {  # surface effective policy for audit drawer
+                "role": policy.get("role"),
+                "scopes": policy.get("domain_scopes") or [],
+                "edge_allowlist": policy.get("edge_allowlist") or [],
+                "sensitivity": policy.get("sensitivity_ceiling"),
+            },
+            "ok": True,
+            "k": 1,
+            "neighbor_count": len(included_neighbors),
+        },
+        "policy_trace": policy_trace,
+    }
+    # Store in cache if eligible
+    if (cache_key is not None) and not cache_bypass:
+        PRESELECT_CACHE.put(cache_key, candidate_set)
+        log_stage(
+            logger, "preselector", "cache_miss_store",
+            node_id=node_id, snapshot_etag=safe_etag, policy_key=policy.get("policy_key"),
+            neighbors=candidate_set["meta"]["neighbor_count"]
+        )
     # One structured log for dashboards & debugging
     log_stage(
-        logger, "expand", "completed",
-        node_id=node_id, k=k, neighbors=result["meta"]["neighbor_count"],
-        snapshot_etag=safe_etag
+        logger, "preselector", "completed",
+        node_id=node_id,
+        neighbors=candidate_set["meta"]["neighbor_count"],
+        edge_types=",".join(policy_trace.get("edge_types_used") or []),
+        hidden_vertices=policy_trace.get("counts", {}).get("hidden_vertices", 0),
+        snapshot_etag=safe_etag,
+        policy_key=policy.get("policy_key"),
     )
-    return _json_response_with_etag(result, safe_etag)
-
+    return _json_response_with_etag(candidate_set, safe_etag)
 # ─────────────────────────────────────────────────────────────────────────────
 #  Trailing-slash aliases kept for legacy contract tests                      │
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/graph/expand_candidates/")
-async def expand_candidates_slash(payload: dict, response: Response):
-    """Back-compat: delegate trailing-slash variant to the canonical handler."""
-    return await expand_candidates(payload, response)
+async def expand_candidates_slash(payload: dict, response: Response, request: Request):
+    """Trailing-slash variant delegates to the canonical handler."""
+    return await expand_candidates(payload, response, request)
 
 @app.post("/api/resolve/text/")
 async def resolve_text_slash(payload: dict, response: Response):
-    """Back-compat: delegate trailing-slash variant to the canonical handler."""
+    """Trailing-slash variant delegates to the canonical handler."""
     return await resolve_text(payload, response)
 
 
