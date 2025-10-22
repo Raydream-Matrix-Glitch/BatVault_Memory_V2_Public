@@ -31,3 +31,8 @@ opentelemetry-instrumentation-fastapi>=0.46b0
 
 # ─── API‑Edge runtime deps ─────────────────────────────────────────────
 prometheus_client>=0.19      # /metrics endpoint
+
+# ─── Tooling (schema codegen) ──────────────────────────────────────────
+# Pin for determinism; used by scripts/codegen_schemas.sh
+datamodel-code-generator==0.25.6
+cryptography>=42.0.0

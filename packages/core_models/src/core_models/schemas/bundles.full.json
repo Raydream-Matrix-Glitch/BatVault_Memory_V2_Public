@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/bundles.full.json",
+  "title": "Bundle (Full)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "response.json",
+    "evidence_canonical.json",
+    "validator_report.json",
+    "trace.json",
+    "plan.json",
+    "evidence_pre.json",
+    "evidence_post.json",
+    "model_raw.json",
+    "envelope.json"
+  ],
+  "properties": {
+    "response.json": {
+      "type": "object"
+    },
+    "evidence_canonical.json": {
+      "type": "object"
+    },
+    "validator_report.json": {
+      "type": "object"
+    },
+    "trace.json": {
+      "type": "object"
+    },
+    "plan.json": {
+      "type": "object"
+    },
+    "evidence_pre.json": {
+      "type": "object"
+    },
+    "evidence_post.json": {
+      "type": "object"
+    },
+    "model_raw.json": {
+      "type": "object"
+    },
+    "envelope.json": {
+      "type": "object"
+    }
+  }
+}

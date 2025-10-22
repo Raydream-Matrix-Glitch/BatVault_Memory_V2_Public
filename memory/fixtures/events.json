@@ -1,0 +1,33 @@
+[
+  {
+    "id": "e-eng-001",
+    "type": "EVENT",
+    "title": "Load tests meet SLOs for billing service",
+    "description": "p95 latency < 200 ms at 300 rps sustained; performance gate passed.",
+    "domain": "eng",
+    "timestamp": "2025-08-12T16:00:00Z",
+    "sensitivity": "low",
+    "x-extra": { "source": "k6", "slo": { "p95_ms": 190, "rps": 300 } }
+  },
+  {
+    "id": "e-eng-002",
+    "type": "EVENT",
+    "title": "PCI SAQ-A scope confirmed",
+    "description": "External assessor confirms SAQ-A scope for hosted fields; compliance gate ready.",
+    "domain": "eng",
+    "timestamp": "2025-08-14T11:00:00Z",
+    "sensitivity": "high",
+    "x-extra": { "assessor": "CertTrust", "scope": "SAQ-A" }
+  },
+  {
+    "id": "e-sales-alias-eng-010",
+    "type": "EVENT",
+    "title": "RFP requires EU billing and VAT",
+    "description": "Top prospect requires EU billing support in Q4; deal is blocked until available.",
+    "domain": "sales",
+    "timestamp": "2025-08-18T09:00:00Z",
+    "sensitivity": "medium",
+    "decision_ref": "eng#d-eng-010",
+    "x-extra": { "prospect": "ACME GmbH", "value_eur": 450000 }
+  }
+]

@@ -1,118 +1,168 @@
-import hashlib, orjson, re, unicodedata, uuid
-from typing import Any, Dict, Optional
+import base64, hashlib, orjson, re, unicodedata, uuid
+from typing import Any, Optional, Union, Dict
 import hashlib as _hashlib
+from urllib.parse import parse_qsl
+try:
+    from core_logging import get_logger, log_stage, current_request_id  # type: ignore
+    _IDS_LOGGER = get_logger("core_utils.ids")
+except ImportError:  # pragma: no cover
+    _IDS_LOGGER = None  # type: ignore
 
-def compute_request_id(path: str, query: dict|None, body) -> str:
-    q = "" if not query else orjson.dumps(query, option=orjson.OPT_SORT_KEYS).decode()
-    b = "" if body is None else (body if isinstance(body, str) else orjson.dumps(body, option=orjson.OPT_SORT_KEYS).decode())
+def compute_request_id(
+    path: str,
+    query: Optional[Union[dict, bytes, bytearray, memoryview, str, Any]],
+    body: Union[bytes, bytearray, memoryview, str, Any],
+) -> str:
+    """
+    Deterministic 16-hex request id for a given path+query+body.
+    Used for idempotency and audit drawer replay.
+    """
+    # ---- query canonicalisation with multi-value support -------------------
+    def _canon_qs_from_items(items) -> str:
+        values_by_key: Dict[str, list[str]] = {}
+        for k, v in items:
+            ks = "" if k is None else str(k)
+            vs = "" if v is None else str(v)
+            values_by_key.setdefault(ks, []).append(vs)
+        parts = []
+        for k in sorted(values_by_key.keys()):
+            for v in sorted(values_by_key[k]):
+                parts.append(f"{k}={v}")
+        return "&".join(parts)
+
+    if query in (None, "", b"", bytearray(), memoryview(b"")):
+        q = ""
+    elif hasattr(query, "multi_items") and callable(getattr(query, "multi_items")):
+        q = _canon_qs_from_items(list(query.multi_items()))
+    elif isinstance(query, (list, tuple)) and query and isinstance(query[0], (list, tuple)) and len(query[0]) == 2:
+        # Sequence of (key, value) pairs
+        q = _canon_qs_from_items(query)
+    elif isinstance(query, (bytes, bytearray, memoryview)):
+        # Prefer parsing JSON directly from raw bytes to avoid lossy decode.
+        bb = bytes(query)
+        sb = bb.lstrip()
+        if sb[:1] in (b"{", b"["):
+            try:
+                q = orjson.dumps(orjson.loads(bb), option=orjson.OPT_SORT_KEYS).decode()
+            except orjson.JSONDecodeError:
+                # Not valid JSON – fall back to tolerant text decode
+                q = bb.decode("utf-8", "replace")
+        else:
+            s = bb.decode("utf-8", "replace")
+            _s = s.lstrip("?")
+            q = _canon_qs_from_items(parse_qsl(_s, keep_blank_values=True)) if ("=" in _s or "&" in _s) else _s
+    elif isinstance(query, str):
+        t = query.lstrip()
+        if t[:1] in ("{", "["):
+            try:
+                q = orjson.dumps(orjson.loads(query), option=orjson.OPT_SORT_KEYS).decode()
+            except orjson.JSONDecodeError:
+                q = query
+        else:
+            _s = query.lstrip("?")
+            q = _canon_qs_from_items(parse_qsl(_s, keep_blank_values=True)) if ("=" in _s or "&" in _s) else _s
+    elif isinstance(query, dict):
+        # Mapping inputs may have already collapsed duplicates; log keys for visibility.
+        if _IDS_LOGGER is not None:
+            log_stage(
+                _IDS_LOGGER, "request_id", "query_mapping_input",
+                keys=sorted(map(str, query.keys())),
+                request_id=(current_request_id() or "startup"),
+            )
+        q = orjson.dumps(query, option=orjson.OPT_SORT_KEYS).decode()
+    else:
+        # Last-resort deterministic stringification
+        q = str(query)
+
+    # Representation-invariance: treat explicit empty JSON object as empty query
+    if q == "{}":
+        if _IDS_LOGGER is not None:
+            log_stage(
+                _IDS_LOGGER, "request_id", "query_empty_json_normalized",
+                request_id=(current_request_id() or "startup"),
+            )
+        q = ""
+
+    # Canonicalise body with representation invariance:
+    # - None            -> ""
+    # - str             -> if JSON-like, parse+re-dump (sorted keys); else as-is
+    # - bytes/bytearray/memoryview -> if JSON-like, parse+re-dump; else base64(body)
+    # - other           -> JSON dump (sorted keys)
+    def _canon_from_bytes(data: Union[bytes, bytearray, memoryview]) -> str:
+        bs = bytes(data)
+        s = bs.lstrip()
+        if s[:1] in (b"{", b"["):
+            try:
+                return orjson.dumps(orjson.loads(bs), option=orjson.OPT_SORT_KEYS).decode()
+            except orjson.JSONDecodeError:
+                # non-JSON bytes after attempt → base64 fallback
+                pass
+        # Non-JSON or decode error -> base64 for deterministic text keys
+        if _IDS_LOGGER:
+            log_stage(
+                _IDS_LOGGER, "request_id", "body_base64_fallback",
+                size=len(bs), reason="non_json_or_decode_error",
+                request_id=(current_request_id() or "startup"),
+            )
+        return base64.b64encode(bs).decode()
+
+    if body is None:
+        b = ""
+    elif isinstance(body, str):
+        s = body.lstrip()
+        if s[:1] in ("{", "["):
+            try:
+                b = orjson.dumps(orjson.loads(body), option=orjson.OPT_SORT_KEYS).decode()
+            except orjson.JSONDecodeError:
+                b = body
+        else:
+            b = body
+    elif isinstance(body, (bytes, bytearray, memoryview)):
+        b = _canon_from_bytes(body)
+    else:
+        try:
+            b = orjson.dumps(body, option=orjson.OPT_SORT_KEYS).decode()
+        except TypeError:
+            b = str(body)
+
+    # Representation-invariance: treat explicit empty JSON object as empty body
+    if b == "{}":
+        if _IDS_LOGGER is not None:
+            log_stage(
+                _IDS_LOGGER, "request_id", "body_empty_json_normalized",
+                request_id=(current_request_id() or "startup"),
+            )
+        b = ""
+        
     raw = f"{path}?{q}#{b}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 def idempotency_key(provided: str|None, path: str, query: dict|None, body) -> str:
     return provided or compute_request_id(path, query, body)
 
-_SLUG_OK = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
+_TAG_OK = re.compile(r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")  # lower-kebab (node tags only)
 
-def slugify_id(s: str) -> str:
+def generate_request_id() -> str:
     """
-    Canonical slug rules (spec K/L):
-      - NFKC → lowercase
-      - trim
-      - map any non [a-z0-9] to '-'
-      - collapse multiple '-' and trim '-'
-    Result matches ^[a-z0-9][a-z0-9-]{2,}[a-z0-9]$
+    Non-deterministic 16-hex id for logging/health/exception paths.
+    Kept short for log readability and parity with compute_request_id().
     """
-    s = unicodedata.normalize("NFKC", s or "").strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "-", s)
-    s = re.sub(r"-{2,}", "-", s).strip("-")
-    # As a utility, we return best-effort even if too short;
-    # upstream validators will enforce strict regex.
-    return s
-
-# ------------------------------------------------------------------
-# Tag slugging helper
-# ------------------------------------------------------------------
-
-def slugify_tag_legacy(s: str) -> str:
-    """
-    Canonical slug rules for tags.  Tags differ from general identifiers in
-    that they use underscores (``_``) as the canonical separator instead of
-    hyphens.  This helper lower‑cases the input, normalises it using
-    Unicode NFKC, collapses any sequence of non‑alphanumeric characters
-    into a single underscore and trims leading/trailing underscores.  It
-    mirrors the behaviour of :func:`core_validator._slugify_to_underscores`.
-
-    Parameters
-    ----------
-    s: str
-        The tag string to normalise.
-
-    Returns
-    -------
-    str
-        A lower‑cased slug string using underscores.
-    """
-    """
-    Deprecated slugify_tag implementation.  Forward to the canonical slugify_tag
-    defined below to avoid divergent behaviours.
-    """
-    return slugify_tag(s)
-
-
-# ------------------------------------------------------------------
-# Public helper: legacy alias + convenience wrapper
-# ------------------------------------------------------------------
-
-def generate_request_id(
-    path: str = "",
-    query: Optional[Dict[str, Any]] = None,
-    body: Any | None = None,
-) -> str:
-    """
-    • Deterministic mode – when *path* is provided, reuse
-      `compute_request_id` so the ID is repeatable.
-    • Fallback mode – when called with no args (common in health probes),
-      return a random 16-char UUID4 fragment.
-    """
-    if path:
-        return compute_request_id(path, query, body)
     return uuid.uuid4().hex[:16]
-
-def is_slug(s: str) -> bool:
-    """
-    Return True if *s* is already a canonical slug (spec §B-2).
-    Forward-compatible with Milestone 4 by centralizing slug semantics.
-    """
-    if not s:
-        return False
-    return bool(_SLUG_OK.match(s.strip()))
-
-_TAG_RE = re.compile(r"[^a-z0-9]+")
 
 def slugify_tag(s: str) -> str:
     """
-    Canonical tag slug:
-      - NFKC normalize
-      - lowercase
-      - replace any non [a-z0-9] sequence with a single underscore
-      - trim leading/trailing underscores
-      - collapse multiple underscores
-    Deterministic and ASCII-safe; aligns all services on tag shape.
+    Normalise tag values to lower-kebab. Fail-closed on invalid input.
+    Tags are optional and node-only (used for coarse discovery facets).
     """
-    if s is None:
-        return ""
-    import unicodedata
     s = unicodedata.normalize("NFKC", str(s)).lower()
-    s = _TAG_RE.sub("_", s).strip("_")
-    # collapse multiple underscores
-    s = re.sub(r"_+", "_", s)
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    s = re.sub(r"-+", "-", s)
+    if not _TAG_OK.match(s or ""):
+        raise ValueError(f"invalid tag: {s!r}")
     return s
 
 def stable_short_id(value: str) -> str:
-    """
-    Deterministic 8-char hex id from the input value (sha1).
-    Handy for correlating batches/runs in logs without leaking details.
-    """
+    """Deterministic 8-char hex id from the input value (sha1)."""
     if value is None:
         value = ""
     return _hashlib.sha1(str(value).encode()).hexdigest()[:8]

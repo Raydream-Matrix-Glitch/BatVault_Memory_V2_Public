@@ -1,122 +1,87 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import Input from "./ui/Input";
 import Button from "./ui/Button";
-import Tab from "./ui/Tab";
 import { logEvent } from "../../utils/logger";
 
+import { Role, ROLES, DEFAULT_ROLE } from "../../utils/roles";
+
 export interface QueryPanelProps {
-  /**
-   * Handler for structured ask queries. Takes an intent, decision reference
-   * and optional extra options.
-   */
-  onAsk: (
-    intent: string,
-    decisionRef: string,
-    options?: Record<string, unknown>
-  ) => Promise<void> | void;
-  /**
-   * Handler for natural language queries. Takes only the input text.
-   */
-  onQuery: (text: string) => Promise<void> | void;
-  /**
-   * Indicates whether a request is currently streaming.
-   */
+  /** Called when the user submits a decision reference (anchor) to trace */
+  onQueryDecision: (decisionRef: string) => Promise<void> | void;
+  /** Indicates whether a request is currently streaming. */
   isStreaming?: boolean;
 }
 
-
-/**
- * The QueryPanel provides a simple interface for submitting either a structured
- * ask or a natural language query. Users can toggle between modes and
- * provide the necessary inputs. Submission will call the supplied
- * onAsk/onQuery callbacks.
- */
-export default function QueryPanel({ onAsk, onQuery, isStreaming }: QueryPanelProps) {
-  const [mode, setMode] = useState<"ask" | "query">("ask");
+export default function QueryPanel(props: QueryPanelProps) {
   const [decisionRef, setDecisionRef] = useState<string>("");
-  const [nlInput, setNlInput] = useState<string>("");
+  const [role, setRole] = useState<Role>(
+    ((window as any)?.BV_ACTIVE_ROLE as Role) ?? DEFAULT_ROLE
+  );
 
-  /**
-   * Switch between structured and natural query modes. Emits a debug log with
-   * the previous and next values.
-   */
-  const handleModeChange = (newMode: "ask" | "query") => {
-    if (newMode === mode) return;
-    console.debug("[ui.memory.mode_switch]", { from: mode, to: newMode });
-    try { logEvent("ui.memory.mode_switch", { from: mode, to: newMode }); } catch { /* ignore */ }
-    setMode(newMode);
-  };
+  // Keep simple demo defaults so the backend accepts the request headers.
+  useEffect(() => {
+    const w = window as any;
+    w.BV_ACTIVE_ROLE = role;
+    w.BV_USER_ID = w.BV_USER_ID || "demo-user";
+    w.BV_POLICY_VERSION = w.BV_POLICY_VERSION || "v3-demo";
+    // Do NOT force a fake policy key. If ops inject one at runtime, keep it.
+    if (!w.BV_POLICY_KEY && (import.meta as any).env?.VITE_POLICY_KEY) {
+      w.BV_POLICY_KEY = (import.meta as any).env.VITE_POLICY_KEY;
+    }
+  }, [role]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // prepare debug payload
-    const payload = {
-      mode,
-      rid: (window as any).__lastRid ?? null,
-      nl_len: nlInput.trim().length,
-      decision_ref: decisionRef.trim(),
-    };
+    const anchor = decisionRef.trim();
+    if (!anchor) return;
+
     try {
-      logEvent("ui_memory_trace_clicked", payload);
-    } catch { /* ignore logging errors */ }
-    console.debug("[ui.memory.submit]", payload);
-    if (mode === "ask") {
-      if (!decisionRef.trim()) return;
-      await onAsk("why_decision", decisionRef.trim());
-    } else {
-      if (!nlInput.trim()) return;
-      await onQuery(nlInput.trim());
-    }
+      logEvent("ui.memory.trace_clicked", {
+        anchor,
+        role,
+        rid: (window as any).__lastRid ?? null,
+      });
+    } catch {/* ignore logging errors */}
+    await props.onQueryDecision(anchor);   // <-- critical: actually fire the request
   };
 
   return (
     <div className="space-y-4">
-      <div className="inline-flex rounded-md bg-black/30 backdrop-blur p-1 border border-vaultred/20">
-        <Tab
-          active={mode === "ask"}
-          onClick={() => handleModeChange("ask")}
-          className={mode !== "ask" ? "text-copy/80" : undefined}
-        >
-          Structured
-        </Tab>
-        <Tab
-          active={mode === "query"}
-          onClick={() => handleModeChange("query")}
-          className={mode !== "query" ? "text-copy/80" : undefined}
-        >
-          Natural
-        </Tab>
+      {/* Role selector */}
+      <div className="inline-flex gap-2 rounded-md bg-black/30 backdrop-blur p-1 border border-vaultred/20">
+        {(ROLES as Role[]).map((r) => (
+          <button
+            key={r}
+            type="button"
+            onClick={() => setRole(r)}
+            className={`px-3 py-1 rounded transition ${
+              role === r
+                ? "bg-vaultred/70 text-white"
+                : "bg-black/30 text-copy/80 hover:text-copy"
+            }`}
+            aria-pressed={role === r}
+          >
+            {r === "ceo" ? "CEO" : r[0].toUpperCase() + r.slice(1)}
+          </button>
+        ))}
       </div>
-      <form onSubmit={handleSubmit} className="space-y-4">
-        {mode === "ask" ? (
-          <div className="flex items-stretch gap-2">
-            <Input
-              type="text"
-              value={decisionRef}
-              onChange={(e) => setDecisionRef(e.target.value)}
-              placeholder="Enter a decision reference (e.g., panasonic-exit-plasma-2012)"
-              required
-              className="flex-1"
-            />
-            <Button type="submit" disabled={isStreaming}>
-              {isStreaming ? "Streaming..." : "Trace"}
-            </Button>
-          </div>
-        ) : (
-          <div className="flex items-stretch gap-2">
-            <Input
-              type="text"
-              value={nlInput}
-              onChange={(e) => setNlInput(e.target.value)}
-              placeholder="Ask a question about a decision..."
-              required
-              className="flex-1"
-            />
-            <Button type="submit" disabled={isStreaming}>
-              {isStreaming ? "Streaming..." : "Trace"}
-            </Button>
-          </div>
-        )}
+
+      {/* Single input for anchored query */}
+      <form onSubmit={handleSubmit} className="space-y-3">
+        <div className="flex items-stretch gap-2">
+          <Input
+            id="memory-input"
+            type="text"
+            value={decisionRef}
+            onChange={(e) => setDecisionRef(e.target.value)}
+            placeholder='Enter an anchor (e.g. "eng#d-eng-010") or paste a title like "Adopt Stripe for EU billing"'
+            required
+            className="flex-1"
+          />
+          <Button type="submit" disabled={props.isStreaming}>
+            {props.isStreaming ? "Streaming..." : "Trace"}
+          </Button>
+        </div>
       </form>
     </div>
   );

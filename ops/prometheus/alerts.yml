@@ -14,6 +14,76 @@ groups:
       - record: slo:p95_ttfb_seconds:6h
         expr: |
           histogram_quantile(0.95, sum by (le) (rate({__name__=~".*_ttfb_seconds_bucket"}[6h])))
+      # --------------------------------------------------------------------
+      # Route-scoped latency: gateway /v2/query
+      # Requires route labeling enabled in request_logging middleware.
+      # --------------------------------------------------------------------
+      - record: slo:p95_ttfb_seconds:gateway_v2_query:5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(gateway_ttfb_seconds_bucket{route="/v2/query"}[5m]))
+          )
+      - record: slo:p95_ttfb_seconds:gateway_v2_query:30m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(gateway_ttfb_seconds_bucket{route="/v2/query"}[30m]))
+          )
+      - record: slo:p95_ttfb_seconds:gateway_v2_query:1h
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(gateway_ttfb_seconds_bucket{route="/v2/query"}[1h]))
+          )
+      - record: slo:p95_ttfb_seconds:gateway_v2_query:6h
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(gateway_ttfb_seconds_bucket{route="/v2/query"}[6h]))
+          )
+
+      # --------------------------------------------------------------------
+      # Stage latency P95s (selector, bundle, expand) across windows
+      # --------------------------------------------------------------------
+      - record: slo:p95_stage_selector_seconds:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_selector_seconds_bucket[5m])))
+      - record: slo:p95_stage_selector_seconds:30m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_selector_seconds_bucket[30m])))
+      - record: slo:p95_stage_selector_seconds:1h
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_selector_seconds_bucket[1h])))
+      - record: slo:p95_stage_selector_seconds:6h
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_selector_seconds_bucket[6h])))
+
+      - record: slo:p95_stage_bundle_seconds:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_bundle_seconds_bucket[5m])))
+      - record: slo:p95_stage_bundle_seconds:30m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_bundle_seconds_bucket[30m])))
+      - record: slo:p95_stage_bundle_seconds:1h
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_bundle_seconds_bucket[1h])))
+      - record: slo:p95_stage_bundle_seconds:6h
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_stage_bundle_seconds_bucket[6h])))
+
+      - record: slo:p95_stage_expand_seconds:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(memory_stage_expand_seconds_bucket[5m])))
+      - record: slo:p95_stage_expand_seconds:30m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(memory_stage_expand_seconds_bucket[30m])))
+      - record: slo:p95_stage_expand_seconds:1h
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(memory_stage_expand_seconds_bucket[1h])))
+      - record: slo:p95_stage_expand_seconds:6h
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(memory_stage_expand_seconds_bucket[6h])))
       # Error rates for each service across multiple windows.  These series
       # represent the fraction of HTTP requests returning 5xx status codes.
       - record: slo:api_edge_error_rate:5m

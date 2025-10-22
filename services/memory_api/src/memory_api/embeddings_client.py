@@ -1,1 +1,0 @@
-from core_ml.embeddings import embed  # re-export for legacy imports

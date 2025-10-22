@@ -1,37 +1,20 @@
 {
-  "id": "role-manager",
   "role": "manager",
-  "display_name": "Manager",
-  "description": "People/line manager. Sees product domain and regional story, plus corporate decision headers (no rationale).",
-  "namespaces": ["public", "internal"],
-  "domain_scopes": ["acme/product", "acme/region_*"],
+  "namespaces": ["product","marketing","sales"],
+  "domain_scopes": ["product*","marketing*"],
+  "edge_allowlist": ["LED_TO","ALIAS_OF"],
   "sensitivity_ceiling": "medium",
-  "edge_allowlist": [
-    "CAUSAL_PRECEDES", "ALIAS_OF"
-  ],
+  "max_hops": 1,
+  "alias_max_hops": 1,
   "field_visibility": {
     "decision": {
-      "visible_fields": ["option", "timestamp", "tags", "domain"],
-      "rationale_visible": {
-        "acme/corporate": false,
-        "default": true
-      },
-      "supporting_events_visible": {
-        "acme/corporate": false,
-        "default": true
-      }
+      "visible_fields": ["id","type","domain","title","timestamp"],
+      "rationale_visible": false
     },
     "event": {
-      "visible_fields": ["summary", "timestamp", "snippet", "tags", "domain"],
+      "visible_fields": ["id","type","domain","title","timestamp"],
       "allow_alias_projection": true
     }
   },
-  "x-extra": {
-    "audit_tags": ["demo", "visibility:product+regional", "restricted-corporate"],
-    "header_template": {
-      "X-User-Roles": "manager",
-      "X-User-Namespaces": "public,internal"
-    },
-    "notes": "Managers can consume product decisions (medium sensitivity) and regional content; corporate decisions appear as headers only via ACL."
-  }
+  "extra_visible": ["tags","note"]
 }

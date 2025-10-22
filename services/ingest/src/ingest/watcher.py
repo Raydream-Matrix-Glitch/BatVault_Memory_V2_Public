@@ -1,25 +1,31 @@
 from __future__ import annotations
-
-import redis, time
+import redis, time, os
+from redis.exceptions import RedisError
 import asyncio
 from core_utils import jsonx
 from pathlib import Path
 from types import SimpleNamespace
-
 from core_utils.snapshot import compute_snapshot_etag_for_files
 from core_logging import get_logger, log_stage
 from core_metrics import counter as _metric_counter
+from core_http.client import get_http_client
 from core_config import get_settings
 
-# ── optional Redis cache for snapshot_etag, field-catalog, etc. ─────────────
-import redis, time
-
 _CACHE_TTL = 60  # seconds
+_REDIS_WARNED = False  # ensure we only emit one structured error log
 
 def _redis():
+    global _REDIS_WARNED
     try:
         return redis.Redis.from_url(get_settings().redis_url)
-    except Exception:
+    except (RedisError, ValueError) as e:
+        if not _REDIS_WARNED:
+            # Structured, one-time observability for optional cache outage
+            log_stage(
+                get_logger("ingest.watcher"), "ingest", "redis_unavailable",
+                error=str(e), request_id="watcher_boot"
+            )
+            _REDIS_WARNED = True
         return None
 
 def _cache_get(key: str):
@@ -38,7 +44,13 @@ def _cache_set(key: str, value, ttl: int = _CACHE_TTL):
     if not r:
         return
     _metric_counter("cache_write_total", 1, service="ingest")
-    r.setex(key, ttl, jsonx.dumps(value))
+    try:
+        r.setex(key, ttl, jsonx.dumps(value))
+    except RedisError as e:
+        log_stage(
+            logger, "ingest", "redis_set_failed",
+            error=str(e), request_id="watcher_boot"
+        )
 
 # Initialize structured logger with ingest service context
 logger = get_logger("ingest.watcher")
@@ -83,6 +95,39 @@ class SnapshotWatcher:
                 file_count=len(self._collect_files()),
             )
             setattr(self.app.state, "snapshot_etag", etag)
+            # -------- Prewarm hook (deterministic, config-driven) -------
+            path = os.getenv("PREWARM_TOPK_PATH", os.path.join("policy", "prewarm.json"))
+            anchors: list[str] = []
+            policy_headers: dict[str, str] = {}
+            try:
+                if Path(path).exists():
+                    data = jsonx.loads(Path(path).read_text(encoding="utf-8"))
+                    anchors = list((data or {}).get("anchors") or [])
+                    policy_headers = dict((data or {}).get("policy_headers") or {})
+                else:
+                    log_stage(logger, "prewarm", "config_missing", path=path, request_id=etag)
+            except (OSError, ValueError) as e:
+                log_stage(logger, "prewarm", "config_read_failed", path=path, error=str(e), request_id=etag)
+                anchors, policy_headers = [], {}
+            if anchors:
+                gw = getattr(get_settings(), "gateway_url", None)
+                if gw:
+                    async def _prewarm_async():
+                        client = get_http_client(timeout_ms=1500)
+                        resp = await client.post(
+                            f"{gw}/v2/prewarm",
+                            json={"anchors": anchors, "policy_headers": policy_headers},
+                        )
+                        status = int(getattr(resp, "status_code", 0) or 0)
+                        if status < 300:
+                            log_stage(logger, "prewarm", "enqueued", count=len(anchors), request_id=etag)
+                        else:
+                            log_stage(logger, "prewarm", "enqueue_failed", status=status, request_id=etag)
+                    try:
+                        asyncio.get_running_loop().create_task(_prewarm_async())
+                    except RuntimeError:
+                        # No running loop (e.g., unit tests): run synchronously
+                        asyncio.run(_prewarm_async())
             self._last_etag = etag
         return etag
 

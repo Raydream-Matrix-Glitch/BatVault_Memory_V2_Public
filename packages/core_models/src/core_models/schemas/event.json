@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/event.json",
+  "title": "Event (node)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "type": {
+      "const": "EVENT"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+     },
+    "domain": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["low","medium","high"]
+    },
+    "decision_ref": {
+      "type": "string",
+      "description": "Reference \"<domain>#<decision_id>\"; when present & resolvable, Ingest creates ALIAS_OF (Event → Decision).",
+      "pattern": "^([a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*)#[a-z0-9._:-]+$"
+    },
+    "x-extra": { "type": "object" }
+  },
+  "required": ["id", "type", "title", "domain", "timestamp"]
+}

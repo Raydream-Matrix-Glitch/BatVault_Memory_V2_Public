@@ -10,7 +10,8 @@
     "test": "vitest run",
     "test:watch": "vitest watch",
     "test:e2e": "playwright test",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "codegen:types": "mkdir -p src/types/generated && npx --yes json-schema-to-typescript ../packages/core_models/src/core_models/schemas/memory.graph_view.json > src/types/generated/memory.graph_view.d.ts && npx --yes json-schema-to-typescript ../packages/core_models/src/core_models/schemas/bundles.exec_summary.json > src/types/generated/bundles.exec_summary.d.ts"
   },
   "dependencies": {
     "@mantine/core": "^8.1.1",
@@ -52,6 +53,7 @@
     "@vitejs/plugin-react": "^4.0.0",
     "@vitest/coverage-v8": "^1.4.0",
     "autoprefixer": "^10.4.21",
+    "json-schema-to-typescript": "^13.1.1",
     "eslint": "^9.30.1",
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",

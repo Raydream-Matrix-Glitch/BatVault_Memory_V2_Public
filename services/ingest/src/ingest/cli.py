@@ -1,381 +1,122 @@
-import sys, os, glob, re, time, argparse, hashlib, platform
-from importlib import resources 
-from jsonschema import Draft202012Validator, FormatChecker
-from core_logging import get_logger, log_stage, trace_span, log_event
-from core_observability.otel import setup_tracing
-from core_utils import compute_snapshot_etag_for_files, slugify_id, jsonx
-from core_storage import ArangoStore
+import sys, os, argparse, json, glob, hashlib
+from pathlib import Path
+from json import JSONDecodeError
+from typing import Dict, Any
+from core_logging import get_logger, log_stage, trace_span, set_snapshot_etag
+from core_utils.snapshot import compute_snapshot_etag_for_files
 from core_config import get_settings
-from .pipeline.normalize import normalize_decision, normalize_event, normalize_transition, normalize_alias_edge, derive_backlinks
-from .pipeline.snippet_enricher import enrich_all as enrich_snippets
-from .pipeline.graph_upsert import upsert_all
-from .catalog.field_catalog import build_field_catalog, build_relation_catalog
+from core_storage import ArangoStore
+from ingest.pipeline.graph_upsert import upsert_pipeline
+if os.getenv("BATVAULT_INGEST_PROCESS") != "1":
+    print("ERROR: BATVAULT_INGEST_PROCESS=1 required for ingest environment", file=sys.stderr)
+    sys.exit(2)
+from ingest.pipeline.normalize import normalize_once
 
-
-logger = get_logger("ingest-cli")
-log_event(logger, "json_parser_selected", parser="core_utils.jsonx", fallback=False)
-log_event(logger, "json_parser_runtime", parser="core_utils.jsonx",
-          orjson_present=bool(getattr(jsonx, "_orjson", None)),
-          python=platform.python_version(), jsonx_module=getattr(jsonx, "__file__", None))
-settings = get_settings()
-
-# ------------------------------------------------------------------
-#  Public regex constants needed by the contract-tests
-# ------------------------------------------------------------------
-
-ID_RE = re.compile(r"^[a-z0-9][a-z0-9-_]{2,}[a-z0-9]$")
-TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$")
-
-# ---------- Alias map (extend as needed) ----------
-ALIASES = {
-    "id": ["id", "_id", "key"],
-    "timestamp": ["timestamp", "ts", "updated_at"],
-    "option": ["option", "title", "decision", "choice"],
-    "rationale": ["rationale", "why", "reasoning"],
-    "summary": ["summary", "headline"],
-    "description": ["description", "content", "text", "body"],
-    "supported_by": ["supported_by", "evidence", "events"],
-    "based_on": ["based_on", "basedOn", "sources"],
-    "transitions": ["transitions", "links"],
-    "from": ["from", "src", "source", "decision", "decision_id", "from_id"],
-    "to": ["to", "dst", "target", "event", "event_id", "to_id"],
-    "relation": ["relation", "rel"],
-    "tags": ["tags", "labels"],
-}
-
-def pick_alias(doc: dict, key: str):
-    for k in ALIASES.get(key, [key]):
-        if k in doc:
-            return doc[k], k
-    return None, None
-
-def canonicalize(doc: dict, kind_hint: str | None = None) -> tuple[dict, dict]:
-    """
-    Returns (canon_doc, alias_hits) where canon_doc has canonical keys populated
-    from the first alias present; original fields are retained.
-    """
-    out = dict(doc)
-    hits: dict[str, str] = {}
-    alias_map = dict(ALIASES)
-    if kind_hint == "alias_edge":
-        # Accept decision/event endpoint names for projections
-        alias_map["relation"] = ["relation", "rel", "kind"]
-        alias_map["from"] = ["from", "src", "source", "decision", "decision_id", "from_id"]
-        alias_map["to"]   = ["to", "dst", "target", "event", "event_id", "to_id"]
-    for k in alias_map.keys():
-        if k in out:
-            continue
-        for candidate in alias_map.get(k, [k]):
-            if candidate in doc:
-                val, used = doc[candidate], candidate
-                break
-        else:
-            val, used = (None, None)
-        if used is not None:
-            out[k] = val
-            hits[k] = used
-    return out, hits
-
-def _coerce_alias_edge_values(doc: dict) -> dict:
-    """
-    Coerce common alias-edge variants *before* schema validation.
-    - type: alias_event|alias|ALIAS|alias-of|alias_of -> ALIAS_OF
-    - relation: alias|ALIAS|alias-of|alias_of -> alias_of
-    """
-    out = dict(doc)
-    t = str(out.get("type") or "").strip().lower()
-    if t in ("alias_event", "alias", "alias-of", "alias_of"):
-        out["type"] = "ALIAS_OF"
-    r = str(out.get("relation") or "").strip().lower()
-    if r in ("alias", "alias-of", "alias_of"):
-        out["relation"] = "alias_of"
-        out.setdefault("type", "ALIAS_OF")
-    return out
-
-def load_schema(name: str) -> dict:
-    """
-    Works both from the repo **and** once the package is installed in site-packages.
-    """
-    pkg = "ingest.schemas.json_v2"
-    path = resources.files(pkg).joinpath(f"{name}.schema.json")
-    # Parse using the canonical JSON loader for deterministic handling.
-    # Fail closed in case of schema parse errors (validator will catch later).
-    try:
-        return jsonx.loads(path.read_bytes())
-    except Exception as e:
-        log_stage(logger, "ingest", "schema_parse_error",
-                  schema=name, error=str(e))
-        return {}
-
-SC_DECISION = load_schema("decision")
-SC_EVENT = load_schema("event")
-SC_TRANSITION = load_schema("transition")
-SC_ALIAS_EDGE = load_schema("alias_edge")
-
-_FORMAT_CHECKER = FormatChecker()
-V_DECISION   = Draft202012Validator(SC_DECISION,   format_checker=_FORMAT_CHECKER)
-V_EVENT      = Draft202012Validator(SC_EVENT,      format_checker=_FORMAT_CHECKER)
-V_TRANSITION = Draft202012Validator(SC_TRANSITION, format_checker=_FORMAT_CHECKER)
-V_ALIAS_EDGE = Draft202012Validator(SC_ALIAS_EDGE, format_checker=_FORMAT_CHECKER)
-
-def _infer_kind_raw(path: str, doc: dict) -> str | None:
-    p = path.replace("\\", "/")
-    t = str(doc.get("type") or "").strip()
-    r = str(doc.get("relation") or "").strip()
-    if ("edges/aliases" in p) or (t.upper() == "ALIAS_OF") or (r.lower() == "alias_of") or (t.lower() in ("alias_event","alias","alias-of","alias_of")):
-        return "alias_edge"
-    if all(k in doc for k in ("from", "to")) and any(k in doc for k in ("relation", "rel", "type")):
-        return "transition"
-    if "option" in doc:
-        return "decision"
-    if ("summary" in doc) or ("description" in doc):
-        return "event"
-    return None
-
-def validate_doc(doc: dict, kind: str, path: str) -> list[str]:
-    v = {"decision": V_DECISION, "event": V_EVENT, "transition": V_TRANSITION, "alias_edge": V_ALIAS_EDGE}[kind]
-    errs = [f"{path}: {e.message}" for e in sorted(v.iter_errors(doc), key=lambda e: e.path)]
-    return errs
-
-def seed(path: str) -> int:
-    # Recursively gather all JSON fixtures from nested subfolders
-    files = sorted(
-        glob.glob(os.path.join(path, "**", "*.json"), recursive=True)
-    )
-    if not files:
-        # strategic structured logging for fast triage.  Avoid printing to stderr
-        # here – structured logs are sufficient for triage.
-        log_stage(
-            logger,
-            "ingest",
-            "fixture_scan_empty",
-            search_path=os.path.abspath(path),
-            deterministic_id=slugify_id(os.path.abspath(path)),
-        )
-        return 1
-
-    raw_decisions, raw_events, raw_transitions, raw_alias_edges = {}, {}, {}, {}
-    errors = []
-    alias_stats = {"hits": 0, "docs": 0}
-    for p in files:
-        try:
-            with open(p, "rb") as fh:
-                doc = jsonx.loads(fh.read())
-        except Exception as e:
-            # Structured parse error with cross-impl (orjson/stdlib) support
-            line = getattr(e, "lineno", getattr(e, "line", None))
-            col  = getattr(e, "colno",  getattr(e, "col",  None))
-            msg  = getattr(e, "msg", str(e))
-            err_type = f"{e.__class__.__module__}.{e.__class__.__name__}"
-            pretty = f"{p}:{line}:{col}: json error {msg}" if (line and col) else f"{p}: json error {msg}"
-            errors.append(pretty)
-            log_stage(
-                logger, "ingest", "fixture_parse_error",
-                path=p, error=msg, error_type=err_type, line=line, col=col, parser="core_utils.jsonx",
-                deterministic_id=_stable_id(p),
-            )
-            continue
-        # Canonicalize aliases BEFORE kind inference and schema validation
-        pre_kind = _infer_kind_raw(p, doc)
-        doc, hits = canonicalize(doc, pre_kind)
-        if pre_kind == "alias_edge":
-            before_t, before_r = doc.get("type"), doc.get("relation")
-            doc = _coerce_alias_edge_values(doc)
-            after_t, after_r = doc.get("type"), doc.get("relation")
-            if (before_t, before_r) != (after_t, after_r):
-                log_stage(logger, "ingest", "alias_edge_coerced",
-                          path=p, type_before=before_t, type_after=after_t,
-                          relation_before=before_r, relation_after=after_r)
-        alias_stats["docs"] += 1
-        alias_stats["hits"] += len(hits)
-        kind = doc.get("kind") or (
-            "alias_edge" if (("edges/aliases" in p.replace("\\", "/")) or (str(doc.get("type")).upper() == "ALIAS_OF") or (str(doc.get("relation")).lower() == "alias_of"))
-            else "transition" if all(k in doc for k in ("from","to","relation"))
-            else "decision" if "option" in doc
-            else "event" if ("summary" in doc or "description" in doc)
-            else None
-        )
-        if kind not in ("decision","event","transition","alias_edge"):
-            errors.append(f"{p}: cannot infer kind (expected decision/event/transition/alias_edge)"); continue
-        # Validate canonicalized doc against v2 schema
-        errors.extend(validate_doc(doc, kind, p))
-        if kind == "decision": raw_decisions[doc["id"]] = doc
-        elif kind == "event": raw_events[doc["id"]] = doc
-        elif kind == "transition": raw_transitions[doc["id"]] = doc
-        elif kind == "alias_edge": raw_alias_edges[doc["id"]] = doc
-        else: errors.append(f"{p}: cannot infer kind (unknown)")
-
-    if errors:
-        # Emit validation and parse errors via structured logging; do not print to stderr.
-        for e in errors:
-            log_stage(logger, "ingest", "validation_error", error=e)
-        return 2
-
-    t0 = time.perf_counter()
-    log_stage(logger, "ingest", "pre_normalization_snapshot",
-              files=len(files), alias_docs=alias_stats["docs"], alias_hits=alias_stats["hits"])
-
-    # Normalize
-    decisions = {k: normalize_decision(v) for k, v in raw_decisions.items()}
-    events = {k: normalize_event(v) for k, v in raw_events.items()}
-    transitions = {k: normalize_transition(v) for k, v in raw_transitions.items()}
-    alias_edges = {k: normalize_alias_edge(v) for k, v in raw_alias_edges.items()}
-
-    # Enrich (deterministic) — precompute node-level `snippet`
-    enrich_snippets(decisions, events, transitions)
-
-    # Referential integrity checks (fail fast with clear messages)
-    ri_errors = []
-    for e in events.values():
-        for did in e.get("led_to", []):
-            if did not in decisions:
-                ri_errors.append(f"event {e['id']} -> missing decision '{did}'")
-    for t in transitions.values():
-        if t.get("from") not in decisions:
-            ri_errors.append(f"transition {t['id']} from missing decision '{t.get('from')}'")
-        if t.get("to") not in decisions:
-            ri_errors.append(f"transition {t['id']} to missing decision '{t.get('to')}'")
-    for a in alias_edges.values():
-        if a.get("from") not in decisions:
-            ri_errors.append(f"alias_edge {a['id']} from missing decision '{a.get('from')}'")
-        if a.get("to") not in events:
-            ri_errors.append(f"alias_edge {a['id']} to missing event '{a.get('to')}'")
-    if ri_errors:
-        for m in ri_errors:
-            log_stage(logger, "ingest", "ri_error", error=m)
-        return 3
-
-    snapshot_etag = compute_snapshot_etag_for_files(files)
-    dt_ms = int((time.perf_counter() - t0) * 1000)
-    log_stage(logger, "ingest", "post_normalization_snapshot",
-              snapshot_etag=snapshot_etag,
-              decisions=len(decisions), events=len(events), transitions=len(transitions),
-              latency_ms=dt_ms)
-
-    # Upsert to Arango
-    store = ArangoStore(settings.arango_url, settings.arango_root_user, settings.arango_root_password,
-                        settings.arango_db, settings.arango_graph_name,
-                        settings.arango_catalog_collection, settings.arango_meta_collection)
-    upsert_all(store, decisions, events, transitions, alias_edges, snapshot_etag)
-    store.set_snapshot_etag(snapshot_etag)
-
-    # ---------- 🎯  content-addressable batch snapshot (spec §D) ----------
-    from core_storage.minio_utils import ensure_bucket
-    import minio, io, gzip, datetime as _dt
-    minio_client = minio.Minio(settings.minio_endpoint,
-                               access_key=settings.minio_access_key,
-                               secret_key=settings.minio_secret_key,
-                               secure=False)
-    ensure_bucket(minio_client, "batvault-snapshots", 30)
-    blob = gzip.compress(
-        jsonx.dumps(
-            {
-                "decisions": decisions,
-                "events": events,
-                "transitions": transitions,
-                "alias_edges": alias_edges,
-                "snapshot_etag": snapshot_etag,
-            }
-        ).encode("utf-8")
-    )
-    obj_name = f"{snapshot_etag}.json.gz"
-    minio_client.put_object("batvault-snapshots", obj_name,
-                            io.BytesIO(blob), length=len(blob),
-                            content_type="application/gzip")
-    log_stage(logger, "artifacts", "snapshot_uploaded",
-              bucket="batvault-snapshots", object=obj_name, size=len(blob))
-
-    # --------------------  sweep out stale docs  -------------------
-    removed_nodes, removed_edges = store.prune_stale(snapshot_etag)
-    log_stage(
-        logger,
-        "ingest",
-        "prune_stale",
-        snapshot_etag=snapshot_etag,
-        removed_nodes=removed_nodes,
-        removed_edges=removed_edges,
-    )
-
-    # Catalogs
-    fields = build_field_catalog(decisions, events, transitions)
-    rels = build_relation_catalog()
-    store.set_field_catalog(fields); store.set_relation_catalog(rels)
-
-    log_stage(logger, "ingest", "seed_persist_ok",
-              snapshot_etag=snapshot_etag,
-              fields=len(fields), relations=len(rels))
-
-    # --- Final strategic summary for dashboards/audit -------------------
-    dt_total_ms = int((time.perf_counter() - t0) * 1000) if 't0' in locals() else None
-    log_stage(
-        logger, "ingest", "batch_completed",
-        ingest_batch_id=_stable_id(snapshot_etag),
-        snapshot_etag=snapshot_etag,
-        files=len(files),
-        decisions=len(decisions), events=len(events), transitions=len(transitions),
-        alias_hits=alias_stats.get("hits", 0),
-        ri_errors=0,
-        removed_nodes=removed_nodes, removed_edges=removed_edges,
-        latency_ms=dt_total_ms,
-    )
-    # Emit the final summary using _jsonx.dumps for stable key ordering.
-    print(jsonx.dumps({"ok": True, "files": len(files), "snapshot_etag": snapshot_etag}))
-    return 0
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="ingest-cli",
-        description="Seed Batvault graph from fixture directory",
-    )
-    parser.add_argument("command", choices=["seed"], help="Currently only 'seed' is supported")
-    parser.add_argument("dir", help="Directory that contains decision/event/transition JSON files")
-    parser.add_argument(
-        "--arango-url",
-        help="Override the ARANGO_URL env var for this run "
-             "(e.g. --arango-url http://localhost:8529)",
-    )
-    args = parser.parse_args()
-    # Initialise tracing for CLI runs (no-op if OTEL not installed)
-    try:
-        setup_tracing('ingest-cli')
-    except Exception:
-        pass
-
-    # ------------------------------------------------------------------
-    #  Strategic logging – resolved Arango URL
-    # ------------------------------------------------------------------
-    if args.arango_url:
-        settings.arango_url = args.arango_url        # runtime override
-        logger.info(
-            "override_arango_url",
-            extra={
-                "stage": "ingest",
-                "arango_url": settings.arango_url,
-                "deterministic_id": _stable_id(settings.arango_url),
-            },
-        )
-    else:
-        logger.info(
-            "resolved_arango_url",
-            extra={
-                "stage": "ingest",
-                "arango_url": settings.arango_url,
-                "deterministic_id": _stable_id(settings.arango_url),
-            },
-        )
-    
-    if args.command == "seed":
-        with trace_span('ingest_cli', stage='cli', command=args.command, dir=args.dir):
-            sys.exit(seed(args.dir))
-
-
-# ------------------------------------------------------------------
-#  helpers
-# ------------------------------------------------------------------
+logger = get_logger("ingest.cli")
 
 def _stable_id(value: str) -> str:
-    """Return an 8‑char deterministic slug for log correlation."""
     return hashlib.sha1(value.encode()).hexdigest()[:8]
+
+def _load_json_files(dir_path: Path) -> tuple[list[dict], list[dict]]:
+    nodes, edges = [], []
+    for path in sorted(dir_path.glob("*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (JSONDecodeError, OSError) as e:
+            raise SystemExit(f"Failed to parse {path}: {e}")
+        def _is_node(obj: dict) -> bool:
+            t = (obj.get("type") or "").upper()
+            return t in ("DECISION","EVENT")
+        def _is_edge(obj: dict) -> bool:
+            t = (obj.get("type") or "").upper()
+            return t in ("LED_TO","CAUSAL","ALIAS_OF")
+
+        if isinstance(data, dict):
+            if _is_node(data):
+                nodes.append(data)
+            elif _is_edge(data):
+                edges.append(data)
+        elif isinstance(data, list):
+            for obj in data:
+                if _is_node(obj):
+                    nodes.append(obj)
+                elif _is_edge(obj):
+                    edges.append(obj)
+    return nodes, edges
+
+def run_dir(dir_path: str) -> int:
+    p = Path(dir_path)
+    if not p.exists():
+        raise SystemExit(f"Directory not found: {dir_path}")
+    nodes, edges = _load_json_files(p)
+    snapshot_etag = compute_snapshot_etag_for_files([str(x) for x in p.glob("*.json")])
+    set_snapshot_etag(snapshot_etag)
+    log_stage(logger, "ingest", "cli_start", snapshot_etag=snapshot_etag,
+              node_count=len(nodes), edge_count=len(edges))
+    # Normalize once
+    nodes, edges = normalize_once(nodes, edges)
+
+    # Storage + upsert
+    # Silence Arango bootstrap logs by default (opt-in via ARANGO_BOOTSTRAP_VERBOSE=1)
+    os.environ.setdefault("ARANGO_BOOTSTRAP_VERBOSE", "0")
+    store = ArangoStore(lazy=True)
+    # Optional deterministic pruning to avoid (domain,id) unique-index 409s on reseed
+    if os.getenv("ARANGO_PRUNE_BEFORE_UPSERT", "1") == "1":
+        with trace_span("ingest.cli.prune", stage="ingest"):
+            n_nodes, n_edges = store.prune_stale(snapshot_etag)
+        log_stage(logger, "ingest", "pruned", snapshot_etag=snapshot_etag,
+                  nodes_removed=int(n_nodes), edges_removed=int(n_edges))
+    with trace_span("ingest.cli.upsert", stage="ingest"):
+        summary: Dict[str, Any] = upsert_pipeline(store, nodes, edges, snapshot_etag=snapshot_etag)
+    # Persist the new snapshot to meta for read preconditions (Memory reads this)
+    try:
+        store.set_snapshot_etag(snapshot_etag)
+    except (OSError, RuntimeError, ValueError) as e:
+        # Fail-fast: snapshot must be persisted for 412 preconditions
+        print(f"ERROR: failed to persist snapshot_etag: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # ------ Emit a deterministic final summary event (and one stdout line) ------
+    nw = int((summary.get("nodes") or {}).get("written", 0))
+    nr = int((summary.get("nodes") or {}).get("rejected", 0))
+    ew = int((summary.get("edges") or {}).get("written", 0))
+    er = int((summary.get("edges") or {}).get("rejected", 0))
+    alias_rej = int(len(summary.get("alias_rejected") or []))
+    sens_applied = int(summary.get("sensitivity_applied") or 0)
+    log_stage(
+        logger, "ingest", "seed_summary",
+        snapshot_etag=snapshot_etag,
+        nodes_in=len(nodes), nodes_written=nw, nodes_rejected=nr,
+        edges_in=len(edges), edges_written=ew, edges_rejected=er,
+        alias_rejected=alias_rej, sensitivity_applied=sens_applied,
+    )
+    # human-friendly line for scripts/CI that don’t parse structured logs
+    print(
+        f"Seeded snapshot {snapshot_etag}: "
+        f"nodes(w={nw},r={nr}/{len(nodes)}) edges(w={ew},r={er}/{len(edges)}); "
+        f"alias_rejected={alias_rej} sensitivity_applied={sens_applied}"
+    )
+    log_stage(logger, "ingest", "completed", snapshot_etag=snapshot_etag)
+    return 0
+
+def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    ap = argparse.ArgumentParser("ingest")
+    ap.add_argument("dir", help="Directory containing JSON nodes/edges.")
+    if argv and argv[0] in ("seed", "load", "upsert"):
+        argv = argv[1:]
+    args = ap.parse_args(argv)
+    try:
+        rc = run_dir(args.dir)
+    except SystemExit:
+        # Preserve non-zero exit
+        raise
+    except (ValueError, RuntimeError, OSError) as e:
+        # Fail fast on first error
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(rc)
 
 if __name__ == "__main__":
     main()

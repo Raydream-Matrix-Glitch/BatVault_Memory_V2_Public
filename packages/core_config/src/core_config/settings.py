@@ -1,9 +1,11 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from typing import Any, Optional
 from core_config.constants import (
     TIMEOUT_SEARCH_MS,
     TIMEOUT_EXPAND_MS,
     TIMEOUT_ENRICH_MS,
+    TTL_EVIDENCE_CACHE_SEC,
 )
 
 class Settings(BaseSettings):
@@ -47,9 +49,17 @@ class Settings(BaseSettings):
     embedding_dim: int = Field(default=768, alias="EMBEDDING_DIM")
     vector_metric: str = Field(default="cosine", alias="VECTOR_METRIC")
     faiss_nlists: int = Field(default=100, alias="FAISS_NLISTS")
-    # ---------------- Milestone‑3 additions ----------------
-    # Evidence bundle cache TTL (15 min default per spec §H3)
-    cache_ttl_evidence_sec: int = Field(default=900, alias="CACHE_TTL_EVIDENCE")
+
+    # Sensitivity ordering (most restrictive wins). Accepts comma string via env.
+    sensitivity_order_raw: str = Field(default="low,medium,high", alias="SENSITIVITY_ORDER")
+    @property
+    def sensitivity_order(self) -> list[str]:  # noqa: D401
+        """Ordering of sensitivity levels, least→most restrictive."""
+        try:
+            return [x.strip() for x in (self.sensitivity_order_raw or "").split(",") if x.strip()]
+        except Exception:
+            return ["low", "medium", "high"]
+
     # Prompt & selector sizing (spec §M4)
     max_prompt_bytes: int = Field(default=8192, alias="MAX_PROMPT_BYTES")
     selector_truncation_threshold: int = Field(default=6144, alias="SELECTOR_TRUNCATION_THRESHOLD")
@@ -62,8 +72,6 @@ class Settings(BaseSettings):
     arango_meta_collection: str = Field(default="meta", alias="ARANGO_META_COLLECTION")
 
     # Redis
-    cache_ttl_expand_sec: int = Field(default=60, alias="CACHE_TTL_EXPAND")   # spec §H3
-    cache_ttl_resolve_sec: int = Field(default=300, alias="CACHE_TTL_RESOLVER")
     redis_url: str = Field(default="redis://redis:6379/0", alias="REDIS_URL")
 
     # MinIO
@@ -80,6 +88,12 @@ class Settings(BaseSettings):
     memory_api_url: str = Field(
         default="http://memory_api:8000", alias="MEMORY_API_URL"
     )
+    # OPA (optional; externalize policy decisions)
+    opa_url: Optional[str] = Field(default=None, alias="OPA_URL")
+    opa_decision_path: str = Field(default="/v1/data/batvault/decision", alias="OPA_DECISION_PATH")
+    opa_timeout_ms: int = Field(default=1000, alias="OPA_TIMEOUT_MS")
+    # If provided, becomes the authoritative policy_fp when using OPA bundles.
+    opa_bundle_sha: Optional[str] = Field(default=None, alias="OPA_BUNDLE_SHA")
 
     # LLM / embeddings
     llm_mode: str = Field(default="off", alias="LLM_MODE")
@@ -88,12 +102,25 @@ class Settings(BaseSettings):
     query_llm_mode: str = Field(default="auto", alias="QUERY_LLM_MODE")
     enable_embeddings: bool = Field(default=False, alias="ENABLE_EMBEDDINGS")
 
+    # If true, Gateway attempts a semantic rerank of BM25 candidates.
+    rerank_enable: bool = Field(default=False, alias="RERANK_ENABLE")
+    # Margin threshold for “confident top-1” (see ai_retrieval.md).
+    rerank_margin: float = Field(default=1e-6, alias="RERANK_MARGIN")
+    # How many BM25 candidates to consider before optional rerank.
+    resolver_top_k: int = Field(default=24, alias="RESOLVER_TOP_K")
+    # Cross-encoder model id (HF hub or local path).
+    cross_encoder_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2", alias="CROSS_ENCODER_MODEL")
+    # Rerank only when candidate count is small (2..RERANK_PAIR_MAX).
+    rerank_pair_max: int = Field(default=10, alias="RERANK_PAIR_MAX")
+    # Hard budget for rerank scoring (milliseconds).
+    rerank_timeout_ms: int = Field(default=50, alias="RERANK_TIMEOUT_MS")
+
     # Evidence heuristics
     enable_day_summary_dedup: bool = Field(default=False, alias="ENABLE_DAY_SUMMARY_DEDUP")
     # Answer shaping
     answer_char_cap: int = Field(default=420, alias="ANSWER_CHAR_CAP")
     answer_sentence_cap: int = Field(default=3, alias="ANSWER_SENTENCE_CAP")
-    because_event_count: int = Field(default=2, alias="BECAUSE_EVENT_COUNT")
+    because_event_count: int = Field(default=3, alias="BECAUSE_EVENT_COUNT")
 
     # Canonical answer budgets (prefer these; legacy kept for back-compat)
     short_answer_max_chars: int = Field(default=320, alias="SHORT_ANSWER_MAX_CHARS")
@@ -108,11 +135,9 @@ class Settings(BaseSettings):
     timeout_search_ms: int = Field(default=TIMEOUT_SEARCH_MS,  alias="TIMEOUT_SEARCH_MS")
     timeout_expand_ms: int = Field(default=TIMEOUT_EXPAND_MS,  alias="TIMEOUT_EXPAND_MS")
     timeout_enrich_ms: int = Field(default=TIMEOUT_ENRICH_MS,  alias="TIMEOUT_ENRICH_MS")
-    # Canary & LLM routing
-    canary_header_override: str = Field(default="", alias="CANARY_HEADER_OVERRIDE")
-    canary_pct: int = Field(default=0, alias="CANARY_PCT")
-    canary_enabled: bool = Field(default=True, alias="CANARY_ENABLED")
-    canary_model_endpoint: str = Field(default="http://tgi-canary:8090", alias="CANARY_MODEL_ENDPOINT")
+    # LLM routing
+    # Primary endpoint (preferred).
+    llm_endpoint: str | None = Field(default=None, alias="LLM_ENDPOINT")
     control_model_endpoint: str = Field(default="http://vllm-control:8010", alias="CONTROL_MODEL_ENDPOINT")
     llm_temperature: float = Field(default=0.0, alias="LLM_TEMPERATURE")
     llm_max_tokens: int = Field(default=512, alias="LLM_MAX_TOKENS")
@@ -143,6 +168,32 @@ class Settings(BaseSettings):
     # LLM metadata / adapters
     vllm_model_name: str | None = Field(default=None, alias="VLLM_MODEL_NAME")
     cross_encoder_model: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2", alias="CROSS_ENCODER_MODEL")
+
+    # --- Back-compat shim (temporary) ---
+    # If LLM_ENDPOINT is not provided, fall back to CONTROL_MODEL_ENDPOINT.
+    def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
+        try:
+            if not self.llm_endpoint:
+                object.__setattr__(self, "llm_endpoint", self.control_model_endpoint)
+        except Exception:
+            # Best-effort; leave defaults as-is on failure.
+            pass
+
+    # ── Back-compat shims (TTL envs removed; constants only) ─────────────
+    @property
+    def cache_ttl_evidence_sec(self) -> int:  # noqa: D401
+        """DEPRECATED: use core_config.constants.TTL_EVIDENCE_CACHE_SEC; env ignored."""
+        return int(TTL_EVIDENCE_CACHE_SEC)
+
+    @property
+    def cache_ttl_expand_sec(self) -> int:  # noqa: D401
+        """DEPRECATED: expand TTL no longer env-driven; fixed constant for compat."""
+        return 60
+
+    @property
+    def cache_ttl_resolve_sec(self) -> int:  # noqa: D401
+        """DEPRECATED: resolve TTL no longer env-driven; fixed constant for compat."""
+        return 300
 
 def get_settings() -> "Settings":
     return Settings()  # type: ignore

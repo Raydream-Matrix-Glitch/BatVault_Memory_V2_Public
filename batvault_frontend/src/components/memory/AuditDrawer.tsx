@@ -10,6 +10,7 @@ import type {
   EvidenceBundle,
   WhyDecisionAnswer,
 } from "../../types/memory";
+import type { GraphEdge } from "../../types/memory";
 
 export interface AuditDrawerProps {
   /**
@@ -143,8 +144,15 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
   // Prefer top-level fields; fall back to evidence_metrics (what the gateway emits today)
   const dropped = meta?.dropped_evidence_ids ?? (meta as any)?.evidence_metrics?.dropped_evidence_ids ?? [];
   const selectorScores = meta?.selector_scores ?? (meta as any)?.evidence_metrics?.selector_scores ?? {};
-  const preceding = (evidence as any)?.transitions?.preceding ?? [];
-  const succeeding = (evidence as any)?.transitions?.succeeding ?? [];
+  // v3 relations from oriented edges (CAUSAL only)
+  const anchorId: string | undefined = (evidence as any)?.anchor?.id;
+  const edges: GraphEdge[] = ((evidence as any)?.graph?.edges) || [];
+  const precedingIds = (edges || [])
+    .filter(e => e.type === "CAUSAL" && e.orientation === "preceding" && e.to === anchorId)
+    .map(e => e.from);
+  const succeedingIds = (edges || [])
+    .filter(e => e.type === "CAUSAL" && e.orientation === "succeeding" && e.from === anchorId)
+    .map(e => e.to);
 
   // Determine classes for drawer visibility. The drawer is positioned off‑canvas
   // on the right when closed and slides into view when `open` is true. It
@@ -410,27 +418,27 @@ const AuditDrawer: React.FC<AuditDrawerProps> = ({
                 </table>
               </div>
             )}
-            {/* Transitions (preceding/succeeding) */}
-            {(preceding.length > 0 || succeeding.length > 0) && (
+            {/* Relations from oriented edges (preceding/succeeding) */}
+            {(precedingIds.length > 0 || succeedingIds.length > 0) && (
               <div className="mt-4">
-                <h4 className="text-sm font-semibold text-vaultred mb-1">Transitions</h4>
+                <h4 className="text-sm font-semibold text-vaultred mb-1">Relations</h4>
                 <div className="grid grid-cols-2 gap-4 text-xs">
                   <div>
-                    <div className="font-semibold mb-1">Preceding ({preceding.length})</div>
-                    {preceding.length ? (
+                    <div className="font-semibold mb-1">Preceding ({precedingIds.length})</div>
+                    {precedingIds.length ? (
                       <ul className="list-disc list-inside space-y-1">
-                        {preceding.map((t: any) => (
-                          <li key={t.id} className="font-mono break-all">{t.id}</li>
+                        {precedingIds.map((id: string) => (
+                          <li key={id} className="font-mono break-all">{id}</li>
                         ))}
                       </ul>
                     ) : <div className="opacity-70">None</div>}
                   </div>
                   <div>
-                    <div className="font-semibold mb-1">Succeeding ({succeeding.length})</div>
-                    {succeeding.length ? (
+                    <div className="font-semibold mb-1">Succeeding ({succeedingIds.length})</div>
+                    {succeedingIds.length ? (
                       <ul className="list-disc list-inside space-y-1">
-                        {succeeding.map((t: any) => (
-                          <li key={t.id} className="font-mono break-all">{t.id}</li>
+                        {succeedingIds.map((id: string) => (
+                          <li key={id} className="font-mono break-all">{id}</li>
                         ))}
                       </ul>
                     ) : <div className="opacity-70">None</div>}

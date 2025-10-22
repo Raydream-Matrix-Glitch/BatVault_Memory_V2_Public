@@ -1,6 +1,6 @@
 from collections import defaultdict
 from typing import Dict, List, Set
-from core_logging import get_logger, log_stage
+from core_logging import get_logger, log_stage, current_request_id
 
 logger = get_logger("ingest-catalog")
 
@@ -12,19 +12,19 @@ ALIASES: Dict[str, List[str]] = {
     "reason": ["reason", "explanation"],
 }
 
-def _observe_keys(decisions: Dict[str, dict], events: Dict[str, dict], transitions: Dict[str, dict]) -> Dict[str, Set[str]]:
+def _observe_keys(decisions: Dict[str, dict], events: Dict[str, dict]) -> Dict[str, Set[str]]:
     """
     Map canonical_key -> set(observed spellings).
     Canonicalization: lowercase the key for catalog purposes,
     but retain original spellings as synonyms.
     """
     observed: Dict[str, Set[str]] = defaultdict(set)
-    for obj in list(decisions.values()) + list(events.values()) + list(transitions.values()):
+    for obj in list(decisions.values()) + list(events.values()):
         for k in obj.keys():
             observed[k.lower()].add(k)
     return observed
 
-def build_field_catalog(decisions: Dict, events: Dict, transitions: Dict) -> Dict[str, List[str]]:
+def build_field_catalog(decisions: Dict, events: Dict) -> Dict[str, List[str]]:
     """
     Self-learning alias catalog:
       - start from ALIASES
@@ -32,7 +32,7 @@ def build_field_catalog(decisions: Dict, events: Dict, transitions: Dict) -> Dic
       - ensure core keys exist with at least themselves as synonyms
       - deterministic sorting for stability
     """
-    observed = _observe_keys(decisions, events, transitions)
+    observed = _observe_keys(decisions, events)
 
     # Start with baseline aliases and union observed spellings for same canonical key
     catalog: Dict[str, List[str]] = {}
@@ -47,16 +47,32 @@ def build_field_catalog(decisions: Dict, events: Dict, transitions: Dict) -> Dic
 
     # Include core fields if missing
     core = [
-        "id", "timestamp", "supported_by", "led_to",
-        "from", "to", "relation",
+        "id", "type", "timestamp", "domain", "sensitivity", "tags",
+        "from", "to",
         "snippet", "description", "decision_maker",
     ]
     for k in core:
         catalog.setdefault(k, [k])
 
-    log_stage(logger, "catalog", "field_catalog_built",
-              canonical_count=len(catalog), observed_keys=len(observed))
+    log_stage(
+        logger, "catalog", "field_catalog_built",
+        canonical_count=len(catalog), observed_keys=len(observed),
+        request_id=(current_request_id() or "unknown"),
+    )
     return catalog
 
 def build_relation_catalog() -> list[str]:
-    return ["LED_TO", "CAUSAL_PRECEDES", "CHAIN_NEXT", "ALIAS_OF"]
+    """
+    Canonical list of edge types used by ingest/UI.
+    Prefer ontology if available; otherwise provide a safe baseline.
+    The legacy 'CAUSAL_PRECEDES' alias must not be surfaced.
+    """
+    try:
+        # Prefer the authoritative source if present
+        from core_models.ontology import EDGE_TYPES  # type: ignore
+        rels = [t for t in list(EDGE_TYPES) if str(t) != "CAUSAL_PRECEDES"]
+    except (ImportError, AttributeError, NameError):
+        # Baseline, conservative set
+        rels = ["ALIAS_OF", "LED_TO", "CAUSAL"]
+    # Deterministic order for stability
+    return sorted(set(map(str, rels)), key=lambda s: (s.lower(), s))

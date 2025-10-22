@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/bundles.trace.json",
+  "title": "Compact Trace (trace.json)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "type": "object", "additionalProperties": true },
+    "gateway_path": { "type": "object", "additionalProperties": true },
+    "response_preview": { "type": "object", "additionalProperties": true },
+    "validator": { "type": "object", "additionalProperties": true }
+  }
+}

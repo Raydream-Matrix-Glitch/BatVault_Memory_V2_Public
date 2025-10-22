@@ -12,6 +12,13 @@ dependencies = [
   # Web framework & ASGI middleware
   "fastapi>=0.112.0",
   "pydantic>=2.7.0",
+  "cryptography>=42.0.0",
+  "PyNaCl>=1.5",
+  "transformers>=4.44.2",
+  "torch>=2.2.0",
+
+  # Time parsing
+  "python-dateutil>=2.9.0",
 
   # Concurrency and networking
   "anyio>=3.7.1",
@@ -44,9 +51,7 @@ dependencies = [
   "core_http",
   "core_metrics",
   "core_utils",
-  "core_validator",
-  "shared",
-  "core_ml",
+  "core_models",
 ]
 
 [project.optional-dependencies]

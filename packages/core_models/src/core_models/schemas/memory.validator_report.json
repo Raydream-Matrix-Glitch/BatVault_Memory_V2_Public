@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/memory.validator_report.json",
+  "title": "Validator Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "pass",
+    "errors",
+    "checks"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "pass": {
+      "type": "boolean"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "code",
+          "msg"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "msg": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "ok"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

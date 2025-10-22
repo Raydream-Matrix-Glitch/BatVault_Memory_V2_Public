@@ -8,8 +8,6 @@ minimal CI runners), we create a tiny in-process stub that fulfils only
 the methods our codebase touches.
 """
 from types import SimpleNamespace
-# re-export shared clients for convenience in tests/call sites
-from .redis import get_redis_pool  # noqa: E402
 from core_http.client import get_http_client       # noqa: E402
 
 try:

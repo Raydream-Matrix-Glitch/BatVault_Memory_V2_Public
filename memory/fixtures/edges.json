@@ -1,0 +1,30 @@
+[
+  {
+    "id": "edge-led-eng-001",
+    "type": "LED_TO",
+    "from": "eng#e-eng-001",
+    "to": "eng#d-eng-010",
+    "timestamp": "2025-08-13T10:00:00Z"
+  },
+  {
+    "id": "edge-led-eng-002",
+    "type": "LED_TO",
+    "from": "eng#e-eng-002",
+    "to": "eng#d-eng-010",
+    "timestamp": "2025-08-14T12:00:00Z"
+  },
+  {
+    "id": "edge-causal-eng-010-011",
+    "type": "CAUSAL",
+    "from": "eng#d-eng-010",
+    "to": "eng#d-eng-011",
+    "timestamp": "2025-09-05T09:30:00Z"
+  },
+  {
+    "id": "edge-led-sales-005",
+    "type": "LED_TO",
+    "from": "sales#e-sales-alias-eng-010",
+    "to": "sales#d-sales-005",
+    "timestamp": "2025-08-20T14:05:00Z"
+  }
+]

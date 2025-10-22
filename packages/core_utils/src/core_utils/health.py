@@ -1,8 +1,8 @@
 """
 core_utils.health – health-check routes for FastAPI services.
 
-Provides attach_health_routes() to wire /healthz and /readyz with
-custom liveness and readiness checks.
+Provides attach_health_routes() to wire /healthz and /readyz with custom
+ liveness and readiness checks. No legacy aliases are exposed.
 """
 
 import asyncio
@@ -61,20 +61,10 @@ def attach_health_routes(app: FastAPI, *, checks: HealthChecks) -> None:
             if isinstance(res, dict):
                 return res
             return {"status": "ok" if bool(res) else "fail"}
-
-        # Back-compat alias some stacks probe
-        @_limit
-        @router.get("/health")
-        async def _health_alias(request: Request):
-            return await _healthz(request)
     else:
         @router.get("/healthz")
         async def _healthz_default(request: Request):
             return {"status": "ok"}
-
-        @router.get("/health")
-        async def _health_alias_default(request: Request):
-            return await _healthz_default(request)
 
     # ── Readiness ───────────────────────────────────────────────────────────
     if "readiness" in checks:
@@ -85,19 +75,9 @@ def attach_health_routes(app: FastAPI, *, checks: HealthChecks) -> None:
             if isinstance(res, dict):
                 return res
             return {"ready": bool(res)}
-
-        # Typo/back-compat alias (some probes use /rdyz by mistake)
-        @_limit
-        @router.get("/rdyz")
-        async def _rdyz_alias(request: Request):
-            return await _readyz(request)
     else:
         @router.get("/readyz")
         async def _readyz_default(request: Request):
             return {"ready": True}
-
-        @router.get("/rdyz")
-        async def _rdyz_alias_default(request: Request):
-            return await _readyz_default(request)
 
     app.include_router(router)

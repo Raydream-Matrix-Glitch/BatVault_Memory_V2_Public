@@ -14,7 +14,7 @@ export interface TokenStreamLineProps {
  */
 const TokenStreamLine: React.FC<TokenStreamLineProps> = ({ tokens }) => (
   <pre className="whitespace-pre-wrap font-mono text-copy">
-    {tokens.join("")}
+    {Array.isArray(tokens) ? tokens.join("") : String(tokens ?? "")}
   </pre>
 );
 

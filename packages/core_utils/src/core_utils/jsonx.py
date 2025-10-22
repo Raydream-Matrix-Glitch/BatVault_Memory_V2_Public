@@ -6,7 +6,7 @@ import os
 # Optional, fast path JSON
 try:
     import orjson as _orjson  # type: ignore
-except Exception:  # pragma: no cover - orjson missing/unavailable
+except ImportError:  # pragma: no cover - orjson missing/unavailable
     _orjson = None
 
 # Optional override to force stdlib json (diagnostics/compat)
@@ -16,7 +16,7 @@ if os.getenv("JSONX_FORCE_STDJSON", "").strip().lower() in ("1","true","yes"):  
 # Optional Pydantic import across v1/v2
 try:
     from pydantic import BaseModel  # type: ignore
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     BaseModel = object  # type: ignore
 
 __all__ = ["dumps", "loads", "sanitize"]
@@ -47,18 +47,18 @@ def sanitize(obj: Any) -> Any:
         # Prefer v2 API, fall back to v1
         try:
             return obj.model_dump(mode="python")  # type: ignore[attr-defined]
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             try:
                 return obj.dict()  # type: ignore[attr-defined]
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 return str(obj)
 
     # Bytes → text
     if isinstance(obj, (bytes, bytearray, memoryview)):
-        try:
-            return (obj.decode("utf-8", "replace") if isinstance(obj, (bytes, bytearray)) else bytes(obj).decode("utf-8", "replace"))
-        except Exception:
-            return str(obj)
+        # 'replace' guarantees decoding won't raise
+        return (obj.decode("utf-8", "replace")
+                if isinstance(obj, (bytes, bytearray))
+                else bytes(obj).decode("utf-8", "replace"))
 
     # Collections
     if isinstance(obj, Mapping):
@@ -71,7 +71,7 @@ def sanitize(obj: Any) -> Any:
         if hasattr(obj, attr):
             try:
                 return getattr(obj, attr)()
-            except Exception:
+            except (TypeError, ValueError):
                 pass
 
     # Last resort
@@ -79,6 +79,16 @@ def sanitize(obj: Any) -> Any:
         return str(obj)
     except Exception:
         return repr(obj)
+    
+def to_jsonable(obj: Any) -> Any:
+    """
+    Canonical JSON-friendly projection used by idempotency and cache keys.
+    Intentional thin alias of `sanitize` for backwards-compatible call-sites.
+    """
+    return sanitize(obj)
+
+__all__.append("to_jsonable")
+
 def dumps(obj: Any) -> str:
     """
     Fast JSON dump that returns a *str* (UTF‑8) and ensures deterministic key ordering.

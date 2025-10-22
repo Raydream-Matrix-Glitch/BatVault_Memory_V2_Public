@@ -1,13 +1,30 @@
 from typing import Any, Dict, List, Optional, Literal
-from pydantic import BaseModel, Field, ConfigDict
+from .ontology import TruncationAction
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 class RequestInfo(BaseModel):
     intent: str
-    anchor_id: Optional[str] = None
+    # Canonical identifier for the decision anchor.  Accept input under
+    # either ``id`` or ``anchor_id`` via field aliases.  When one is
+    # provided the other is automatically mirrored.
+    id: Optional[str] = Field(default=None, alias="anchor_id")
+    anchor_id: Optional[str] = Field(default=None, alias="id")
     request_id: Optional[str] = None
     trace_id: Optional[str] = None
     span_id: Optional[str] = None
     ts_utc: str
+
+    @model_validator(mode="after")
+    def _mirror_ids(self):
+        # Ensure both id and anchor_id attributes reflect the same value.
+        # Whichever is provided takes precedence.
+        if getattr(self, "id", None) and not getattr(self, "anchor_id", None):
+            object.__setattr__(self, "anchor_id", self.id)
+        elif getattr(self, "anchor_id", None) and not getattr(self, "id", None):
+            object.__setattr__(self, "id", self.anchor_id)
+        return self
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 class AllowedIdsPolicy(BaseModel):
     mode: Literal["include_all", "cap_top_k"] = "include_all"
@@ -39,11 +56,11 @@ class Fingerprints(BaseModel):
     bundle_fp: str
     snapshot_etag: str
 
+    policy_fingerprint: str | None = None
 class CountBreakdown(BaseModel):
-    anchor: int = 0
-    events: int = 0
-    transitions: int = 0
-    total: int = 0
+    ids: int = 0
+    edges: int = 0
+    model_config = ConfigDict(extra="forbid")
 
 class EvidenceCounts(BaseModel):
     pool: CountBreakdown
@@ -71,7 +88,7 @@ class SelectionMetrics(BaseModel):
 class TruncationPass(BaseModel):
     prompt_tokens: int
     max_prompt_tokens: Optional[int] = None
-    action: Literal["render", "clip", "render_retry", "stop"] = "render"
+    action: TruncationAction = "render"
 
 class TruncationMetrics(BaseModel):
     passes: List[TruncationPass] = Field(default_factory=list)
@@ -83,10 +100,6 @@ class Runtime(BaseModel):
     fallback_used: bool = False
     fallback_reason: Optional[str] = None
     retries: int = 0
-
-class ValidatorReport(BaseModel):
-    error_count: int = 0
-    warnings: List[str] = Field(default_factory=list)
 
 class MetaInputs(BaseModel):
     """JSON-first input schema for canonical MetaInfo assembly."""
@@ -100,6 +113,5 @@ class MetaInputs(BaseModel):
     selection_metrics: SelectionMetrics
     truncation_metrics: TruncationMetrics
     runtime: Runtime
-    validator: ValidatorReport
     load_shed: bool = False
     model_config = ConfigDict(extra="forbid")

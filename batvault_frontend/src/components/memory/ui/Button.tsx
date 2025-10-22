@@ -14,6 +14,7 @@ const Button: React.FC<ButtonProps> = ({
   variant = "primary",
   className,
   children,
+  type = "button",
   ...rest
 }) => {
   const base =
@@ -26,6 +27,7 @@ const Button: React.FC<ButtonProps> = ({
   };
   return (
     <button
+      type={type ?? "button"}
       className={clsx(base, variants[variant], className)}
       {...rest}
     >

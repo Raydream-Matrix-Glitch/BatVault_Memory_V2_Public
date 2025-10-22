@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/memory.meta.json",
+  "title": "Memory Meta (v3, snapshot-bound)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "returned_count",
+    "allowed_ids",
+    "allowed_ids_fp",
+    "policy_fp",
+    "snapshot_etag",
+    "fingerprints",
+    "alias"
+  ],
+  "properties": {
+  "returned_count": { "type": "integer", "minimum": 0 },
+    "allowed_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_-]*#[^#\\s]+$"
+      }
+    },
+    "allowed_ids_fp": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "policy_fp":      { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "snapshot_etag":  { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "fingerprints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["graph_fp"],
+      "properties": {
+        "graph_fp": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "alias": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["partial", "max_depth", "returned"],
+      "properties": {
+        "partial":   { "type": "boolean" },
+        "max_depth": { "const": 1 },
+        "returned": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_-]*#[^#\\s]+$"
+          }
+        }
+      }
+    }
+  }
+}

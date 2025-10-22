@@ -1,1 +1,1 @@
-from .client import get_http_client, fetch_json
+from .client import get_http_client, fetch_json, get_sync_http_client, fetch_json_sync

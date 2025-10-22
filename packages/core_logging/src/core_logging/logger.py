@@ -1,10 +1,247 @@
 import logging, sys, orjson, os, asyncio
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, Iterable, List, Tuple
 from contextlib import contextmanager as _contextmanager
 import time
 import inspect
 import functools
 import contextvars
+import hashlib
+
+# ────────────────────────────────────────────────────────────
+# Request-level aggregation & summary emission
+# ────────────────────────────────────────────────────────────
+class _ReqAgg:
+    __slots__ = ("events","timers","last","id_norm","errors","once")
+    def __init__(self) -> None:
+        self.events: dict[str, dict[str,int]] = {}
+        self.timers: dict[str, list[float]] = {}
+        self.last: dict[str, Any] = {}
+        self.id_norm: list[tuple[str,str]] = []
+        self.errors: list[dict[str,Any]] = []
+        self.once: set[str] = set()
+
+_REQ_AGG: contextvars.ContextVar[Optional[_ReqAgg]] = contextvars.ContextVar("REQ_AGG", default=None)
+
+def _get_req_agg() -> _ReqAgg:
+    agg = _REQ_AGG.get()
+    if agg is None:
+        agg = _ReqAgg()
+        _REQ_AGG.set(agg)
+    return agg
+
+def _should_summarize() -> bool:
+    # Default to compact summary mode; set LOG_EMIT_MODE=verbose to disable
+    return (os.getenv("LOG_EMIT_MODE", "summary").lower() in ("summary","summarize","compact"))
+
+def _is_error_like(event: str, extras: Dict[str, Any]) -> bool:
+    ev = (event or "").lower()
+    if "error" in extras or extras.get("level") == "ERROR" or int(extras.get("status_code", 200)) >= 500:
+        return True
+    # Policy denies are legitimate ACL outcomes – never classify as errors.
+    if ev == "opa_decide_denied" or extras.get("error_code") == "OPA_DECIDE_DENIED":
+        return False
+    for k in ("error","failed","exception","invalid","mismatch","timeout"):
+        if k in ev:
+            return True
+    return False
+
+def _always_emit(stage: str, event: str) -> bool:
+    # Preserve the canonical bookends even in summary mode
+    if stage == "request" and event in ("request_start","request_end"):
+        return True
+    return False
+
+def _iter_latencies_ms(extras: Dict[str, Any]) -> Iterable[float]:
+    v = extras.get("latency_ms")
+    if isinstance(v, (int, float)):
+        yield float(v)
+
+def _agg_note(stage: str, event: str, extras: Dict[str, Any]) -> None:
+    agg = _get_req_agg()
+    st = agg.events.setdefault(stage, {})
+    st[event] = st.get(event, 0) + 1
+    for v in _iter_latencies_ms(extras):
+        agg.timers.setdefault(stage, []).append(v)
+    # Surface commonly used fingerprints once in the summary
+    for k in ("snapshot_etag","policy_fp","allowed_ids_fp","graph_fp","request_id","bundle_fp","prompt_fingerprint","plan_fingerprint"):
+        v = extras.get(k) or (extras.get("meta") or {}).get(k)
+        if isinstance(v, str) and v:
+            agg.last[k] = v
+    # Capture last seen HTTP method/target for request_summary clarity
+    http = extras.get("http")
+    if isinstance(http, dict):
+        m = http.get("method")
+        t = http.get("target")
+        if isinstance(m, str) and m:
+            agg.last["method"] = m
+        if isinstance(t, str) and t:
+            agg.last["path"] = t
+    # Collect a few normalization samples when present
+    if (event.endswith("id_normalized") or event == "id_normalized"):
+        b = extras.get("before") or (extras.get("meta") or {}).get("before")
+        a = extras.get("after") or (extras.get("meta") or {}).get("after")
+        if isinstance(b,str) and isinstance(a,str) and len(agg.id_norm) < 16:
+            agg.id_norm.append((b,a))
+    # Keep error crumbs verbatim in the summary payload
+    if _is_error_like(event, extras):
+        agg.errors.append({
+            "stage": stage,
+            "event": event,
+            "attrs": {k: v for k, v in extras.items() if k not in ("message","event")}
+        })
+
+def emit_request_summary(logger: logging.Logger, *, service: Optional[str]=None) -> None:
+    """Emit one compact per-request summary line when summary mode is active."""
+    if not _should_summarize():
+        return
+    agg = _REQ_AGG.get()
+    if not agg:
+        return
+    timers = {}
+    for stage, vals in agg.timers.items():
+        if not vals:
+            continue
+        srt = sorted(vals)
+        n   = len(srt)
+        p50 = srt[int(0.5*(n-1))]
+        p95 = srt[int(0.95*(n-1))]
+        timers[stage] = {
+            "count": n,
+            "sum_ms": round(sum(srt), 3),
+            "p50_ms": round(float(p50), 3),
+            "p95_ms": round(float(p95), 3),
+            "max_ms": round(max(srt), 3),
+        }
+    payload = {
+        "stage": "summary",
+        "service": service or os.getenv("SERVICE_NAME") or logger.name,
+        "counts": {k: sum(v.values()) for k,v in agg.events.items()},
+        "events": agg.events,
+        "timers": timers,
+        "id_normalized": {"count": len(agg.id_norm), "samples": agg.id_norm[:4]},
+        **agg.last,
+        "error_count": len(agg.errors),
+    }
+    # Summarize cache usage if present
+    _cache = (agg.events or {}).get("cache", {})
+    _hits  = int(_cache.get("cache.hit", 0))
+    _miss  = int(_cache.get("cache.miss", 0))
+    _gets  = int(_cache.get("cache.get", 0))
+    _total = _gets if _gets else (_hits + _miss)
+    if _total:
+        payload["cache"] = {
+            "gets": _total,
+            "hits": _hits,
+            "misses": max(0, _total - _hits),
+            "hit_rate": round((_hits / _total), 3) if _total else 0.0,
+        }
+    # Best-effort ensure request_id present
+    try:
+        rid = current_request_id()
+        if rid and not payload.get("request_id"):
+            payload["request_id"] = rid
+    except Exception:
+        pass
+    logger.info("request_summary", extra=_sanitize_extra(payload))
+    _REQ_AGG.set(None)
+
+# ────────────────────────────────────────────────────────────
+# Error helpers (single-line ERRORs + end-of-request rollup)
+# ────────────────────────────────────────────────────────────
+def record_error(
+    code: str,
+    *,
+    where: str,
+    message: str,
+    logger: logging.Logger,
+    action: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+    level: str = "ERROR",
+    **extras: Any,
+) -> None:
+    """
+    Emit one normalized ERROR line *and* stash a structured crumb for the
+    end-of-request error summary. Safe to call from any failure path.
+    """
+    agg = _get_req_agg()
+    # Keep a normalized crumb for the rollup
+    crumb = {
+        "code": str(code),
+        "where": str(where),
+        "message": str(message),
+        **({"action": action} if action else {}),
+        **({"context": context} if isinstance(context, dict) else {}),
+    }
+    agg.errors.append(crumb)
+    # Immediate single-line ERROR for operators/dashboards
+    lvl = (level or "ERROR").upper()
+    levelno = getattr(logging, lvl, logging.ERROR)
+    payload = {
+        "stage": extras.pop("stage", None) or "error",
+        "error_code": code,
+        "error_message": message,
+        "where": where,
+        **({"action": action} if action else {}),
+        **({"context": context} if isinstance(context, dict) else {}),
+        **extras,
+    }
+    logger.log(levelno, "error", extra=_sanitize_extra(payload))
+
+def _normalize_error_crumbs(crumbs: List[Dict[str, Any]]) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Coerce aggregator error crumbs into a uniform shape for rollup. Supports
+    both explicit `record_error` entries and heuristic `_agg_note` errors.
+    """
+    out: List[Dict[str, Any]] = []
+    for c in (crumbs or []):
+        if "code" in c and "where" in c and "message" in c:
+            out.append({k: v for k, v in c.items() if v is not None})
+            continue
+        # Heuristic crumbs from _agg_note(...) → synthesize a minimal record
+        ev  = c.get("event")
+        stg = c.get("stage") or "unknown"
+        attrs = c.get("attrs") or {}
+        code = str(attrs.get("error_code") or attrs.get("code") or (str(ev or "GENERIC").upper().replace(".", "_")))
+        msg  = str(attrs.get("error_message") or attrs.get("error") or attrs.get("detail") or ev or "error")
+        out.append({
+            "code": code,
+            "where": stg,
+            "message": msg,
+            **({"action": attrs.get("action")} if attrs.get("action") else {}),
+            **({"context": attrs.get("context")} if isinstance(attrs.get("context"), dict) else {}),
+        })
+    return (len(out), out)
+
+def emit_request_error_summary(logger: logging.Logger, *, service: Optional[str]=None) -> None:
+    """
+    Emit a single compact ERROR rollup when the current request accumulated
+    any errors. No-op if none were recorded.
+    """
+    agg = _REQ_AGG.get()
+    if not agg or not agg.errors:
+        return
+    count, errors = _normalize_error_crumbs(agg.errors)
+    payload: Dict[str, Any] = {
+        "stage": "summary",
+        "service": service or os.getenv("SERVICE_NAME") or logger.name,
+        "error_count": int(count),
+        "errors": errors[:50],  # guard against pathological fan-out
+    }
+    # Best-effort: include request_id if bound
+    try:
+        rid = current_request_id()
+        if rid and "request_id" not in payload:
+            payload["request_id"] = rid
+    except Exception:
+        pass
+    # Optionally derive a coarse "cause" for dashboards (prefix before dot)
+    try:
+        if errors:
+            cause = str(errors[0].get("code") or "").split(".", 1)[0].lower() or "unknown"
+            payload["cause"] = cause
+    except Exception:
+        pass
+    logger.error("request_error_summary", extra=_sanitize_extra(payload))
 
 # ────────────────────────────────────────────────────────────
 # Global Snapshot-ETag support
@@ -20,6 +257,8 @@ _SNAPSHOT_ETAG: Optional[str] = None
 # from OpenTelemetry when available; see JsonFormatter.format() below.
 _TRACE_IDS: contextvars.ContextVar[tuple[Optional[str], Optional[str]]] = \
     contextvars.ContextVar("_TRACE_IDS", default=(None, None))
+_REQUEST_ID: contextvars.ContextVar[Optional[str]] = \
+    contextvars.ContextVar("_REQUEST_ID", default=None)
 
 def bind_trace_ids(trace_id: Optional[str], span_id: Optional[str]) -> None:
     """Bind trace/span IDs into the local context for logging fallbacks."""
@@ -27,6 +266,20 @@ def bind_trace_ids(trace_id: Optional[str], span_id: Optional[str]) -> None:
         _TRACE_IDS.set((trace_id, span_id))
     except Exception:
         pass
+
+def bind_request_id(request_id: Optional[str]) -> None:
+    """Bind the current request_id into the local context for log injection."""
+    try:
+        _REQUEST_ID.set(request_id)
+    except Exception:
+        pass
+
+def current_request_id() -> Optional[str]:
+    """Return the currently bound request_id (if any)."""
+    try:
+        return _REQUEST_ID.get()
+    except Exception:
+        return None
 
 def current_trace_ids() -> tuple[Optional[str], Optional[str]]:
     """Return the currently bound (trace_id, span_id) pair, if any."""
@@ -52,6 +305,17 @@ class _SnapshotFilter(logging.Filter):
             record.snapshot_etag = _SNAPSHOT_ETAG
         return True
 
+class _RequestIdFilter(logging.Filter):
+    """Inject the bound request_id (if any) into LogRecords that lack it."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if getattr(record, "request_id", None) is None:
+                rid = _REQUEST_ID.get()
+                if rid:
+                    record.request_id = rid
+        except Exception:
+            pass
+        return True
 
 # Reserved LogRecord attributes we must not overwrite
 _RESERVED: set[str] = {
@@ -63,15 +327,24 @@ _RESERVED: set[str] = {
 
 # Top‑level fields allowed by the B5 log‑envelope (§B5 tech‑spec)
 _TOP_LEVEL: set[str] = {
-    "timestamp",          # ISO‑8601 UTC
+    "ts",                 # ISO-8601 UTC
     "level",              # INFO|DEBUG|…
     "service",            # gateway|api_edge|…
     "stage",              # resolve|plan|…
     "latency_ms",         # optional, top‑level
     "request_id", "snapshot_etag",
     "prompt_fingerprint", "plan_fingerprint", "bundle_fingerprint",
+    # v3 baseline (prefer *_fp naming); keep *_fingerprint for compat
+    "bundle_fp",
     "selector_model_id",
     "message",            # preserved human message
+    "policy_fp",
+    "allowed_ids_fp",
+    "graph_fp",
+    "cache_key",
+    "status_code",
+    "path",
+    "method",
 }
 
 def _default(obj):
@@ -88,10 +361,11 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         # --- fixed top‑level fields -----------------------------------------
         base: Dict[str, Any] = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(getattr(record, "created", time.time()))),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(getattr(record, "created", time.time()))),
             "level": record.levelname,
             "service": os.getenv("SERVICE_NAME", record.name),
-            "message": record.getMessage(),
+            # Canonical event key (do not duplicate as `message`)
+            "event": record.getMessage(),
         }
 
         # Attach OTEL trace identifiers if present; otherwise use local fallback.
@@ -130,6 +404,12 @@ class JsonFormatter(logging.Formatter):
                 base[key] = val
             else:
                 meta[key] = val
+
+        # If a human-friendly message was explicitly provided by callers,
+        # preserve it under the canonical `message` key (rare).
+        msg_extra = record.__dict__.get("message_extra", None)
+        if msg_extra is not None:
+            base["message"] = msg_extra
 
         if meta:
             base["meta"] = meta
@@ -193,38 +473,60 @@ logging.setLoggerClass(StructuredLogger)
 
 def get_logger(name: str = "app", level: str | None = None) -> logging.Logger:
     logger = logging.getLogger(name)
-    if not logger.handlers:                      # one-shot configuration guard
-        handler = DynamicStdoutHandler() 
-        handler.setFormatter(JsonFormatter())
-        logger.addHandler(handler)
-        # ------------------------------------------------------------------
-        # Allow LogRecords to bubble up to the *root* logger so that
-        # third-party tooling (pytest-caplog, opentelemetry, Sentry, …) can
-        # observe them without having to attach a handler to every leaf logger.
-        #
-        # In typical production deployments the root logger either has **no**
-        # handlers (→ no duplicate output) or is configured exclusively for
-        # out-of-process shipping.  If a human-readable StreamHandler *is*
-        # attached higher up the tree, a second, plain-text copy of the log
-        # line may appear.  That edge-case has never been part of the public
-        # contract, but if it matters you can opt-out by setting
-        # `logger.propagate = False` at application bootstrap.
-        # ------------------------------------------------------------------
-        logger.propagate = True
-        logger.setLevel(level or os.getenv("SERVICE_LOG_LEVEL", "INFO"))
+    is_service_root = "." not in name  # only top-level names own handlers
 
-        # ensure the snapshot-etag filter is attached exactly once
+    if is_service_root:
+        # Attach a single JSON StreamHandler **once** for the service root.
+        if not logger.handlers:
+            handler = DynamicStdoutHandler()
+            handler.setFormatter(JsonFormatter())
+            logger.addHandler(handler)
+        # Service roots terminate propagation to avoid double-emit at the root.
+        logger.propagate = False
+    else:
+        # Leaf/module loggers never own handlers; let them bubble to the service root.
+        if logger.handlers:  # scrub any accidental handlers to prevent duplication
+            for h in list(logger.handlers):
+                logger.removeHandler(h)
+        logger.propagate = True
+
+    logger.setLevel(level or os.getenv("SERVICE_LOG_LEVEL", "INFO"))
+    # Ensure contextual filters are attached exactly once.
+    if not any(isinstance(f, _SnapshotFilter) for f in getattr(logger, "filters", [])):
         logger.addFilter(_SnapshotFilter())
+    if not any(isinstance(f, _RequestIdFilter) for f in getattr(logger, "filters", [])):
+        logger.addFilter(_RequestIdFilter())
     return logger
 
 def log_event(logger: logging.Logger, event: str, **kwargs: Any) -> None:
     logger.info(event, extra=_sanitize_extra(kwargs))
 
 # ---------------------------------------------------------------------------#
+# log_once – emit a structured line only once per request (by key)           #
+# ---------------------------------------------------------------------------#
+def log_once(logger: logging.Logger, *, key: str, event: str, **extras: Any) -> None:
+    """
+    Emit the (event, extras) only once for the current request, keyed by *key*.
+    Still contributes to the per-request summary when summary mode is active.
+    """
+    agg = _get_req_agg()
+    payload = {"stage": extras.pop("stage", None) or extras.pop("phase", None) or "misc", **extras}
+    _agg_note(payload["stage"], event, payload)
+    if key in agg.once:
+        return
+    agg.once.add(key)
+    logger.info(event, extra=_sanitize_extra(payload))
+
+# ---------------------------------------------------------------------------#
 # Internal helper – emit exactly one structured log line                      #
 # ---------------------------------------------------------------------------#
 def _emit_stage_log(logger: logging.Logger, stage: str, event: str, **extras: Any):
     payload = {"stage": stage, **extras}
+    # In summary mode: aggregate most breadcrumbs, but always keep request bookends and errors.
+    if _should_summarize() and not _always_emit(stage, event) and not _is_error_like(event, payload):
+        _agg_note(stage, event, payload)
+        return
+    _agg_note(stage, event, payload)  # keep stats even when emitting
     logger.info(event, extra=_sanitize_extra(payload))
 
 # ---------------------------------------------------------------------------#
@@ -408,6 +710,17 @@ def _sanitize_extra(extra: Dict[str, Any] | None) -> Dict[str, Any]:
     safe: Dict[str, Any] = {}
     for k, v in extra.items():
         lk = str(k)
+        # Flatten user-provided nested `meta` to avoid meta.meta
+        if lk == "meta" and isinstance(v, dict):
+            for mk, mv in v.items():
+                # don't collide with LogRecord attrs
+                mk_norm = str(mk)
+                if mk_norm in _RESERVED:
+                    safe[f"meta_{mk_norm}"] = mv
+                else:
+                    safe[mk_norm] = mv
+            continue
+
         if lk in _RESERVED:
             if lk == "message":
                 safe["message_extra"] = v
@@ -416,3 +729,43 @@ def _sanitize_extra(extra: Dict[str, Any] | None) -> Dict[str, Any]:
         else:
             safe[lk] = v
     return safe
+
+# ---------------------------------------------------------------------------#
+# log_once – emit a line only once per process key (strategic logs)          #
+# ---------------------------------------------------------------------------#
+_ONCE_KEYS: set[str] = set()
+def log_once(logger: logging.Logger, key: str, *, level: int = logging.INFO, event: str, **kwargs: Any) -> None:
+    """
+    Emit a structured log exactly once per *key* for the lifetime of the process.
+    Useful for one-shot diagnostics (e.g., schema directory resolution).
+    """
+    if key in _ONCE_KEYS:
+        return
+    _ONCE_KEYS.add(key)
+    logger.log(level, event, extra=_sanitize_extra(kwargs))
+
+# ────────────────────────────────────────────────────────────
+# Cache logging helpers (shared across services)
+# ────────────────────────────────────────────────────────────
+def cache_key_fp(key: Any) -> str:
+    """Deterministic fingerprint for cache keys (avoid logging raw keys)."""
+    s = str(key)
+    return "sha1:" + hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+def log_cache_hit(logger: logging.Logger, *, backend: str, namespace: str, key: Any,
+                  ttl_remaining_ms: Optional[int] = None, shared: bool = True, latency_ms: Optional[int] = None) -> None:
+    log_stage(logger, "cache", "cache.hit",
+              backend=str(backend), namespace=str(namespace), key_fp=cache_key_fp(key),
+              shared=bool(shared), ttl_remaining_ms=ttl_remaining_ms, latency_ms=latency_ms)
+
+def log_cache_miss(logger: logging.Logger, *, backend: str, namespace: str, key: Any,
+                   shared: bool = True, latency_ms: Optional[int] = None) -> None:
+    log_stage(logger, "cache", "cache.miss",
+              backend=str(backend), namespace=str(namespace), key_fp=cache_key_fp(key),
+              shared=bool(shared), latency_ms=latency_ms)
+
+def log_cache_set(logger: logging.Logger, *, backend: str, namespace: str, key: Any,
+                  ttl_ms: Optional[int] = None, bytes: Optional[int] = None, shared: bool = True, latency_ms: Optional[int] = None) -> None:
+    log_stage(logger, "cache", "cache.set",
+              backend=str(backend), namespace=str(namespace), key_fp=cache_key_fp(key),
+              shared=bool(shared), ttl_ms=ttl_ms, bytes=bytes, latency_ms=latency_ms)

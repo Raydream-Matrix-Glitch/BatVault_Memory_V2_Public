@@ -18,7 +18,6 @@ dependencies = [
   "core_observability",
   "core_storage",
   "core_http",
-  "core_ml",
   "opentelemetry-sdk>=1.24",
   "opentelemetry-exporter-otlp-proto-http>=1.24",
   "opentelemetry-instrumentation-fastapi>=0.46b0",

@@ -7,10 +7,12 @@ export function uiLog(event: string, payload: UILogPayload = {}) {
     // @ts-ignore
     if (typeof window !== "undefined" && window.__bv_log) {
       // @ts-ignore
-      window.__bv_log({ level: "INFO", event, ...payload });
+      const base = { ts: new Date().toISOString(), level: "INFO", service: "frontend", event, ...payload };
+      window.__bv_log(base);
     } else {
       // eslint-disable-next-line no-console
-      console.info("[ui]", event, payload);
+      const base = { ts: new Date().toISOString(), level: "INFO", service: "frontend", event, ...payload };
+      console.info("[ui]", base);
     }
   } catch {
     // noop — never throw from logging

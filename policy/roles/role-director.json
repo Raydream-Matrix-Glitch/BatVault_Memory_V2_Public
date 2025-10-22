@@ -1,31 +1,46 @@
 {
-  "id": "role-director",
   "role": "director",
-  "display_name": "Director / Exec",
-  "description": "Leadership role. Full cross-domain visibility including corporate rationale and supporting events.",
-  "namespaces": ["public", "internal", "confidential"],
-  "domain_scopes": ["acme/*"],
-  "sensitivity_ceiling": "high",
-  "edge_allowlist": [
-    "ALIAS_OF","CAUSAL_PRECEDES","LED_TO"
+  "policy_version": "v3",
+  "namespaces": [
+    "corp",
+    "eng",
+    "public"
   ],
+  "domain_scopes": ["corp","eng","public", "sales"],
+  "edge_allowlist": [
+    "LED_TO",
+    "CAUSAL",
+    "ALIAS_OF"
+  ],
+  "sensitivity_ceiling": "medium",
+  "alias_max_hops": 1,
   "field_visibility": {
     "decision": {
-      "visible_fields": ["option", "timestamp", "tags", "domain", "rationale"],
-      "rationale_visible": true,
-      "supporting_events_visible": true
+      "visible_fields": [
+        "title",
+        "timestamp",
+        "description",
+        "decision_maker.*",
+        "summary",
+        "tags",
+        "x-extra"
+      ],
+      "rationale_visible": false,
+      "allow_alias_projection": true
     },
     "event": {
-      "visible_fields": ["summary", "timestamp", "snippet", "tags", "domain", "description"],
+      "visible_fields": [
+        "title",
+        "timestamp",
+        "description",
+        "x-extra"
+      ],
       "allow_alias_projection": true
     }
   },
-  "x-extra": {
-    "audit_tags": ["demo", "visibility:full"],
-    "header_template": {
-      "X-User-Roles": "director",
-      "X-User-Namespaces": "public,internal,confidential"
-    },
-    "notes": "Director covers all items that list roles_allowed including 'director' (corporate fixtures include ['director','exec'])."
-  }
+  "extra_visible": [
+    "public.*",
+    "safe.note",
+    "telemetry.build_id"
+  ]
 }

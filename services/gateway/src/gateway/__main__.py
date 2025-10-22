@@ -1,14 +1,12 @@
-import sys
-from pathlib import Path
-
-# Ensure the monorepo import shim is active even if PYTHONPATH is minimal.
-# This guarantees 'packages/*/src' and 'services/*/src' are importable.
-ROOT = Path(__file__).resolve().parents[4]  # -> /app
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
+from __future__ import annotations
+import os
+from core_utils.bootstrap import ensure_monorepo_paths
+ensure_monorepo_paths()
 from core_utils.uvicorn_entry import run
 from core_config.constants import HEALTH_PORT as PORT
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+ACCESS_LOG = os.getenv("ACCESS_LOG", "0") in ("1","true","True","yes","on")
+
 if __name__ == "__main__":
-    run("gateway.app:app", port=PORT, log_level="info", access_log=False)
+    run("gateway.app:app", port=PORT, log_level=LOG_LEVEL, access_log=ACCESS_LOG)

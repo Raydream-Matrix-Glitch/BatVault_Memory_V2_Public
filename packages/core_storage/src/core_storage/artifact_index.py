@@ -1,12 +1,13 @@
 from __future__ import annotations
-
 import io
 import tarfile
 from datetime import datetime, timezone
+import os
+import time
 from typing import Dict, Tuple
-
 from core_utils import jsonx
 from core_logging import get_logger, log_stage
+from core_utils.backoff import compute_backoff_delay_ms
 
 logger = get_logger("artifact_index")
 
@@ -41,13 +42,46 @@ def upload_named_bundles(client, bucket: str, request_id: str, bundles: Dict[str
     """
     Upload multiple bundles and a shared meta sidecar to object storage.
     """
-    # Ensure bucket exists
+    # Env-driven retry knobs (fall back to HTTP defaults if provided there)
+    max_retries = int(os.getenv("MINIO_MAX_RETRIES", "3"))
+    base_ms = int(os.getenv("MINIO_RETRY_BASE_MS", os.getenv("HTTP_RETRY_BASE_MS", "50")))
+    jitter_ms = int(os.getenv("MINIO_RETRY_JITTER_MS", os.getenv("HTTP_RETRY_JITTER_MS", "200")))
+    cap_ms = int(os.getenv("MINIO_RETRY_CAP_MS", "2000"))
+
+    def _retry(op: str, fn, *args, **kwargs):
+        last_exc = None
+        for attempt in range(1, max_retries + 2):  # retries=N → attempts=N+1
+            try:
+                return fn(*args, **kwargs)
+            except (OSError, RuntimeError) as e:
+                last_exc = e
+                if attempt <= max_retries:
+                    delay_ms = compute_backoff_delay_ms(attempt, base_ms=base_ms, jitter_ms=jitter_ms, cap_ms=cap_ms, mode="exp_equal_jitter")
+                    # Strategic retry sleep log (keeps your pattern)
+                    log_stage(
+                        logger, "artifacts", "artifacts.retry_sleep",
+                        request_id=request_id, op=op, attempt=attempt, delay_ms=delay_ms
+                    )
+                    time.sleep(delay_ms / 1000.0)
+                    continue
+                break
+        assert last_exc is not None
+        # Terminal failure is surfaced; caller decides whether to handle
+        log_stage(logger, "artifacts", "named_bundles_upload_failed", request_id=request_id, error=str(last_exc))
+        raise last_exc
+
+    # Ensure bucket exists (idempotent; may already exist)
     try:
-        client.make_bucket(bucket)
-    except Exception:
-        pass  # already exists
+        _retry("make_bucket", client.make_bucket, bucket)
+    except (OSError, RuntimeError):
+        # Continue if bucket already exists or creation is racing elsewhere
+        pass
+
+    # Upload bundles
     for name, blob in bundles.items():
-        client.put_object(
+        _retry(
+            "put_object",
+            client.put_object,
             bucket,
             f"{request_id}/{name}.tar.gz",
             io.BytesIO(blob),
@@ -55,7 +89,9 @@ def upload_named_bundles(client, bucket: str, request_id: str, bundles: Dict[str
             content_type="application/gzip",
         )
     # Per-request meta for list views
-    client.put_object(
+    _retry(
+        "put_object",
+        client.put_object,
         bucket,
         f"{request_id}/_index.json",
         io.BytesIO(meta_bytes),
@@ -91,7 +127,7 @@ def build_bundle_and_meta(artefacts: Dict[str, bytes]) -> Tuple[bytes, bytes]:
             anchor_id = resp.get("evidence", {}).get("anchor", {}).get("id")
             if anchor_id:
                 index["anchor_id"] = anchor_id
-    except Exception:
+    except (ValueError, TypeError, UnicodeDecodeError, AttributeError):
         # Non-fatal; preserve minimal index when parsing fails
         pass
 
@@ -120,33 +156,72 @@ def upload_bundle_and_meta(client, bucket: str, request_id: str, bundle_bytes: b
     Upload the bundle (.tar.gz) and the sidecar meta JSON to the given bucket.
     Safe to call in a best-effort manner; emits structured logs.
     """
-    try:
-        # Upload archive
-        client.put_object(
-            bucket,
-            f"{request_id}.bundle.tar.gz",
-            io.BytesIO(bundle_bytes),
-            length=len(bundle_bytes),
-            content_type="application/gzip",
-        )
-        # Upload sidecar meta JSON (root)
-        client.put_object(
-            bucket,
-            f"{request_id}.meta.json",
-            io.BytesIO(meta_bytes),
-            length=len(meta_bytes),
-            content_type="application/json",
-        )
-        # Also write a per-prefix meta object so inspecting the folder shows dates and size
-        client.put_object(
-            bucket,
-            f"{request_id}/_meta.json",
-            io.BytesIO(meta_bytes),
-            length=len(meta_bytes),
-            content_type="application/json",
-        )
-        log_stage(logger, "artifacts", "index_upload_ok",
-                  request_id=request_id, bundle_bytes=len(bundle_bytes), meta_bytes=len(meta_bytes))
-    except Exception as exc:
-        # Non-fatal – raw artefacts were already written
-        log_stage(logger, "artifacts", "index_upload_failed", request_id=request_id, error=str(exc))
+    # Use the same retry knobs as upload_named_bundles
+    max_retries = int(os.getenv("MINIO_MAX_RETRIES", "3"))
+    base_ms = int(os.getenv("MINIO_RETRY_BASE_MS", os.getenv("HTTP_RETRY_BASE_MS", "50")))
+    jitter_ms = int(os.getenv("MINIO_RETRY_JITTER_MS", os.getenv("HTTP_RETRY_JITTER_MS", "200")))
+    cap_ms = int(os.getenv("MINIO_RETRY_CAP_MS", "2000"))
+
+    def _retry(op: str, fn, *args, **kwargs):
+        last_exc = None
+        for attempt in range(1, max_retries + 2):
+            try:
+                return fn(*args, **kwargs)
+            except (OSError, RuntimeError) as e:
+                last_exc = e
+                if attempt <= max_retries:
+                    delay_ms = compute_backoff_delay_ms(attempt, base_ms=base_ms, jitter_ms=jitter_ms, cap_ms=cap_ms, mode="exp_equal_jitter")
+                    log_stage(logger, "artifacts", "artifacts.retry_sleep", request_id=request_id, op=op, attempt=attempt, delay_ms=delay_ms)
+                    time.sleep(delay_ms / 1000.0)
+                    continue
+                break
+        assert last_exc is not None
+        return last_exc
+
+    # Upload archive (retrying)
+    err = _retry(
+        "put_object",
+        client.put_object,
+        bucket,
+        f"{request_id}.bundle.tar.gz",
+        io.BytesIO(bundle_bytes),
+        length=len(bundle_bytes),
+        content_type="application/gzip",
+    )
+    if isinstance(err, Exception):
+        # Non-fatal – preserve prior best-effort behavior
+        log_stage(logger, "artifacts", "index_upload_failed", request_id=request_id, error=str(err))
+        return
+
+    # Upload sidecar meta JSON (root)
+    err = _retry(
+        "put_object",
+        client.put_object,
+        bucket,
+        f"{request_id}.meta.json",
+        io.BytesIO(meta_bytes),
+        length=len(meta_bytes),
+        content_type="application/json",
+    )
+    if isinstance(err, Exception):
+        log_stage(logger, "artifacts", "index_upload_failed", request_id=request_id, error=str(err))
+        return
+
+    # Also write a per-prefix meta object so folder views show dates/size
+    err = _retry(
+        "put_object",
+        client.put_object,
+        bucket,
+        f"{request_id}/_meta.json",
+        io.BytesIO(meta_bytes),
+        length=len(meta_bytes),
+        content_type="application/json",
+    )
+    if isinstance(err, Exception):
+        log_stage(logger, "artifacts", "index_upload_failed", request_id=request_id, error=str(err))
+        return
+
+    log_stage(
+        logger, "artifacts", "index_upload_ok",
+        request_id=request_id, bundle_bytes=len(bundle_bytes), meta_bytes=len(meta_bytes)
+    )

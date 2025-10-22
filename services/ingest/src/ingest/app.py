@@ -1,8 +1,6 @@
-# services/ingest/src/ingest/app.py
-
 from fastapi import FastAPI, Request
 from core_logging import get_logger, log_stage
-from core_observability.otel import setup_tracing, instrument_fastapi_app
+from core_utils.fastapi_bootstrap import setup_service
 from core_utils.health import attach_health_routes
 from core_utils.ids import generate_request_id
 from core_config import get_settings 
@@ -10,71 +8,56 @@ import core_metrics, time
 from core_http.client import get_http_client
 from core_config.constants import timeout_for_stage
 import os
-_INGEST_UPSTREAM_BASE = os.getenv("INGEST_UPSTREAM_BASE", "http://gateway:8081").rstrip("/")
+import httpx
 from fastapi.responses import JSONResponse, Response
 import inspect
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core_observability.otel import inject_trace_context
 
 app = FastAPI(title="BatVault Ingest", version="0.1.0")
+_INGEST_UPSTREAM_BASE = os.getenv("INGEST_UPSTREAM_BASE", "http://gateway:8081").rstrip("/")
+setup_service(app, 'ingest')
 
-# Ensure OTEL middleware wraps all subsequent middlewares/handlers
-instrument_fastapi_app(app, service_name=os.getenv('OTEL_SERVICE_NAME') or 'ingest')
+logger = get_logger("ingest"); logger.propagate = False
 
-logger = get_logger("ingest")
-logger.propagate = False
-setup_tracing(os.getenv("OTEL_SERVICE_NAME") or "ingest")
-
-@app.middleware("http")
-async def _request_logger(request: Request, call_next):
-    idem = generate_request_id()
-    # Observability: expose current trace/span IDs (should be non-zero if OTEL middleware wrapped us)
+@app.on_event("startup")
+async def _log_effective_sensitivity_order() -> None:
+    """
+    Emit the effective SENSITIVITY_ORDER once at startup for ops clarity.
+    Looks for (in order): settings.SENSITIVITY_ORDER | settings.sensitivity_order |
+    env SENSITIVITY_ORDER (comma-separated) | conservative default.
+    """
     try:
-        from opentelemetry import trace as _trace  # type: ignore
-        _sp = _trace.get_current_span()
-        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
-        if _ctx and getattr(_ctx, 'trace_id', 0):
-            log_stage(logger, 'observability', 'trace_ctx',
-                      request_id=idem,
-                      trace_id=f"{_ctx.trace_id:032x}",
-                      span_id=f"{_ctx.span_id:016x}")
-    except Exception:
-        pass
-    t0   = time.perf_counter()
-    log_stage(logger, "request", "request_start",
-              request_id=idem, path=str(request.url.path), method=request.method)
-
-    resp = await call_next(request)
-
-    try:
-        from opentelemetry import trace as _trace  # type: ignore
-        _sp = _trace.get_current_span()
-        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
-        if _ctx and getattr(_ctx, 'trace_id', 0):
-            resp.headers["x-trace-id"] = f"{_ctx.trace_id:032x}"
-    except Exception:
-        pass
-
-    dt_s = (time.perf_counter() - t0)
-    core_metrics.histogram("ingest_ttfb_seconds", dt_s)
-    resp.headers["x-request-id"] = idem
-    try:
-        core_metrics.counter("ingest_http_requests_total", 1, method=request.method, code=str(resp.status_code))
-        if str(resp.status_code).startswith("5"):
-            core_metrics.counter("ingest_http_5xx_total", 1)
-    except Exception:
-        pass
-    log_stage(logger, "request", "request_end",
-              request_id=idem, status_code=resp.status_code,
-              latency_ms=dt_s * 1000.0)
-    return resp
+        cfg = get_settings()
+        order = None
+        source = None
+        for attr in ("SENSITIVITY_ORDER", "sensitivity_order", "SENSITIVITY_LEVELS", "sensitivity_levels"):
+            if hasattr(cfg, attr):
+                val = getattr(cfg, attr)
+                if isinstance(val, (list, tuple)):
+                    order = list(val)
+                    source = f"settings.{attr}"
+                    break
+        if order is None:
+            raw = os.getenv("SENSITIVITY_ORDER")
+            if raw:
+                order = [x.strip() for x in raw.split(",") if x.strip()]
+                source = "env.SENSITIVITY_ORDER"
+        if order is None:
+            # conservative default (least→most restrictive)
+            order = ["public", "internal", "confidential", "secret"]
+            source = "default"
+        log_stage(
+            logger, "ingest", "sensitivity_order",
+            order=order, source=source, request_id=generate_request_id()
+        )
+    except (AttributeError, TypeError, ValueError, RuntimeError) as e:
+        # Narrow catch and surface the failure; do not crash the service
+        log_stage(
+            logger, "ingest", "sensitivity_order_log_failed",
+            error=str(e), request_id=generate_request_id()
+        )
 
 # ── Prometheus scrape endpoint (CI + Prometheus) ───────────────────────────
-@app.get("/metrics", include_in_schema=False)
-def metrics() -> Response:                         # pragma: no cover
-    return Response(generate_latest(),
-                    media_type=CONTENT_TYPE_LATEST)
-
 async def _ping_gateway_ready() -> bool:
     """
     Returns True iff Gateway /readyz reports status “ready”.
@@ -87,7 +70,14 @@ async def _ping_gateway_ready() -> bool:
             headers=inject_trace_context({}),
         )
         return r.status_code == 200 and r.json().get("status") == "ready"
-    except Exception:
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as e:
+        # Surface gateway ping failures in readiness logs for easier triage
+        try:
+            log_stage(
+                logger, "readiness", "gateway_ping_failed",
+                error=str(e), request_id=generate_request_id()
+            )
+        except (RuntimeError, ValueError): pass
         return False
 
 
@@ -105,6 +95,8 @@ async def _readiness() -> dict:
     if etag is None:
         return {
             "status": "starting",
+            # Not ready until a snapshot is loaded
+            "ready": False,
             "snapshot_etag": None,
         }
 
@@ -114,12 +106,30 @@ async def _readiness() -> dict:
         mem_ok = await maybe_coro
     else:
         mem_ok = bool(maybe_coro)
+    # Storage readiness (fail-closed if Arango unreachable in non-DEV)
+    storage_ok = True
+    try:
+        from core_storage import ArangoStore
+        ArangoStore(lazy=False)  # force connect
+    except (RuntimeError, OSError, ValueError) as e:
+        storage_ok = False
+        try:
+            log_stage(
+                logger, "readiness", "storage_unavailable",
+                error=str(e), request_id=generate_request_id()
+            )
+        except (RuntimeError, ValueError):
+            pass
+    overall_ok = bool(mem_ok and storage_ok)
     return {
-        "status": "ready" if mem_ok else "degraded",
+        "status": "ready" if overall_ok else "degraded",
+        # Canonical readiness boolean required by Baseline
+        # (fail-closed on storage outages outside DEV; this logic remains closed by default)
+        "ready": overall_ok,
         "snapshot_etag": etag,
         "request_id": generate_request_id(),
+        "storage_ok": storage_ok,
     }
-
 
 attach_health_routes(
     app,

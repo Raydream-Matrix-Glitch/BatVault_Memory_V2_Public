@@ -1,16 +1,20 @@
 """
-Public API for the core_validator package.
+Public API for the core_validator package (v3).
 
-This module exposes the key validation entry points.  Consumers should
-import functions from here rather than pulling private helpers from
-``core_validator.validator`` directly.  The ``canonical_allowed_ids``
-function computes a stable ordering of anchor, event and transition IDs
-according to the Why‑Decision contract.
+Strict JSON Schema validators for BatVault contracts.
+Import from here in services (ingest/memory_api/gateway) to avoid drift.
 """
 
-from .validator import validate_response, canonical_allowed_ids  # noqa: F401
+from .validator import (  # noqa: F401
+    validate_node,
+    validate_edge,
+    validate_graph_view,
+    validate_bundle_view,
+)
 
 __all__ = [
-    "validate_response",
-    "canonical_allowed_ids",
+    "validate_node",
+    "validate_edge",
+    "validate_graph_view",
+    "validate_bundle_view",
 ]

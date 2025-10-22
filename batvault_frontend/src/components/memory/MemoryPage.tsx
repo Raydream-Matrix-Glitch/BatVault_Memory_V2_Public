@@ -3,44 +3,60 @@ import Card from "./ui/Card";
 import QueryPanel from "./QueryPanel";
 import EvidenceList from "./EvidenceList";
 import { useMemoryAPI } from "../../hooks/useMemoryAPI";
-import type { EvidenceItem, EvidenceBundle } from "../../types/memory";
+import type { EvidenceItem, EvidenceBundle, GraphEdge } from "../../types/memory";
 import AuditDrawer from "./AuditDrawer";
 import Button from "./ui/Button";
 import { logEvent } from "../../utils/logger";
-import GraphView from "./GraphView";
+import { openEvidenceBundle } from "../../utils/bundle";
 import TagFilter from "./ui/TagFilter";
-import { useAliasResolver } from "../../hooks/useAliasResolver";
 import EmptyResult from "./EmptyResult";
+import AllowedIdsDrawer from "./AllowedIdsDrawer";
+import ShortAnswer from "./ShortAnswer";
+import { useEnrichedCatalog } from "../../hooks/useEnrichedCatalog";
 
-/**
- * Root container for the Memory page.
- *
- * This component will evolve in later batches to include the full
- * query interface, streaming answer renderer, evidence cards,
- * audit drawer and data visualisations. For now, it provides a
- * skeleton with cyberpunk styling to verify that routing and
- * theming are wired correctly.
- */
+
 export default function MemoryPage() {
   const {
     tokens,
     isStreaming,
     error,
     finalData,
-    ask,
-    query,
+    queryDecision,
+    topic,
   } = useMemoryAPI();
 
   // --- UI-only validation message just below the QueryPanel input ---
   const [emptyHint, setEmptyHint] = useState<string | null>(null);
   const queryPanelHostRef = useRef<HTMLDivElement>(null);
 
-  // Hook to resolve decision slugs to human‑friendly titles. Cached
-  // internally to avoid repeated fetches.
-  const resolveAlias = useAliasResolver();
+  // Next decision (derived from edges); no alias resolver in V3 cutover
+  const [nextTitle] = useState<string | undefined>(undefined);
 
-  // Store the resolved next decision title (from succeeding transition)
-  const [nextTitle, setNextTitle] = useState<string | undefined>(undefined);
+  // Enriched Catalog hook (for All Allowed IDs)
+  const { loading: catalogLoading, error: catalogError, itemsById, load: loadCatalog } = useEnrichedCatalog();
+
+  // Auto-prefetch Enriched Catalog once final bundle arrives (edges-only baseline).
+  useEffect(() => {
+    const anchorId     = finalData?.anchor?.id || "";
+    const snapshotEtag = finalData?.meta?.snapshot_etag || "";
+    const allowedIds   = (finalData as any)?.meta?.allowed_ids || (finalData as any)?.evidence?.allowed_ids || [];
+    const policyFp     = finalData?.meta?.policy_fp || "";
+    const allowedIdsFp = finalData?.meta?.allowed_ids_fp || "";
+    const cacheKey     = `${snapshotEtag}|${allowedIdsFp}|${policyFp}`;
+    if (anchorId && snapshotEtag && allowedIds.length > 0) {
+      try {
+        logEvent("ui.allowed_ids.prefetch_autorun", {
+          have_anchor: true,
+          have_snapshot: true,
+          allowed_count: allowedIds.length,
+          rid: finalData?.meta?.request_id ?? null
+        });
+      } catch { /* no-op */ }
+      // Deterministic, cache-keyed prefetch (idempotent inside hook).
+      loadCatalog({ anchorId, snapshotEtag, allowedIds, cacheKey });
+    }
+  }, [finalData?.meta?.snapshot_etag, finalData?.meta?.allowed_ids_fp, finalData?.meta?.policy_fp, loadCatalog, finalData?.anchor?.id]);
+
 
   // Track which evidence item is currently selected (for graph/audit integration).
   const [selectedEvidenceId, setSelectedEvidenceId] = useState<string | undefined>(undefined);
@@ -67,6 +83,41 @@ export default function MemoryPage() {
     } catch { /* ignore */ }
   }, [finalData]);
 
+  const handleOpenAllowedIds = useCallback(async () => {
+    try { logEvent("ui.allowed_ids.open_click", { rid: finalData?.meta?.request_id ?? null }); } catch {}
+
+    // Proactively fetch the Enriched Catalog so the drawer always has data on open.
+    try {
+      const anchorId     = finalData?.anchor?.id || "";
+      const snapshotEtag = finalData?.meta?.snapshot_etag || "";
+      const allowedIds   = finalData?.evidence?.allowed_ids || finalData?.meta?.allowed_ids || [];
+      const policyFp     = finalData?.meta?.policy_fp || "";
+      const allowedIdsFp = finalData?.meta?.allowed_ids_fp || "";
+      const cacheKey     = `${snapshotEtag}|${allowedIdsFp}|${policyFp}`;
+
+      if (anchorId && snapshotEtag && allowedIds.length > 0) {
+        // Warm the cache; AllowedIdsDrawer will render from it immediately.
+        await loadCatalog({ anchorId, snapshotEtag, allowedIds, cacheKey });
+      } else {
+        // Strategic logging: prefetch skipped due to missing prerequisites.
+        try { logEvent("ui.allowed_ids.prefetch_skipped", {
+          have_anchor: Boolean(anchorId),
+          have_snapshot: Boolean(snapshotEtag),
+          allowed_count: allowedIds.length
+        }); } catch {}
+      }
+    } catch {
+      // Non-fatal: the drawer will attempt again if needed.
+    }
+
+    // Signal the drawer to open and scroll it into view.
+    try { window.dispatchEvent(new CustomEvent('open-allowed-ids')); } catch { /* no-op */ }
+    try {
+      const el = document.getElementById('allowed-ids-drawer');
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch { /* ignore */ }
+  }, [finalData, loadCatalog])
+
   // Strategic structured logging for audit drawer interactions.
   const handleOpenAudit = () => {
     setAuditOpen(true);
@@ -77,7 +128,9 @@ export default function MemoryPage() {
   const rawShortAnswer = finalData?.answer?.short_answer;
   // Render-time split: if the short answer (or streaming tokens) contains
   // an inline "Next:" sentence, render it on a new line with a spacer.
-  const streamingText = isStreaming ? tokens.join("") : undefined;
+  const streamingText = isStreaming
+    ? (Array.isArray(tokens) ? tokens.join("") : String(tokens ?? ""))
+    : undefined;
   const { mainAnswer, nextFromShort } = useMemo(() => {
     const src = (streamingText ?? rawShortAnswer) || "";
     const match = src.match(/\bNext:\s*(.*)$/i);
@@ -89,6 +142,24 @@ export default function MemoryPage() {
     try { logEvent("ui.short_answer.next_split", { rid: finalData?.meta?.request_id ?? null }); } catch {}
     return { mainAnswer: before, nextFromShort: nextTxt };
   }, [streamingText, rawShortAnswer, finalData]);
+  // Parse deterministic 'Key Events:' clause into a bullet-friendly array when we have the final short answer.
+  const { leadBeforeEvents, eventsFromShort } = useMemo(() => {
+    // Only parse once we have the final short answer to avoid flicker during streaming.
+    if (!rawShortAnswer) return { leadBeforeEvents: undefined, eventsFromShort: undefined as string[] | undefined };
+    try {
+      const s = String(rawShortAnswer);
+      // Capture the minimal-span events clause; templater always ends it with a period.
+      const m = s.match(/\bKey\s*Events:\s*(.*?)(?:\.\s*(?:Next:|$))/i);
+      if (!m) return { leadBeforeEvents: undefined, eventsFromShort: undefined };
+      const lead = s.slice(0, m.index).trim();
+      // Split on semicolons (templater joins with '; ') and trim items.
+      const items = m[1].split(/\s*;\s*/).map(x => x.trim()).filter(Boolean);
+      try { logEvent("ui.short_answer.key_events_parsed", { count: items.length, rid: finalData?.meta?.request_id ?? null }); } catch {}
+      return { leadBeforeEvents: lead, eventsFromShort: items };
+    } catch {
+      return { leadBeforeEvents: undefined, eventsFromShort: undefined };
+    }
+  }, [rawShortAnswer, finalData]);
   const shortAnswer = useMemo(() => {
     if (!rawShortAnswer) return undefined;
     try {
@@ -97,12 +168,34 @@ export default function MemoryPage() {
     } catch { return rawShortAnswer; }
   }, [rawShortAnswer]);
 
-  // Compute the slug/id of the next succeeding transition (if any). Prefer
-  // the `to` field if present, otherwise fall back to the transition id.
+  const { anchorHeading, anchorDescription } = useMemo(() => {
+    const src = (leadBeforeEvents ?? mainAnswer ?? "").trim();
+    if (!src) return { anchorHeading: undefined as string | undefined, anchorDescription: undefined as string | undefined };
+    try {
+      const m = src.match(/^\s*(.+?)\s+on\s+(\d{4}-\d{2}-\d{2})\s*(?::|[—-])?\s*(.+?)\s*(?:[—-])\s*(.*)$/);
+      if (!m) return { anchorHeading: undefined, anchorDescription: undefined };
+      const who = m[1].trim();
+      const date = m[2].trim();
+      const title = m[3].trim();
+      let desc = m[4].trim();
+      // Avoid trailing period duplication when followed by "Key Events:" which we split out.
+      desc = desc.replace(/\s*\.$/, "");
+      return { anchorHeading: `${who} on ${date}: ${title}`, anchorDescription: desc };
+    } catch {
+      return { anchorHeading: undefined, anchorDescription: undefined };
+    }
+  }, [leadBeforeEvents, mainAnswer]);
+
+  // v3: Compute the next decision from oriented edges (succeeding CAUSAL from anchor).
   const nextSlug: string | undefined = useMemo(() => {
-    const nxt: any = (finalData as any)?.evidence?.transitions?.succeeding?.[0];
+    const edges: GraphEdge[] =
+      ((finalData as any)?.graph?.edges) ||
+      ((finalData as any)?.evidence?.graph?.edges) ||
+      [];
+    const anchorId = (finalData as any)?.anchor?.id || (finalData as any)?.evidence?.anchor?.id;
+    const nxt = edges.find((e) => e && e.type === "CAUSAL" && e.orientation === "succeeding" && e.from === anchorId);
     if (!nxt) return undefined;
-    return (nxt.to as string) || (nxt.id as string) || undefined;
+    return String(nxt.to || "");
   }, [finalData]);
 
   // Disable native browser validation bubbles inside QueryPanel so we can show our own hint.
@@ -116,21 +209,6 @@ export default function MemoryPage() {
     });
   }, []);
 
-  // When the slug changes, resolve the human title via the alias resolver.
-  useEffect(() => {
-    let ignore = false;
-    (async () => {
-      if (nextSlug) {
-        const title = await resolveAlias(nextSlug);
-        if (!ignore) setNextTitle(title);
-      } else {
-        setNextTitle(undefined);
-      }
-    })();
-    return () => {
-      ignore = true;
-    };
-  }, [nextSlug, resolveAlias]);
   // Log presence of a "Next:" line for audit/UX metrics
   useEffect(() => {
     if (nextTitle) {
@@ -149,7 +227,7 @@ export default function MemoryPage() {
     if (finalData && finalData.answer && finalData.answer.short_answer) {
       try {
         logEvent("ui_short_answer_rendered", {
-          id: finalData?.evidence?.anchor?.id ?? null,
+          id: finalData?.anchor?.id ?? null,
         });
       } catch {
         /* ignore logging errors */
@@ -159,17 +237,6 @@ export default function MemoryPage() {
 
   // Extract supplementary answer fields for UI enhancements
   const citationIds: string[] = finalData?.answer?.cited_ids ?? finalData?.answer?.supporting_ids ?? [];
-  const fallbackUsed: boolean | undefined = finalData?.meta?.fallback_used;
-  // Derive a label describing the path taken (deterministic fallback or model).
-  const pathLabel: string = fallbackUsed ? "Deterministic" : "Model";
-  // nextLabel has been superseded by alias resolution via `nextTitle`. See
-  // useEffect below for details.
-
-  // Log when anchor maker/date chips are present
-  // Fire a layout painted event exactly once when this component mounts. When
-  // finalData is available we include its request id in the payload, otherwise
-  // pass null. This uses an empty dependency array so it runs only on the
-  // initial render.
   useEffect(() => {
     try {
       logEvent("ui.memory.layout_painted", { rid: finalData?.meta?.request_id ?? null });
@@ -179,23 +246,17 @@ export default function MemoryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Handler for evidence bundle download.
-  // Strategy:
-  // 1) If we have a request id, use the canonical presign flow:
-  //    POST /v2/bundles/{rid}/download → { url }, then open the url
-  // 2) Else, if the response included a bundle_url, open that
-  // 3) Else, as a last resort (rid only), GET /v2/bundles/{rid} and save blob
+  // Evidence bundle download (V3):
   const handleDownloadEvidence = useCallback(async () => {
     try { logEvent("ui.evidence_download_click", { rid: finalData?.meta?.request_id ?? null }); } catch { /* ignore */ }
     const bundleUrl = (finalData as any)?.bundle_url as string | undefined;
     const ridFromMeta = (finalData as any)?.meta?.request_id as string | undefined;
     let rid = ridFromMeta;
     if (!rid && bundleUrl) {
-      const m = /\/v2\/bundles\/([^\/\s]+)/i.exec(bundleUrl);
+      const m = /\/v3\/bundles\/([^\/\s]+)/i.exec(bundleUrl);
       if (m && m[1]) rid = m[1];
     }
-    // Delegate to shared utility (presigned-first with safe fallbacks)
-    const { openEvidenceBundle } = await import("../../utils/bundle");
+    // Static import — avoids runtime chunk/load flakiness
     await openEvidenceBundle(rid, bundleUrl);
   }, [finalData]);
 
@@ -212,13 +273,6 @@ export default function MemoryPage() {
   const anchorItem: EvidenceItem | undefined = useMemo(() => {
     const a = finalData?.evidence?.anchor as any;
     return a && a.id ? { ...a, type: 'DECISION' as const } : undefined;
-  }, [finalData]);
-
-  const transitionsBoth = useMemo(() => {
-    const t = finalData?.evidence?.transitions as any;
-    const preceding = Array.isArray(t?.preceding) ? t.preceding.map((x: any) => ({ ...x, type: 'TRANSITION' as const })) : [];
-    const succeeding = Array.isArray(t?.succeeding) ? t.succeeding.map((x: any) => ({ ...x, type: 'TRANSITION' as const })) : [];
-    return { preceding, succeeding };
   }, [finalData]);
 
   // Rank events by selector score (desc) then timestamp (desc), then id
@@ -243,11 +297,9 @@ export default function MemoryPage() {
   const allEvidenceItems: EvidenceItem[] = useMemo(() => {
     const items: EvidenceItem[] = [];
     if (anchorItem) items.push(anchorItem);
-    if (transitionsBoth.preceding?.length) items.push(...transitionsBoth.preceding);
     if (rankedEvents?.length) items.push(...rankedEvents);
-    if (transitionsBoth.succeeding?.length) items.push(...transitionsBoth.succeeding);
     return items;
-  }, [anchorItem, transitionsBoth, rankedEvents]);
+    }, [anchorItem, rankedEvents]);
 
   // Events only for graph (exclude decision/transitions)
   const filteredEventsForGraph: EvidenceItem[] = useMemo(() => {
@@ -267,30 +319,6 @@ export default function MemoryPage() {
     ((finalData?.answer?.cited_ids ?? finalData?.answer?.supporting_ids) ?? []).forEach((id: string) => ids.add(id));
     return Array.from(ids);
   }, [anchorId, finalData]);
-
-  // Cache of resolved human titles for receipt chips: slug -> title|undefined
-  const [receiptTitles, setReceiptTitles] = useState<Record<string, string | undefined>>({});
-
-  // Resolve human titles for current receipts (anchor/supporting/events)
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const updates: Record<string, string | undefined> = {};
-      for (const id of receipts) {
-        if (!(id in receiptTitles)) {
-          const t = await resolveAlias(id);
-          updates[id] = t;
-          if (!t) {
-            try { logEvent("ui.receipt_title_fallback", { id, rid: finalData?.meta?.request_id ?? null }); } catch {}
-          }
-        }
-      }
-      if (!cancelled && Object.keys(updates).length) {
-        setReceiptTitles((prev) => ({ ...prev, ...updates }));
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [receipts, resolveAlias]);
 
   useEffect(() => {
     try { logEvent("ui.receipts_count", { count: receipts.length, rid: finalData?.meta?.request_id ?? null }); } catch {}
@@ -319,6 +347,18 @@ export default function MemoryPage() {
     const filtered = rest.filter(predicate);
     return anchor ? [anchor, ...filtered] : filtered;
   }, [allEvidenceItems, selectedTags]);
+
+  // Central handler for clicking a receipt chip inside ShortAnswer
+  const handleCitationClick = useCallback((cid: string) => {
+    try {
+      logEvent("ui.citation_click", { id: cid, rid: finalData?.meta?.request_id ?? null });
+    } catch { /* ignore logging errors */ }
+    setSelectedEvidenceId(cid);
+    const el = document.getElementById(`evidence-${cid}`);
+    if (el) {
+      try { el.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {}
+    }
+  }, [finalData]);
 
   // Log when the empty-state is shown (no evidence returned).
   useEffect(() => {
@@ -365,20 +405,15 @@ export default function MemoryPage() {
         {/* Query panel */}
         <div ref={queryPanelHostRef}>
           <QueryPanel
-            onAsk={(intent: string, decisionRef: string) => {
+            onQueryDecision={(decisionRef: string) => {
               const slug = decisionRef?.trim();
               if (!slug) {
                 setEmptyHint("I can’t trace the void — drop a decision id.");
                 return;
               }
               setEmptyHint(null);
-              const effIntent = intent ?? "why_decision";
-              try { logEvent("ui.memory.ask", { intent: effIntent, decision_ref: slug }); } catch { /* ignore */ }
-              return ask(effIntent, slug);
-            }}
-            onQuery={(q: string) => {
-              if (emptyHint) setEmptyHint(null);
-              return query(q);
+              try { logEvent("ui.memory.query_decision", { decision_ref: slug }); } catch { /* ignore */ }
+              return queryDecision(slug);
             }}
             isStreaming={isStreaming}
           />
@@ -389,66 +424,41 @@ export default function MemoryPage() {
           )}
         </div>
         {(isStreaming || shortAnswer) && (
-          <div className="mt-6">
-            <div className="section-hairline" />
-            <div>
-              <div className="flex items-center justify-between">
-                <h3 className="text-xs tracking-widest uppercase text-neonCyan/80">Short answer</h3>
-                <span
-                  className="text-xs font-mono px-2 py-1 rounded-md border border-gray-600 text-copy/80 whitespace-nowrap self-start"
-                  title={fallbackUsed ? "Deterministic fallback path used" : "Model path used"}
-                >
-                  Path: {pathLabel}
-                </span>
-              </div>
-              <div className="mt-1">
-                <p className="text-copy text-lg md:text-xl leading-snug">
-                  {mainAnswer || (isStreaming ? tokens.join("") : shortAnswer)}
-                </p>
-                {(nextFromShort || nextTitle) && (
-                  <p className="text-copy/80 text-lg md:text-xl leading-snug mt-4">
-                    <span className="font-semibold">Next:</span>{" "}{nextFromShort ?? nextTitle}
-                  </p>
-                )}
-              </div>
-              <div className="section-hairline my-3" />
-               {/* Supporting IDs moved lower */}
-              {receipts && receipts.length > 0 && (
-                <div className="mt-3 flex gap-2 overflow-x-auto whitespace-nowrap no-scrollbar">
-                  {receipts.map((cid) => (
-                    <button
-                      key={cid}
-                      type="button"
-                      onClick={() => {
-                        try {
-                          logEvent("ui.citation_click", {
-                            id: cid,
-                            rid: finalData?.meta?.request_id ?? null,
-                          });
-                        } catch { /* ignore logging errors */ }
-                        setSelectedEvidenceId(cid);
-                        const el = document.getElementById(`evidence-${cid}`);
-                        if (el) {
-                          el.scrollIntoView({ behavior: "smooth", block: "center" });
-                          el.classList.add("animate-pulse");
-                          window.setTimeout(() => el.classList.remove("animate-pulse"), 1200);
-                        }
-                      }}
-                      className="text-xs px-2 py-0.5 rounded-full border border-vaultred/50 text-vaultred hover:bg-vaultred/30 transition-colors"
-                    >
-                      <span
-                        title={receiptTitles[cid] ? undefined : "No human title available"}
-                        className={receiptTitles[cid] ? "font-sans" : "font-mono"}
-                      >
-                        {receiptTitles[cid] ?? cid}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
+          <ShortAnswer
+            isStreaming={isStreaming}
+            tokens={tokens as any}
+            mainAnswer={mainAnswer}
+            leadBeforeEvents={leadBeforeEvents || shortAnswer}
+            eventsFromShort={eventsFromShort}
+            anchorHeading={anchorHeading}
+            anchorDescription={anchorDescription}
+            nextFromShort={nextFromShort}
+            nextTitle={nextTitle}
+            receipts={receipts}
+            onCitationClick={handleCitationClick}
+            onOpenAllowedIds={handleOpenAllowedIds}
+            onOpenAudit={handleOpenAudit}
+          />
         )}
+        {/* All Allowed IDs (expandable enriched catalog) */}
+        {!isStreaming && finalData && (
+          <AllowedIdsDrawer
+            anchorId={finalData?.anchor?.id || ""}
+            edges={(
+              ((finalData as any)?.graph?.edges) ||
+              ((finalData as any)?.evidence?.graph?.edges) || []
+            ) as GraphEdge[]}
+            anchor={(finalData?.anchor || (finalData as any)?.evidence?.anchor) as any}
+            allowedIds={finalData?.meta?.allowed_ids || finalData?.evidence?.allowed_ids || []}
+            policyFp={finalData?.meta?.policy_fp || ""}
+            allowedIdsFp={finalData?.meta?.allowed_ids_fp || ""}
+            snapshotEtag={finalData?.meta?.snapshot_etag || ""}
+            loadCatalog={loadCatalog}
+            loading={catalogLoading}
+            error={catalogError}
+          />
+        )}
+
         {/* Evidence & graph sections */}
         {!isStreaming && finalData?.evidence && (
           <div className="mt-8 space-y-6">
@@ -498,24 +508,6 @@ export default function MemoryPage() {
                   }}
                   className="mt-2"
                 />
-                {/* Section: Graph */}
-                <div className="mt-8">
-                  <div className="section-hairline" />
-                  <h3 className="text-xs tracking-widest uppercase text-neonCyan/80 mb-2">Graph</h3>
-                  <GraphView
-                    items={filteredEventsForGraph}
-                    anchor={finalData?.evidence?.anchor as any}
-                    transitions={finalData?.evidence?.transitions as any}
-                    selectedId={selectedEvidenceId}
-                    onSelect={(id) => {
-                      setSelectedEvidenceId(id);
-                      try {
-                        logEvent("ui.evidence_select", { id, rid: finalData?.meta?.request_id ?? null });
-                      } catch {}
-                    }}
-                  />
-                  {/* Transitions summary (preceding/succeeding) */}
-                </div>
               </>
             ) : (
               <EmptyResult
@@ -528,22 +520,10 @@ export default function MemoryPage() {
             )}
           </div>
         )}
-        {/* Audit drawer trigger */}
-        {(tokens.length > 0 || isStreaming || finalData) && (
-          <div className="mt-8 flex justify-end">
-            <Button
-              onClick={handleOpenAudit}
-              disabled={!finalData}
-              className={!finalData ? "opacity-50 cursor-not-allowed" : undefined}
-            >
-              Audit
-            </Button>
-          </div>
-        )}
         {/* Error state */}
         {error && !isStreaming && (
           <div className="mt-6 pt-4 border-t border-red-500">
-            <p className="text-red-400 font-mono text-sm">Error: {error.message}</p>
+            <p className="text-red-400 font-mono text-sm">Error: {String(error)}</p>
           </div>
         )}
       </Card>

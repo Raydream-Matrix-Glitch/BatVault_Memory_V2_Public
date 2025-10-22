@@ -4,7 +4,7 @@ services:
   prometheus:
     image: prom/prometheus:latest
     restart: unless-stopped
-    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle"]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle", "--log.level=warn", "--log.format=json"]
     volumes:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -15,13 +15,20 @@ services:
     image: grafana/grafana:10.4.2
     env_file:
       - .env
-      - .env.local
     restart: unless-stopped
     volumes:
       - ./ops/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./ops/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
+    environment:
+      - GF_LOG_LEVEL=warn
+      - GF_LOG_CONSOLE_LEVEL=warn
+      # Keep alerting etc.; drop noisy "info" lines:
+      - "GF_LOG_FILTERS=provisioning.*:error ngalert.*:warn grafana-apiserver:warn plugins.update.checker:warn grafana.update.checker:warn"
+      # Remove update/usage spam entirely:
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
     depends_on: [prometheus]
     networks: [batnet]
 
@@ -30,7 +37,6 @@ services:
     restart: always
     env_file:
       - .env
-      - .env.local
     command: >
       arangod
       --server.endpoint=tcp://0.0.0.0:8529
@@ -69,13 +75,22 @@ services:
       retries: 5
     networks: [batnet]
 
+  opa:
+    image: ${OPA_IMAGE:-openpolicyagent/opa:0.67.1}
+    user: "1000:1000"
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policies"]
+    volumes:
+      - ./policy/opa:/policies:ro
+    ports: ["8181:8181"]
+    restart: unless-stopped
+    networks: [batnet]
+
   minio:
     image: minio/minio:latest
     restart: unless-stopped
     command: server /data --console-address ":9001"
     env_file:
       - .env
-      - .env.local
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -108,15 +123,14 @@ services:
       dockerfile: ops/docker/Dockerfile.python
     environment:
       - OTEL_SERVICE_NAME=api_edge
+      - SERVICE_NAME=api_edge
       - BATVAULT_HEALTH_PORT=8080
     env_file:
       - .env
-      - .env.local
-      - services/api_edge/.env.local
     command: ["python", "-m", "api_edge.__main__"]
     ports: ["8080:8080"]
     healthcheck:
-      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/readyz || curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/healthz"]
       interval: 10s
       timeout: 5s
       start_period: 15s
@@ -133,17 +147,25 @@ services:
 
   gateway:
     image: batvault/python-svc:dev
+    build:
+      context: .
+      dockerfile: ops/docker/Dockerfile.python
+      args:
+        SERVICE_NAME: gateway
     environment:
       - OTEL_SERVICE_NAME=gateway
+      - SERVICE_NAME=gateway
       - BATVAULT_HEALTH_PORT=8081
+      - BATVAULT_SCHEMAS_DIR=/app/packages/core_models/src/core_models/schemas
+      # Prefer secrets or exported env for the signing key:
+      # - GATEWAY_ED25519_PRIV_B64=${GATEWAY_ED25519_PRIV_B64}
+      - GATEWAY_ED25519_PRIV_B64_FILE=/run/secrets/gateway_signing_seed_b64
     env_file:
       - .env
-      - .env.local
-      - services/gateway/.env.local
     command: ["python", "-m", "gateway.__main__"]
     ports: ["8081:8081"]
     healthcheck:
-      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/readyz || curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/healthz"]
       interval: 10s
       timeout: 5s
       start_period: 15s
@@ -156,25 +178,26 @@ services:
       minio:
         condition: service_healthy
     restart: unless-stopped
+    secrets:
+      - gateway_signing_seed_b64
     networks: [batnet]
 
   memory_api:
     image: batvault/python-svc:dev
     environment:
       - OTEL_SERVICE_NAME=memory_api
+      - SERVICE_NAME=memory_api
       - BATVAULT_HEALTH_PORT=8000
       - POLICY_DIR=/app/policy/roles
+      - OPA_URL=http://opa:8181
     env_file:
       - .env
-      - .env.local
-      - services/memory_api/.env.local
     command: ["python", "-m", "memory_api.__main__"]
     volumes:
       - ./policy/roles:/app/policy/roles:ro
-    # Expose container:8000 to host:8082 (internal still 8000)
     ports: ["8082:8000"]
     healthcheck:
-      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/readyz || curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/healthz"]
       interval: 10s
       start_period: 15s
       retries: 5
@@ -185,143 +208,19 @@ services:
         condition: service_healthy
     restart: unless-stopped
     networks: [batnet]
-
-  # -------------------------------------------------------------------
-  # Open-source LLM & Embeddings services (optional via profile: llm)
-  #
-  # These services provide text summarisation and embedding inference for the
-  # Gateway and Memory API.  They are disabled by default and only started
-  # when you explicitly select the ``llm`` profile.  To enable them, run:
-  #
-  #     docker compose --profile llm up
-  #
-  # The HuggingFace model weights are cached under the ``models-cache``
-  # named volume so that downloads persist across container restarts.
-  # Each service exposes its own healthcheck to allow the Gateway and
-  # Memory API to wait until the models are ready.
-  vllm-control:
-    profiles: [llm]
-    image: vllm/vllm-openai:latest
-    # Hard cap the container RAM so the host doesn't get eaten.
-    mem_limit: "16g"
-    mem_reservation: "8g"
-    shm_size: "1g"
-    gpus: "all"
-    environment:
-      - VLLM_MODEL_NAME=${VLLM_MODEL_NAME:-Qwen/Qwen2-7B-Instruct-AWQ}
-      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
-      - HF_HOME=/data/hf
-      - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtbbmalloc.so.2
-      # Allow vLLM to page KV cache into host RAM if needed.
-      - VLLM_SWAP_GB=${VLLM_SWAP_GB:-4}
-      # GPU VRAM target fraction. 0.86 leaves ~1.7 GiB headroom on 12 GiB GPUs.
-      - VLLM_GPU_UTIL=${VLLM_GPU_UTIL:-0.86}
-    command:
-      - --host
-      - "0.0.0.0"
-      - --model
-      - "${VLLM_MODEL_NAME:-Qwen/Qwen2-7B-Instruct-AWQ}"
-      - --port
-      - "8010"
-      - --download-dir
-      - "/data/hf"
-      # Carve KV cache as a fraction of device VRAM
-      - --gpu-memory-utilization
-      - "${VLLM_GPU_UTIL:-0.86}"
-      # Load quantized weights
-      - --quantization
-      - "${VLLM_QUANTIZATION:-awq}"
-      # Bound KV cache by limiting effective context and concurrent sequences
-      - --max-model-len
-      - "${VLLM_MAX_MODEL_LEN:-2048}"
-      - --max-num-seqs
-      - "${VLLM_MAX_NUM_SEQS:-2}"
-      - --max-num-batched-tokens
-      - "${VLLM_MAX_BATCHED_TOKENS:-2048}"
-      - --dtype
-      - "float16"
-      # Page part of KV cache to host RAM when spikes occur
-      - --swap-space
-      - "${VLLM_SWAP_GB:-4}"
-      - --disable-frontend-multiprocessing
-    ports:
-      - "8010:8010"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:8010/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - models-cache:/data/hf
-    networks: [batnet]
-
-  tgi-canary:
-    # run docker compose --profile canary up
-    profiles: [canary]
-    image: ghcr.io/huggingface/text-generation-inference:latest
-    mem_limit: "8g"
-    mem_reservation: "6g"
-    env_file:
-      - .env
-      - .env.local
-    command:
-      - --model-id
-      - "${TGI_CANARY_MODEL_ID:?err}"
-      - --port
-      - "8090"
-      # be explicit on single-GPU boxes
-      - --num-shard
-      - "1"
-    gpus: "all"
-    ports:
-      - "8090:8090"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:8090/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - models-cache:/data/hf
-    networks: [batnet]
-
-  tei-embed:
-    profiles: [llm]
-    image: ghcr.io/huggingface/text-embeddings-inference:latest
-    gpus: "all"
-    env_file:
-      - .env
-      - .env.local
-    command:
-      - --model-id
-      - "${TEI_MODEL_NAME:?err}"
-      - --port
-      - "8085"
-      - --pooling
-      - "mean"
-    ports:
-      - "8085:8085"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost:8085/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-    volumes:
-      - models-cache:/data/hf
-    networks: [batnet]
-
   ingest:
     image: batvault/python-svc:dev
     environment:
       - OTEL_SERVICE_NAME=ingest
+      - SERVICE_NAME=ingest
       - BATVAULT_HEALTH_PORT=8083
+      - BATVAULT_INGEST_PROCESS=1
     env_file:
       - .env
-      - .env.local
-      - services/ingest/.env.local
     command: ["python", "-m", "ingest.__main__"]
     ports: ["8083:8083"]
     healthcheck:
-      test: ["CMD-SHELL","curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/readyz || curl -fsS http://localhost:$${BATVAULT_HEALTH_PORT}/healthz"]
       interval: 10s
       timeout: 5s
       start_period: 15s
@@ -339,7 +238,6 @@ services:
     image: jaegertracing/all-in-one:1.57
     env_file:
       - .env
-      - .env.local
     restart: unless-stopped
     ports:
       - "16686:16686"
@@ -351,6 +249,9 @@ services:
     build:
       context: ./batvault_frontend
       dockerfile: dockerfile
+      args:
+        VITE_GATEWAY_BASE: ${VITE_API_BASE:-http://localhost:8080}
+        VITE_MEMORY_BASE:  ${VITE_MEMORY_BASE:-http://localhost:8082}
     ports:
       - "5173:80"
     depends_on:
@@ -359,7 +260,7 @@ services:
     networks: [batnet]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -fs http://localhost || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost/healthz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -370,3 +271,7 @@ volumes:
 networks:
   batnet:
     driver: bridge
+
+secrets:
+  gateway_signing_seed_b64:
+    file: ./ops/secrets/gateway_signing_seed_b64

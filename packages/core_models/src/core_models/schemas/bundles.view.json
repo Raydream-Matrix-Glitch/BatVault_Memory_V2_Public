@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/bundles.view.json",
+  "title": "Bundle (View)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "response.json": { "$ref": "./bundles.exec_summary.json" },
+    "trace.json":    { "$ref": "./bundles.trace.json" }
+  },
+  "required": ["response.json", "trace.json"]
+}

@@ -6,17 +6,21 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
+import httpx  # retained for types; calls go through core_http
+from core_http import fetch_json_sync
+from core_models.ontology import NodeType, EdgeType
 # Import OTEL context injector so all outgoing HTTP calls carry the current trace.
 try:
     from core_observability import inject_trace_context  # type: ignore
 except Exception:
     inject_trace_context = None  # type: ignore
 from core_config import get_settings
-from core_logging import get_logger, log_stage, trace_span
+from core_logging import get_logger, log_stage, trace_span, current_request_id
 from core_config.constants import timeout_for_stage
 import core_metrics
 from core_utils import jsonx
+from core_utils.domain import anchor_to_storage_key
+
 
 logger = get_logger("core_storage")
 
@@ -57,8 +61,24 @@ class ArangoStore:
         self.catalog_col, self.meta_col = catalog_col, meta_col
         self.db: Optional[object] = None
         self.graph: Optional[object] = None
+        self._core_indexes_ok = False
         if not lazy:
             self._connect()
+
+    def _bootstrap_verbose(self) -> bool:
+        return os.getenv("ARANGO_BOOTSTRAP_VERBOSE", "0") == "1"
+
+    # Environment helpers
+    def _is_dev(self) -> bool:
+        """
+        Return True when running in a development environment.
+        Uses core_config settings if present, falls back to ENVIRONMENT.
+        """
+        try:
+            env = getattr(get_settings(), "environment", None) or os.getenv("ENVIRONMENT", "dev")
+            return str(env).lower() == "dev"
+        except Exception:
+            return os.getenv("ENVIRONMENT", "dev").lower() == "dev"
 
     def _connect(self) -> None:
         if self.db is not None:
@@ -77,26 +97,35 @@ class ArangoStore:
         try:
             socket.getaddrinfo(host, None)            # DNS probe
         except socket.gaierror:
-            logger.warning("ArangoDB host '%s' not resolvable – stub-mode", host)
-            self.db = self.graph = None
-            return
+            if self._is_dev():
+                logger.warning("ArangoDB host '%s' not resolvable – stub-mode (DEV)", host)
+                self.db = self.graph = None
+                return
+            logger.error("ArangoDB host '%s' not resolvable – abort (non-DEV)", host)
+            raise RuntimeError(f"ArangoDB host '{host}' not resolvable (non-DEV)")
 
         try:
             sock = socket.create_connection((host, port), timeout=0.05)
             sock.close()
         except OSError:
-            logger.warning("ArangoDB %s:%s unreachable – stub-mode", host, port)
-            self.db = self.graph = None
-            return
+            if self._is_dev():
+                logger.warning("ArangoDB %s:%s unreachable – stub-mode (DEV)", host, port)
+                self.db = self.graph = None
+                return
+            logger.error("ArangoDB %s:%s unreachable – abort (non-DEV)", host, port)
+            raise RuntimeError(f"ArangoDB {host}:{port} unreachable (non-DEV)")
 
         # DNS resolves *and* port accepts connections – continue with normal
         # driver initialisation.
         try:
             socket.getaddrinfo(host, None)
         except socket.gaierror:
-            logger.warning("ArangoDB host '%s' not resolvable – stub-mode", host)
-            self.db = self.graph = None
-            return
+            if self._is_dev():
+                logger.warning("ArangoDB host '%s' not resolvable – stub-mode (DEV)", host)
+                self.db = self.graph = None
+                return
+            logger.error("ArangoDB host '%s' not resolvable – abort (non-DEV)", host)
+            raise RuntimeError(f"ArangoDB host '{host}' not resolvable (non-DEV)")
         try:
             from arango import ArangoClient
 
@@ -112,8 +141,12 @@ class ArangoStore:
                 else self.db.create_graph(self._graph_name)
             )
         except Exception as exc:
-            logger.warning("ArangoDB unavailable – running in stub mode (%s)", exc)
-            self.db = self.graph = None
+            if self._is_dev():
+                logger.warning("ArangoDB unavailable – stub mode (DEV) (%s)", exc)
+                self.db = self.graph = None
+            else:
+                logger.error("ArangoDB unavailable – abort (non-DEV): %s", exc)
+                raise
         finally:
             core_metrics.histogram_ms(
                 "arangodb.connection_latency_ms",
@@ -133,29 +166,38 @@ class ArangoStore:
             )
         self._ensure_search_components()
         if os.getenv("ARANGO_VECTOR_INDEX_ENABLED", "false").lower() == "true":
-            self._audit_embedding_config()
-            self._maybe_create_vector_index()
+            # Bootstrap verbosity is opt-in; avoid noisy logs by default.
+            if self._bootstrap_verbose():
+                self._audit_embedding_config()
+                self._maybe_create_vector_index()
+            else:
+                # Still validate config (raise if invalid), but do it silently.
+                self._audit_embedding_config(silent=True); self._maybe_create_vector_index(silent=True)
+
+
+    def ready(self) -> bool:
+        """Return True when a real database connection is established."""
+        return self.db is not None
 
     # ------------------------------------------------------------
     # Search components (vector index, analyzer & view)
     # ------------------------------------------------------------
 
     def _ensure_search_components(self) -> None:
-        with trace_span("storage.arango.ensure_search", stage="storage") as sp:
-            # Attach stable attributes on the parent span so that traces and logs
-            # can be correlated back to the concrete Arango collections and search
-            # components.
-            try:
-                sp.set_attribute("analyzer", "text_en")
-                sp.set_attribute("view", "nodes_search")
-                sp.set_attribute("collection", "nodes")
-            except Exception:
-                pass
+        verbose = self._bootstrap_verbose()
+        if verbose:
+            with trace_span("storage.arango.ensure_search", stage="storage") as sp:
+                try:
+                    sp.set_attribute("analyzer", "text_en")
+                    sp.set_attribute("view", "nodes_search")
+                    sp.set_attribute("collection", "nodes")
+                except Exception:
+                    pass
 
-            cfg = get_settings()
-            auth = httpx.BasicAuth(cfg.arango_root_user, cfg.arango_root_password)
-            base = f"{cfg.arango_url}/_db/{self.db.name}"
-            analyzer = {
+        cfg = get_settings()
+        auth = httpx.BasicAuth(cfg.arango_root_user, cfg.arango_root_password)
+        base = f"{cfg.arango_url}/_db/{self.db.name}"
+        analyzer = {
                 "name": "text_en",
                 "type": "text",
                 "properties": {
@@ -166,102 +208,78 @@ class ArangoStore:
                 },
             }
 
-            # Inject the current trace context into outbound calls if possible.
-            headers = inject_trace_context({}) if inject_trace_context else {}
-            # Create the analyzer.  Wrap the call in its own span so that durations
-            # and statuses can be inspected in trace UIs.  Duplicate definitions
-            # (HTTP 400 or 409) are tolerated per the original logic.
-            try:
-                with trace_span("storage.arango.http.create_analyzer", stage="storage") as call_span:
-                    try:
-                        call_span.set_attribute("analyzer", "text_en")
-                        call_span.set_attribute("collection", "nodes")
-                        call_span.set_attribute("timeout_ms", int(1000*timeout_for_stage("enrich")))
-                    except Exception:
-                        pass
-                    _t0 = time.perf_counter()
-                    resp = httpx.post(
-                        f"{base}/_api/analyzer",
-                        json=analyzer,
-                        auth=auth,
-                        timeout=timeout_for_stage("enrich"),
-                        headers=headers,
-                    )
-                    try:
-                        call_span.set_attribute("duration_ms", int((time.perf_counter() - _t0) * 1000))
-                        call_span.set_attribute("status_code", getattr(resp, "status_code", 0))
-                    except Exception:
-                        pass
-            except httpx.HTTPStatusError as exc:
-                # Allow existing analyzer or duplicate definitions (400/409)
-                if exc.response.status_code not in (400, 409):
-                    raise
-            # Create the ArangoSearch view.  This call is idempotent; existing
-            # resources return HTTP 400/409.  Instrument the call to capture
-            # latency and status.
-            try:
-                with trace_span("storage.arango.http.create_view", stage="storage") as call_span:
-                    try:
-                        call_span.set_attribute("view", "nodes_search")
-                        call_span.set_attribute("collection", "nodes")
-                        call_span.set_attribute("timeout_ms", int(1000*timeout_for_stage("enrich")))
-                    except Exception:
-                        pass
-                    _t0 = time.perf_counter()
-                    resp2 = httpx.post(
-                        f"{base}/_api/view",
-                        json={"name": "nodes_search", "type": "arangosearch"},
-                        auth=auth,
-                        timeout=timeout_for_stage("enrich"),
-                        headers=headers,
-                    )
-                    try:
-                        call_span.set_attribute("duration_ms", int((time.perf_counter() - _t0) * 1000))
-                        call_span.set_attribute("status_code", getattr(resp2, "status_code", 0))
-                    except Exception:
-                        pass
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code not in (400, 409):
-                    raise
-            # Define view properties including which fields are indexed.  The HTTP
-            # PATCH will create or update the view’s properties.  Use a dedicated
-            # span for observability and to record the result.
-            view_props = {
-                "links": {
-                    "nodes": {
-                        "includeAllFields": False,
-                        "fields": {
-                            "rationale": {"analyzers": ["text_en"]},
-                            "summary": {"analyzers": ["text_en"]},
-                            "description": {"analyzers": ["text_en"]},
-                            "reason": {"analyzers": ["text_en"]},
-                            "option": {"analyzers": ["text_en"]},
-                            "title": {"analyzers": ["text_en"]},
-                        },
-                        "storeValues": "id",
-                    }
+        headers = inject_trace_context({}) if inject_trace_context else {}
+        # Include the current request id for audit correlation
+        try:
+            _rid = current_request_id()
+            if _rid:
+                headers.setdefault("x-request-id", _rid)
+        except Exception:
+            pass
+        # Create analyzer (idempotent). Silent unless unexpected error.
+        if verbose:
+            with trace_span("storage.arango.http.create_analyzer", stage="storage"):
+                resp = httpx.post(
+                    f"{base}/_api/analyzer", json=analyzer, auth=auth,
+                    timeout=timeout_for_stage("enrich"), headers=headers
+                )
+        else:
+            resp = httpx.post(
+                f"{base}/_api/analyzer", json=analyzer, auth=auth,
+                timeout=timeout_for_stage("enrich"), headers=headers
+            )
+            if resp.status_code not in (200, 201, 400, 409):
+                log_stage(get_logger("storage"), "bootstrap", "arango_bootstrap_error",
+                          step="create_analyzer", status=int(resp.status_code), body=resp.text[:240],
+                          request_id=(current_request_id() or "startup"))
+        # Create ArangoSearch view (idempotent).
+        payload_view = {"name": "nodes_search", "type": "arangosearch"}
+        if verbose:
+            with trace_span("storage.arango.http.create_view", stage="storage"):
+                resp2 = httpx.post(
+                    f"{base}/_api/view", json=payload_view, auth=auth,
+                    timeout=timeout_for_stage("enrich"), headers=headers
+                )
+        else:
+            resp2 = httpx.post(
+                f"{base}/_api/view", json=payload_view, auth=auth,
+                timeout=timeout_for_stage("enrich"), headers=headers
+            )
+            if resp2.status_code not in (200, 201, 400, 409):
+                log_stage(get_logger("storage"), "bootstrap", "arango_bootstrap_error",
+                          step="create_view", status=int(resp2.status_code), body=resp2.text[:240],
+                          request_id=(current_request_id() or "startup"))
+        # Define view properties incl. indexed fields; PATCH creates/updates.
+        # Index all present and future node fields; strings analyzed by text_en.
+        view_props = {
+            "links": {
+                "nodes": {
+                    "includeAllFields": True,
+                    "analyzers": ["text_en"],
+                    "storeValues": "id",
                 }
             }
-            with trace_span("storage.arango.http.patch_view", stage="storage") as call_span:
-                try:
-                    call_span.set_attribute("view", "nodes_search")
-                    call_span.set_attribute("collection", "nodes")
-                    call_span.set_attribute("timeout_ms", int(1000*timeout_for_stage("enrich")))
-                except Exception:
-                    pass
-                _t0 = time.perf_counter()
+        }
+        if verbose:
+            with trace_span("storage.arango.http.patch_view", stage="storage"):
                 resp3 = httpx.patch(
                     f"{base}/_api/view/nodes_search/properties",
-                    json=view_props,
-                    auth=auth,
-                    timeout=timeout_for_stage("enrich"),
-                    headers=headers,
+                    json=view_props, auth=auth,
+                    timeout=timeout_for_stage("enrich"), headers=headers
                 )
-                try:
-                    call_span.set_attribute("duration_ms", int((time.perf_counter() - _t0) * 1000))
-                    call_span.set_attribute("status_code", getattr(resp3, "status_code", 0))
-                except Exception:
-                    pass
+        else:
+            resp3 = httpx.patch(
+                f"{base}/_api/view/nodes_search/properties",
+                json=view_props, auth=auth,
+                timeout=timeout_for_stage("enrich"), headers=headers
+            )
+            if resp3.status_code not in (200, 201):
+                # 400/409 here usually means "already configured" which PATCH shouldn't return;
+                # still keep bootstrap quiet unless it's clearly unexpected.
+                if resp3.status_code not in (400, 409):
+                    log_stage(get_logger("storage"), "bootstrap", "arango_bootstrap_error",
+                              step="patch_view", status=int(resp3.status_code), body=resp3.text[:240],
+                              request_id=(current_request_id() or "startup"))
 
     def _count_vectors(self) -> int:
         try:
@@ -269,11 +287,12 @@ class ArangoStore:
                 'RETURN LENGTH(FOR d IN nodes FILTER HAS(d, "embedding") RETURN 1)'
             )
             return int(next(cursor))
-        except Exception as exc:
-            log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_estimate_warn", error=str(exc))
+        except (RuntimeError, ValueError, TypeError, StopIteration) as exc:
+            log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_estimate_warn",
+                      error=str(exc), request_id=(current_request_id() or "startup"))
             return 0
 
-    def _maybe_create_vector_index(self) -> None:
+    def _maybe_create_vector_index(self, silent: bool = False) -> None:
         """Create a vector index on nodes.embedding (HNSW or IVF).
 
         Chooses the primary index type via ARANGO_VECTOR_INDEX_TYPE ("hnsw" or "ivf")
@@ -325,7 +344,7 @@ class ArangoStore:
             if num_probes_env is not None:
                 try:
                     params["numProbes"] = int(num_probes_env)
-                except Exception:
+                except (OSError, httpx.HTTPError, ValueError, RuntimeError):
                     # Ignore invalid values; omitting numProbes is always safe
                     pass
             return {
@@ -359,6 +378,12 @@ class ArangoStore:
                 except Exception:
                     pass
                 hdrs = inject_trace_context({}) if inject_trace_context else {}
+                try:
+                    _rid = current_request_id()
+                    if _rid:
+                        hdrs.setdefault("x-request-id", _rid)
+                except Exception:
+                    pass
                 _t0 = time.perf_counter()
                 resp = httpx.post(
                     url,
@@ -379,7 +404,8 @@ class ArangoStore:
             try:
                 resp = _create(payload)
             except Exception as exc:
-                log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_error", error=str(exc))
+                if not silent:
+                    log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_error", error=str(exc))
                 break
 
             common = {
@@ -395,7 +421,8 @@ class ArangoStore:
                 "vector_count": vectors,
             }
             if resp.status_code in (200, 201):
-                log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created", **common)
+                if not silent:
+                    log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created", **common)
                 return
             # Already exists (duplicate index): HTTP 409 or errorNum 1210 in JSON body.
             if resp.status_code == 409 or (
@@ -436,29 +463,32 @@ class ArangoStore:
                         common_retry = dict(common)
                         common_retry["nLists"] = _p2["params"].get("nLists")
                         common_retry["numProbes"] = _p2["params"].get("numProbes")
-                        log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created", **common_retry)
+                        log_stage(get_logger("memory_api"), "bootstrap", "arango_vector_index_created",
+                                  request_id=(current_request_id() or "startup"), **common_retry)
                         return
                 except Exception:
                     pass
 
-            log_stage(
-                get_logger("memory_api"),
-                "bootstrap",
-                "arango_vector_index_warn",
-                body=body_txt,
-                **common,
-                payload_schema="vector+params/" + payload["params"].get("indexType", "unknown"),
-            )
+            if not silent:
+                log_stage(
+                    get_logger("memory_api"),
+                    "bootstrap",
+                    "arango_vector_index_warn",
+                    body=body_txt,
+                    **common,
+                    payload_schema="vector+params/" + payload["params"].get("indexType", "unknown"),
+                )
             return
 
-    def _audit_embedding_config(self) -> None:
+    def _audit_embedding_config(self, silent: bool = False) -> None:
         cfg = get_settings()
         dim = int(getattr(cfg, "embedding_dim", 0))
         metric = str(getattr(cfg, "vector_metric", "cosine")).lower()
         ok_dim = dim > 0
         ok_metric = metric in {"cosine", "l2"}
         fp = hashlib.sha1(f"{dim}|{metric}".encode()).hexdigest()[:12]
-        log_stage(
+        if not silent:
+            log_stage(
             get_logger("memory_api"),
             "bootstrap",
             "embedding_config",
@@ -467,82 +497,193 @@ class ArangoStore:
             config_fingerprint=fp,
             valid_dim=ok_dim,
             valid_metric=ok_metric,
-        )
+            request_id=(current_request_id() or "startup"),
+            )
         if not ok_dim or not ok_metric:
             raise ValueError(f"Invalid embedding configuration: dim={dim}, metric='{metric}'")
 
-    # ------------------------------------------------------------
-    # Upsert helpers
-    # ------------------------------------------------------------
 
-    def upsert_node(self, node_id: str, node_type: str, payload: Dict[str, Any]) -> None:
-        """Insert or replace a node document after applying normalisation.
-
-        Prior to writing to the ``nodes`` collection this method applies
-        the shared normalisation routine to the provided payload.  This
-        guarantees that all persisted documents adhere to the canonical
-        schema (``x-extra`` presence, tag formatting, allowed field
-        filtering and timestamp coercion).  The normalised payload is
-        then augmented with the Arango-specific ``_key`` and ``type``
-        keys and written using an upsert (insert with overwrite).
+    # ------------------------------------------------------------------
+    # Bulk-first write API (public) with micro-batching and retries
+    # ------------------------------------------------------------------
+    def upsert_nodes(self, docs: List[Dict[str, Any]], snapshot_etag: Optional[str] = None) -> Dict[str, Any]:
+        """Bulk upsert nodes.
+        Returns a summary dict: {batches,written,deduped,rejected,errors:[...]}.
+        This is the **only** public node write method.
         """
         self._connect()
-        # Import within the method to avoid creating dependency cycles.
-        # If the shared normaliser cannot be imported (e.g. during tests),
-        # fall back to verbatim storage.  Import errors are swallowed to
-        # allow ingestion to proceed.
-        try:
-            from shared.normalize import (
-                normalize_decision,
-                normalize_event,
-                normalize_transition,
-            )
-        except Exception:
-            normalised = dict(payload)
-        else:
-            if node_type == "decision":
-                normalised = normalize_decision(payload)
-            elif node_type == "event":
-                normalised = normalize_event(payload)
-            elif node_type == "transition":
-                normalised = normalize_transition(payload)
-            else:
-                normalised = dict(payload)
-        # Attach the storage specific identifiers.  The node id maps to
-        # the Arango ``_key``; type is preserved if present on the
-        # normalised document but overwritten to ensure consistency.
-        doc = dict(normalised)
-        doc["_key"] = node_id
-        doc["type"] = node_type
-        # In stub-mode ``self.db`` may be None; guard against AttributeError
-        if self.db is not None:
-            self.db.collection("nodes").insert(doc, overwrite=True)
+        self._ensure_core_indexes_once()
+        summary = {"batches": 0, "written": 0, "deduped": 0, "rejected": 0, "errors": []}
+        if self.db is None:
+            if self._is_dev():
+                return summary
+            raise RuntimeError("Storage unavailable (non-DEV): cannot upsert nodes")
 
-    def upsert_edge(
-        self,
-        edge_id: str,
-        from_id: str,
-        to_id: str,
-        rel_type: str,
-        payload: Dict[str, Any],
-    ) -> None:
-        # tolerate stub-mode when DB is unavailable
-        self._connect()
-        if self.db is None or not hasattr(self.db, "collection"):
-            return
-        safe_key = self._safe_key(edge_id)
-        if safe_key != edge_id:
-            logger.info("edge_key_sanitised", extra={"raw": edge_id, "sanitised": safe_key, "stage": "storage"})
-        doc = dict(payload)
-        doc.update(
-            {
-                "_key": safe_key,
-                "_from": f"nodes/{from_id}",
-                "_to": f"nodes/{to_id}",
-                "type": rel_type,
+        mb_size = int(os.getenv("STORAGE_MICROBATCH_SIZE", "1000"))
+        max_retries = int(os.getenv("STORAGE_MAX_RETRIES", "3"))
+        base_ms = int(os.getenv("HTTP_RETRY_BASE_MS", "50"))
+        jitter_ms = int(os.getenv("HTTP_RETRY_JITTER_MS", "200"))
+
+        def _sanitize(d: Dict[str, Any]) -> Dict[str, Any]:
+            """
+            Accept all schema-validated fields (validator is authoritative).
+            Only strip obvious legacy junk keys; compute Arango internals.
+            """
+            LEGACY_BLOCKLIST = {
+                "preceding","succeeding","supported_by","based_on","led_to",
+                "preceding_ids","adjacency","summary","snippet","rationale","option","reason","tags"
             }
-        )
-        self.db.collection("edges").insert(doc, overwrite=True)
+            doc = {k: v for k, v in (d or {}).items() if k not in LEGACY_BLOCKLIST}
+            # On-wire ID is the ANCHOR "<domain>#<id>"; storage _key maps '#'→'_'
+            dom, nid = doc.get("domain"), doc.get("id")
+            if not dom or not nid:
+                raise ValueError(f"node missing domain/id for anchor key: {doc}")
+            anchor = f"{dom}#{nid}"
+            doc["_key"] = self._safe_key(anchor_to_storage_key(anchor))
+            if snapshot_etag:
+                doc["snapshot_etag"] = snapshot_etag
+            return doc
+
+        batch_no = 0
+        for i in range(0, len(docs), mb_size):
+            batch = [ _sanitize(x) for x in docs[i:i+mb_size] ]
+            batch_no += 1
+            summary["batches"] += 1
+            attempt = 0
+            while True:
+                try:
+                    created, updated = self._bulk_upsert_nodes_fast(batch)
+                    summary["written"] += int(created + updated)
+                    summary["deduped"] += int(updated)
+                    break
+                except Exception as exc:
+                    attempt += 1
+                    if attempt > max_retries:
+                        log_stage(get_logger("storage"), "storage", "upsert_nodes_batch_failed",
+                                  batch=batch_no, error=str(exc))
+                        # Fallback to per-doc insert to isolate errors
+                        n_ok = 0
+                        for d in batch:
+                            try:
+                                self.db.collection("nodes").insert(d, overwrite=True)
+                                n_ok += 1
+                            except Exception as doc_exc:
+                                summary["rejected"] += 1
+                                summary["errors"].append({"doc_id": d.get("id"), "reason": str(doc_exc)})
+                        summary["written"] += n_ok
+                        break
+                    backoff = (base_ms * (2 ** (attempt - 1)) + int(os.urandom(1)[0] % max(1, jitter_ms))) / 1000.0
+                    time.sleep(backoff)
+
+        return summary
+
+    def upsert_edges(self, docs: List[Dict[str, Any]], snapshot_etag: Optional[str] = None) -> Dict[str, Any]:
+        """Bulk upsert edges.
+        Returns a summary dict: {batches,written,deduped,rejected,errors:[...]}.
+        This is the **only** public edge write method.
+        """
+        self._connect()
+        self._ensure_core_indexes_once()
+        summary = {"batches": 0, "written": 0, "deduped": 0, "rejected": 0, "errors": []}
+        if self.db is None:
+            if self._is_dev():
+                return summary
+            raise RuntimeError("Storage unavailable (non-DEV): cannot upsert edges")
+
+        mb_size = int(os.getenv("STORAGE_MICROBATCH_SIZE", "1000"))
+        max_retries = int(os.getenv("STORAGE_MAX_RETRIES", "3"))
+        base_ms = int(os.getenv("HTTP_RETRY_BASE_MS", "50"))
+        jitter_ms = int(os.getenv("HTTP_RETRY_JITTER_MS", "200"))
+
+        def _sanitize_edge(e: Dict[str, Any]) -> Dict[str, Any]:
+            """
+            Minimal transformation only:
+            - preserve all incoming fields (validator/ingest are authoritative)
+            - add Arango internals: _key, _from, _to
+            - add optional snapshot_etag
+            """
+            d = dict(e or {})
+            _id, _f, _t = d.get("id"), d.get("from"), d.get("to")
+            if not _id or not _f or not _t or "#" not in _f or "#" not in _t:
+                raise ValueError(f"invalid edge (id/from/to) or anchor format: {d!r}")
+            d["_key"]  = self._safe_key(str(_id))
+            d["_from"] = f"nodes/{self._safe_key(anchor_to_storage_key(_f))}"
+            d["_to"]   = f"nodes/{self._safe_key(anchor_to_storage_key(_t))}"
+            # Do not persist legacy from/to copies; Arango stores only _from/_to.
+            for k in ("from","to"):
+                d.pop(k, None)
+            if snapshot_etag:
+                d["snapshot_etag"] = snapshot_etag
+            return d
+
+        batch_no = 0
+        for i in range(0, len(docs), mb_size):
+            batch = [ _sanitize_edge(x) for x in docs[i:i+mb_size] ]
+            batch_no += 1
+            summary["batches"] += 1
+            attempt = 0
+            while True:
+                try:
+                    created, updated = self._bulk_upsert_edges_fast(batch)
+                    summary["written"] += int(created + updated)
+                    summary["deduped"] += int(updated)
+                    break
+                except Exception as exc:
+                    attempt += 1
+                    if attempt > max_retries:
+                        log_stage(get_logger("storage"), "storage", "upsert_edges_batch_failed",
+                                  batch=batch_no, error=str(exc))
+                        n_ok = 0
+                        for d in batch:
+                            try:
+                                self.db.collection("edges").insert(d, overwrite=True)
+                                n_ok += 1
+                            except Exception as doc_exc:
+                                summary["rejected"] += 1
+                                summary["errors"].append({"doc_id": d.get("id"), "reason": str(doc_exc)})
+                        summary["written"] += n_ok
+                        break
+                    backoff = (base_ms * (2 ** (attempt - 1)) + int(os.urandom(1)[0] % max(1, jitter_ms))) / 1000.0
+                    time.sleep(backoff)
+
+        return summary
+
+    def _ensure_core_indexes_once(self) -> None:
+        if getattr(self, "_core_indexes_ok", False):
+            return
+        try:
+            self.ensure_core_indexes()
+            self._core_indexes_ok = True
+        except Exception:
+            pass
+
+    def ensure_core_indexes(self) -> None:
+        """Ensure unique indexes for nodes(domain,id) and edges(id)."""
+        if self.db is None:
+            return
+        cfg = get_settings()
+        auth = httpx.BasicAuth(cfg.arango_root_user, cfg.arango_root_password)
+        base = f"{cfg.arango_url}/_db/{self.db.name}"
+        headers = {}
+        if inject_trace_context:
+            headers.update(inject_trace_context({}))
+        # nodes(domain,id) unique
+        payload_nodes = {"type": "persistent", "name": "uniq_nodes_domain_id",
+                         "fields": ["domain","id"], "unique": True}
+        try:
+            httpx.post(f"{base}/_api/index", params={"collection":"nodes"},
+                       json=payload_nodes, auth=auth, timeout=5.0, headers=headers)
+        except Exception:
+            pass
+        # edges(id) unique
+        payload_edges = {"type": "persistent", "name": "uniq_edges_id",
+                         "fields": ["id"], "unique": True}
+        try:
+            httpx.post(f"{base}/_api/index", params={"collection":"edges"},
+                       json=payload_edges, auth=auth, timeout=5.0, headers=headers)
+        except Exception:
+            pass
+        log_stage(get_logger("storage"), "bootstrap", "ensure_core_indexes_ok")
 
     # ------------------------------------------------------------
     # Key & cache helpers
@@ -558,42 +699,47 @@ class ArangoStore:
         return f"{cleaned[:245]}_{digest}"
 
     def _cache_key(self, *parts: str) -> str:
+        SCHEMA_VERSION = os.getenv("SCHEMA_VERSION", "v2")
+        POLICY_VERSION = os.getenv("POLICY_VERSION", "v2")
         etag = self.get_snapshot_etag() or "noetag"
-        return ":".join((etag, *parts))
+        # Include schema/policy versioning in the key so cache rotations happen
+        # automatically when either changes.
+        return ":".join((SCHEMA_VERSION, POLICY_VERSION, etag, *parts))
 
     # ---------------------------- Bulk upserts ----------------------------
-    def bulk_upsert_nodes_fast(self, docs: List[Dict[str, Any]]) -> int:
-        """Best-effort bulk replace into `nodes` collection."""
+    def _bulk_upsert_nodes_fast(self, docs: List[Dict[str, Any]]) -> tuple[int,int]:
+        """Batch UPSERT into `nodes` by (domain,id) to avoid unique-index 409s."""
         self._connect()
         if self.db is None:
-            return 0
+            return 0, 0
+        # Sanitize keys defensively (already sanitized by caller).
         _docs = []
         for d in docs:
             dd = dict(d)
             if "_key" in dd:
                 dd["_key"] = self._safe_key(str(dd["_key"]))
             _docs.append(dd)
-        try:
-            coll = self.db.collection("nodes")
-            if hasattr(coll, "import_bulk"):
-                res = coll.import_bulk(_docs, on_duplicate="replace")
-                return int(res.get("created", 0)) + int(res.get("updated", 0))
-        except Exception as exc:
-            log_stage(logger, "storage", "bulk_upsert_nodes_fallback", error=str(exc))
-        n = 0
-        for d in _docs:
-            try:
-                self.db.collection("nodes").insert(d, overwrite=True)
-                n += 1
-            except Exception:
-                pass
-        return n
+        # Perform a single AQL UPSERT per batch keyed on (domain,id).
+        aql = """
+        FOR d IN @docs
+          LET existed = LENGTH(FOR x IN nodes FILTER x.domain == d.domain AND x.id == d.id LIMIT 1 RETURN 1) > 0
+          UPSERT { domain: d.domain, id: d.id }
+            INSERT d
+            UPDATE UNSET(d, ["_id","_rev"])
+          IN nodes OPTIONS { keepNull: false }
+          RETURN { created: !existed }
+        """
+        cursor = self.db.aql.execute(aql, bind_vars={"docs": _docs})
+        stats = list(cursor)
+        created = sum(1 for r in stats if r.get("created"))
+        updated = len(_docs) - created
+        return int(created), int(updated)
 
-    def bulk_upsert_edges_fast(self, docs: List[Dict[str, Any]]) -> int:
+    def _bulk_upsert_edges_fast(self, docs: List[Dict[str, Any]]) -> tuple[int,int]:
         """Best-effort bulk replace into `edges` collection."""
         self._connect()
         if self.db is None:
-            return 0
+            return (0, 0)
         _docs = []
         for d in docs:
             dd = dict(d)
@@ -604,9 +750,9 @@ class ArangoStore:
             coll = self.db.collection("edges")
             if hasattr(coll, "import_bulk"):
                 res = coll.import_bulk(_docs, on_duplicate="replace")
-                return int(res.get("created", 0)) + int(res.get("updated", 0))
+                return int(res.get("created", 0)), int(res.get("updated", 0))
         except Exception as exc:
-            log_stage(logger, "storage", "bulk_upsert_edges_fallback", error=str(exc))
+            raise
         n = 0
         for d in _docs:
             try:
@@ -614,7 +760,7 @@ class ArangoStore:
                 n += 1
             except Exception:
                 pass
-        return n
+        return n, 0
 
     # ------------------------------------------------------------
     # Catalog API
@@ -650,6 +796,10 @@ class ArangoStore:
         return doc.get("etag") if doc else None
 
     def prune_stale(self, snapshot_etag: str) -> Tuple[int, int]:
+        # Ensure a live connection (ArangoStore may have been created with lazy=True)
+        self._connect()
+        if self.db is None or not hasattr(self.db, "aql"):
+            return 0, 0
         nodes_removed = int(
             next(
                 self.db.aql.execute(
@@ -729,18 +879,30 @@ class ArangoStore:
 
     def get_enriched_decision(self, node_id: str) -> Optional[Dict[str, Any]]:
         n = self.get_node(node_id)
-        if not n or n.get("type") != "decision":
+        # Enrich only canonical decisions
+        if not n or n.get("type") != "DECISION":
             return None
+        from core_utils.domain import storage_key_to_anchor
+        anchor_id = None
+        _k = n.get("_key")
+        if isinstance(_k, str) and _k:
+            try:
+                anchor_id = storage_key_to_anchor(_k)
+            except Exception:
+                anchor_id = None
+        if not anchor_id:
+            dom = n.get("domain")
+            nid = n.get("id")
+            if dom and nid:
+                anchor_id = f"{dom}#{nid}"
         out: Dict[str, Any] = {
-            "id": n.get("_key"),
-            "option": n.get("option"),
-            "rationale": n.get("rationale"),
+            "id": anchor_id,
+            "type": "DECISION",
+            "title": n.get("title"),
+            "description": n.get("description"),
             "timestamp": n.get("timestamp"),
             "decision_maker": n.get("decision_maker"),
-            "tags": n.get("tags", []),
-            "supported_by": n.get("supported_by", []),
-            "based_on": n.get("based_on", []),
-            "transitions": n.get("transitions", []),
+            "domain": n.get("domain"),
         }
 
         # Merge any existing x-extra and other non-canonical keys
@@ -749,7 +911,7 @@ class ArangoStore:
             extra.update(n.get("x-extra") or {})
         _exclude = {
             "_key","_id","_rev","id","x-extra","snapshot_etag","meta","type",
-            "option","rationale","timestamp","decision_maker","tags","supported_by","based_on","transitions",
+            "title","description","timestamp","decision_maker","supported_by","based_on","domain",
         }
         for k, v in n.items():
             if k in _exclude:
@@ -765,16 +927,29 @@ class ArangoStore:
 
     def get_enriched_event(self, node_id: str) -> Optional[Dict[str, Any]]:
         n = self.get_node(node_id)
-        if not n or n.get("type") != "event":
+        # Enrich only canonical events
+        if not n or n.get("type") != "EVENT":
             return None
+        from core_utils.domain import storage_key_to_anchor
+        anchor_id = None
+        _k = n.get("_key")
+        if isinstance(_k, str) and _k:
+            try:
+                anchor_id = storage_key_to_anchor(_k)
+            except Exception:
+                anchor_id = None
+        if not anchor_id:
+            dom = n.get("domain")
+            nid = n.get("id")
+            if dom and nid:
+                anchor_id = f"{dom}#{nid}"
         out: Dict[str, Any] = {
-            "id": n.get("_key"),
-            "summary": n.get("summary"),
+            "id": anchor_id,
+            "type": "EVENT",
+            "title": n.get("title"),
             "description": n.get("description"),
             "timestamp": n.get("timestamp"),
-            "tags": n.get("tags", []),
-            "led_to": n.get("led_to", []),
-            "snippet": n.get("snippet"),
+            "domain": n.get("domain"),
         }
 
         extra: Dict[str, Any] = {}
@@ -782,7 +957,7 @@ class ArangoStore:
             extra.update(n.get("x-extra") or {})
         _exclude = {
             "_key","_id","_rev","id","x-extra","snapshot_etag","meta","type",
-            "summary","description","timestamp","tags","led_to","snippet",
+            "title","description","timestamp","led_to","domain",
         }
         for k, v in n.items():
             if k in _exclude:
@@ -796,38 +971,28 @@ class ArangoStore:
                 pass
         return out
 
-    def get_enriched_transition(self, node_id: str) -> Optional[Dict[str, Any]]:
-        n = self.get_node(node_id)
-        if not n or n.get("type") != "transition":
+    def get_enriched_node(self, storage_key: str) -> Optional[Dict[str, Any]]:
+        """
+        Generic enrich by storage key: route to specific enricher by node.type.
+        """
+        n = self.get_node(storage_key)
+        if not n or "type" not in n:
             return None
-        out: Dict[str, Any] = {
+        t = (n.get("type") or "").upper()
+        if t == "DECISION":
+            return self.get_enriched_decision(storage_key)
+        if t == "EVENT":
+            return self.get_enriched_event(storage_key)
+        # Future: return the stored node as a minimal enriched doc
+        return {
             "id": n.get("_key"),
-            "from": n.get("from"),
-            "to": n.get("to"),
-            "relation": n.get("relation"),
-            "reason": n.get("reason"),
+            "type": t or "UNKNOWN",
+            "domain": n.get("domain"),
+            "title": n.get("title"),
+            "description": n.get("description"),
             "timestamp": n.get("timestamp"),
-            "tags": n.get("tags", []),
+            "x-extra": n.get("x-extra") if isinstance(n.get("x-extra"), dict) else None,
         }
-
-        extra: Dict[str, Any] = {}
-        if isinstance(n.get("x-extra"), dict):
-            extra.update(n.get("x-extra") or {})
-        _exclude = {
-            "_key","_id","_rev","id","x-extra","snapshot_etag","meta","type",
-            "from","to","relation","reason","timestamp","tags",
-        }
-        for k, v in n.items():
-            if k in _exclude:
-                continue
-            extra[k] = v
-        if extra:
-            out["x-extra"] = extra
-            try:
-                log_stage(logger, "enrich", "x_extra_preserved", node_type="transition", node_id=node_id, extra_count=len(extra))
-            except Exception:
-                pass
-        return out
 
     # ------------------------------------------------------------
     # Redis-backed caching utilities
@@ -876,124 +1041,133 @@ class ArangoStore:
     # ------------------------------------------------------------
 
     def expand_candidates(self, anchor_id: str, k: int = 1) -> dict:
+        """
+        Expand the graph one hop around the given anchor and return an edges-only
+        view.  Per the v3 baseline, no legacy fields (neighbors, transitions,
+        rel/direction) are emitted.  The result shape is:
+            {"node_id": ..., "anchor": ..., "graph": {"edges": [...]}, "meta": {}}
+        """
         with trace_span("storage.arango.expand_candidates", stage="resolver") as sp:
-            try:
-                sp.set_attribute("k", k)
-                sp.set_attribute("anchor_id", anchor_id)
-            except Exception:
-                pass
+            sp.set_attribute("k", k)
+            sp.set_attribute("anchor_id", anchor_id)
+        # Ensure database connection; stub-mode returns empty edges
         if self.db is None:
             self._connect()
-        # Stub-mode fallback (Arango unavailable).  Keep the new canonical key
-        # `node_id`; keep `anchor` as a temporary alias for backward-compat.
         if self.db is None:
             return {
                 "node_id": anchor_id,
-                "anchor":  anchor_id,
-                "neighbors": [],
-                "meta": {"snapshot_etag": ""},
+                "anchor": anchor_id,
+                "graph": {"edges": []},
+                "meta": {},
             }
-        k = 1
+        k = 1  # fixed
         cache_key = self._cache_key("expand", anchor_id, f"k{k}")
         cached = self._cache_get(cache_key)
-        if cached:
-            if isinstance(cached.get("neighbors"), dict):
-                cached = {
-                    **cached,
-                    "neighbors": (cached["neighbors"].get("events") or []) + (cached["neighbors"].get("transitions") or []),
-                }
-            # Milestone-4 contract normalisation
-            if "anchor" not in cached and cached.get("node_id") is not None:
-                cached = {**cached, "anchor": cached["node_id"]}
-            if "node_id" not in cached and cached.get("anchor") is not None:
-                cached = {**cached, "node_id": cached["anchor"]}
+        if cached and "graph" in cached:
             return cached
-        aql = """
+        # Build outbound and inbound edges with AQL; include domain only for ALIAS_OF
+        graph_clause = f"GRAPH '{self._graph_name}'"
+        aql = f"""
         LET anchor   = DOCUMENT('nodes', @anchor)
-        LET outgoing = (anchor == null ? [] : (FOR v,e IN 1..1 OUTBOUND anchor GRAPH @graph RETURN {node: v, edge: e}))
-        LET incoming = (anchor == null ? [] : (FOR v,e IN 1..1 INBOUND  anchor GRAPH @graph RETURN {node: v, edge: e}))
-        // Seen node keys from real graph edges (prefer these)
-        LET seen = UNION_DISTINCT(outgoing[*].node._key, incoming[*].node._key)
-        // Backfill from `supported_by` only when no explicit LED_TO edge exists
-        LET sup = (anchor == null ? [] : (
-          FOR sid IN anchor.supported_by
-            LET ev = DOCUMENT('nodes', sid)
-            FILTER ev != NULL AND POSITION(seen, ev._key, true) == false
-            RETURN { node: ev, edge: { relation: 'LED_TO', _from: ev._id, _to: anchor._id } }
-        ))
-        RETURN { anchor: anchor, neighbors: UNIQUE(APPEND(APPEND(outgoing, incoming), sup)) }
+        LET outgoing = (
+            anchor == null ? [] : (
+                FOR v, e IN 1..1 OUTBOUND anchor {graph_clause}
+                LET etype = e.type
+                RETURN {{
+                    type: etype,
+                    from: anchor._key,
+                    to: v._key,
+                    timestamp: e.timestamp,
+                    domain: (etype == 'ALIAS_OF' ? v.domain : null)
+                }}
+            )
+        )
+        LET incoming = (
+            anchor == null ? [] : (
+                /* one-hop inbound to the anchor; no legacy fallbacks */
+                FOR v, e IN 1..1 INBOUND anchor {graph_clause}
+                LET etype = e.type
+                RETURN {{
+                    type: etype,
+                    from: v._key,
+                    to: anchor._key,
+                    timestamp: e.timestamp,
+                    domain: (etype == 'ALIAS_OF' ? v.domain : null)
+                }}
+            )
+        )
+        RETURN {{ anchor: anchor, edges: UNIQUE(APPEND(outgoing, incoming)) }}
         """
-        cursor = self.db.aql.execute(aql, bind_vars={"anchor": anchor_id, "graph": self._graph_name})
+        cursor = self.db.aql.execute(aql, bind_vars={"anchor": anchor_id})
         docs   = self._cursor_to_list(cursor)
-        doc    = docs[0] if docs else {"anchor": None, "neighbors": []}
+        doc    = docs[0] if docs else {"anchor": None, "edges": []}
         anchor_doc = doc.get("anchor")
-        anchor_id  = (anchor_doc.get("_key") if isinstance(anchor_doc, dict) else None) or doc.get("node_id")
-        anchor_arango_id = anchor_doc.get("_id") if isinstance(anchor_doc, dict) else None
+        if isinstance(anchor_doc, dict):
+            anchor_id = anchor_doc.get("_key") or anchor_id
+        edges_raw = doc.get("edges") or []
+        # Deduplicate edges by (type, from, to, timestamp, domain)
+        seen = set()
+        edges = []
+        for e in edges_raw:
+            t  = (e.get("type") or "").upper()
+            fr = e.get("from")
+            to = e.get("to")
+            ts = e.get("timestamp")
+            dm = e.get("domain")
+            key = (t, fr, to, ts, dm)
+            if key in seen:
+                continue
+            seen.add(key)
+            edge = {"type": t, "from": fr, "to": to, "timestamp": ts}
+            if dm is not None:
+                edge["domain"] = dm
+            edges.append(edge)
         result = {
             "node_id": anchor_id,
-            "anchor":  anchor_doc,
-            "neighbors": [
-                {
-                    "id": n["node"].get("_key"),
-                    "type": n["node"].get("type"),
-                    "title": n["node"].get("title"),
-                    "edge": (lambda _e: (
-                        (lambda etype, rel, direction: {
-                            "type": etype,
-                            "rel": (
-                                "succeeding" if (etype == "CAUSAL_PRECEDES" and direction == "outbound")
-                                else "preceding" if (etype == "CAUSAL_PRECEDES" and direction == "inbound")
-                                else (rel or etype)
-                            ),
-                            "direction": direction,
-                            "timestamp": _e.get("timestamp"),
-                        })(
-                            _e.get("type") or _e.get("relation"),
-                            _e.get("rel") or _e.get("relation"),
-                            ("outbound" if (_e.get("_from") == anchor_arango_id) else
-                             "inbound"  if (_e.get("_to") == anchor_arango_id) else None)
-                        )
-                    ))(n.get("edge") or {}),
-                }
-                for n in doc.get("neighbors", [])
-                if n.get("node") and n.get("edge")
-            ],
+            "anchor": anchor_doc,
+            "graph": {"edges": edges},
+            "meta": {},
         }
-        # ---- Neighbor de-duplication (prefer richer edge metadata) ----
-        _neighbors = result.get("neighbors") or []
-        _before = len(_neighbors)
-        _by_id = {}
-        def _score(item):
-            try:
-                _edge = item.get("edge") or {}
-                # Prefer entries with a computed direction (derived from _from/_to)
-                return 1 if (_edge.get("direction") is not None) else 0
-            except Exception:
-                return 0
-        for _n in _neighbors:
-            _id = _n.get("id")
-            if not _id:
-                continue
-            _prev = _by_id.get(_id)
-            if (_prev is None) or (_score(_n) > _score(_prev)):
-                _by_id[_id] = _n
-        _deduped = list(_by_id.values())
-        if len(_deduped) != _before:
-            try:
-                log_stage(logger, "expand", "dedup_neighbors",
-                          before=_before, after=len(_deduped),
-                          dropped_ids=[i for i in set([n.get("id") for n in _neighbors]) if i not in _by_id])
-            except Exception:
-                pass
-        result["neighbors"] = _deduped
-        # If the anchor was not found, surface a structured log for debuggability.
-        if anchor_doc is None:
-            try:
-                log_stage(logger, "expand", "anchor_not_found", anchor_id=anchor_id)
-            except Exception:
-                pass
         self._cache_set(cache_key, result, get_settings().cache_ttl_expand_sec)
         return result
+
+    # ------------------------------------------------------------
+    # Alias-tail helper (next decisions from an event)
+    # ------------------------------------------------------------
+    def next_decisions_from_event(self, event_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+        """
+        Return up to `limit` DECISION nodes one hop OUTBOUND from the given EVENT
+        over {LED_TO, CAUSAL}, scoped to the event’s domain. Ordered by
+        edge.timestamp DESC, decision.timestamp DESC, decision.id ASC.
+        Orientation is not computed or surfaced here.
+        """
+        if self.db is None:
+            self._connect()
+        if self.db is None:
+            return []
+        try:
+            lim = max(0, int(limit or 0))
+        except Exception:
+            lim = 3
+        graph_clause = f"GRAPH '{self._graph_name}'"
+        aql = f"""
+        LET ev = DOCUMENT('nodes', @event_id)
+        FOR v, e IN 1..1 OUTBOUND ev {graph_clause}
+          FILTER e.type IN ['LED_TO','CAUSAL']
+          FILTER v.type == 'DECISION' && v.domain == ev.domain
+          SORT e.timestamp DESC, v.timestamp DESC, v._key ASC
+          LIMIT @limit
+          RETURN {{
+            id: v._key,
+            title: v.title,
+            domain: v.domain,
+            timestamp: v.timestamp,
+            edge: {{ type: e.type, timestamp: e.timestamp }}
+          }}
+        """
+        cursor = self.db.aql.execute(aql, bind_vars={"event_id": event_id, "limit": lim})
+        rows = self._cursor_to_list(cursor)
+        return rows
 
     # ------------------------------------------------------------
     # Text & vector resolver
@@ -1028,7 +1202,8 @@ class ArangoStore:
                     use_vector = True
                 except Exception:
                     use_vector = False
-        key = self._cache_key("resolve", str(hash((q, bool(use_vector)))), f"l{limit}")
+        _fp = hashlib.sha1(f"{q}|{int(bool(use_vector))}".encode()).hexdigest()[:12]
+        key = self._cache_key("resolve", f"h{_fp}", f"l{limit}")
         cached = self._cache_get(key)
         if cached:
             cached.setdefault("query", q)
@@ -1116,19 +1291,12 @@ class ArangoStore:
                 except Exception:
                     pass
         try:
-            # The BM25 search uses the ArangoSearch view ``nodes_search``.  In addition
-            # to rationale, description, reason and summary, include the decision
-            # ``option`` and ``title`` fields so that queries about the action itself
-            # (e.g. “Exit plasma TV production”) can match the associated decision.
+            # The BM25 search uses the ArangoSearch view ``nodes_search`` (v3: title & description only).
             aql = (
                 "FOR d IN nodes_search "
                 "SEARCH ANALYZER( "
-                "  TOKENS(@q,'text_en') ANY IN d.option OR "
                 "  TOKENS(@q,'text_en') ANY IN d.title OR "
-                "  TOKENS(@q,'text_en') ANY IN d.rationale OR "
-                "  TOKENS(@q,'text_en') ANY IN d.summary OR "
-                "  TOKENS(@q,'text_en') ANY IN d.description OR "
-                "  TOKENS(@q,'text_en') ANY IN d.reason, 'text_en' ) "
+                "  TOKENS(@q,'text_en') ANY IN d.description, 'text_en' ) "
                 "SORT BM25(d) DESC LIMIT @limit "
                 "RETURN {id: d._key, score: BM25(d), title: d.title, type: d.type}"
             )
@@ -1151,7 +1319,7 @@ class ArangoStore:
                 except Exception:
                     terms = []
                 if terms:
-                    fields = ["option","title","rationale","summary","description","reason"]
+                    fields = ["title","description"]
                     ors = " OR ".join([f"LIKE(LOWER(d.{f}), LOWER(CONCAT('%', @t, '%')))" for f in fields])
                     aql_like = ("FOR t IN @terms FOR d IN nodes FILTER " + ors +
                                 " COLLECT d = d WITH COUNT INTO _c LIMIT @limit "
@@ -1175,16 +1343,11 @@ class ArangoStore:
                         pass
         except Exception:
             # Fallback lexical search when ArangoSearch view fails (view missing or unsupported).
-            # Extend the LIKE filters to include options and titles so queries referencing
-            # the decision’s action rather than its rationale are still captured.
+            # v3: search only `title` and `description`.
             aql = (
                 "FOR d IN nodes "
-                "FILTER LIKE(LOWER(d.rationale), LOWER(CONCAT('%', @q, '%'))) "
-                "  OR LIKE(LOWER(d.description), LOWER(CONCAT('%', @q, '%'))) "
-                "  OR LIKE(LOWER(d.reason), LOWER(CONCAT('%', @q, '%'))) "
-                "  OR LIKE(LOWER(d.summary), LOWER(CONCAT('%', @q, '%'))) "
-                "  OR LIKE(LOWER(d.option), LOWER(CONCAT('%', @q, '%'))) "
-                "  OR LIKE(LOWER(d.title), LOWER(CONCAT('%', @q, '%'))) "
+                "FILTER LIKE(LOWER(d.title), LOWER(CONCAT('%', @q, '%'))) "
+                "   OR LIKE(LOWER(d.description), LOWER(CONCAT('%', @q, '%'))) "
                 "LIMIT @limit RETURN {id: d._key, score: 0.0, title: d.title, type: d.type}"
             )
             with trace_span("storage.arango.aql.lexical_fallback", stage="resolver") as sp:
@@ -1218,3 +1381,97 @@ class ArangoStore:
         if isinstance(cursor, (list, tuple)):
             return list(cursor)
         return []
+
+    def resolve_alias_home(self, node_id: str, max_hops: int = 1) -> Optional[str]:
+        """
+        Follow ALIAS_OF edges up to `max_hops` to resolve to a DECISION in its home domain.
+        Returns the DECISION node_id if found; otherwise returns the original node_id.
+        Does not modify sensitivity; used only at read time.
+        """
+        if self.db is None:
+            self._connect()
+        if self.db is None:
+            return node_id
+        # Public invariant: exactly one hop. Allow callers to request fewer, never more.
+        try:
+            hops = 1 if int(max_hops or 1) >= 1 else 0
+        except Exception:
+            hops = 1
+        if hops <= 0:
+            return node_id
+        graph_clause = f"GRAPH '{self._graph_name}'"
+        aql = f"""
+        LET anchor = DOCUMENT('nodes', @anchor)
+        LET start  = (anchor == null ? null : anchor)
+        LET path = (start == null ? [] : (
+          FOR v, e, p IN 1..@hops OUTBOUND start {graph_clause}
+            FILTER e.type == 'ALIAS_OF'
+            PRUNE LENGTH(p.edges) >= @hops
+            FILTER v.type == 'DECISION'
+            LIMIT 1
+            RETURN v
+        ))
+        RETURN LENGTH(path) > 0 ? path[0]._key : @anchor
+        """
+        cursor = self.db.aql.execute(aql, bind_vars={"anchor": node_id, "hops": hops})
+        res = self._cursor_to_list(cursor)
+        return (res[0] if res else node_id)
+    
+    # ------------------------------------------------------------
+    # Edges-only adjacent view (k=1) — OPTIONAL new read
+    # ------------------------------------------------------------
+    def get_edges_adjacent(self, anchor_id: str) -> dict:
+        """
+        Return all edges touching `anchor_id` (INBOUND + OUTBOUND), as stored:
+        {type, from, to, timestamp, domain?}. No orientation or alias tails here.
+        """
+        if self.db is None:
+            self._connect()
+        if self.db is None:
+            # Stub-mode
+            return {"anchor": anchor_id, "edges": [], "meta": {"snapshot_etag": ""}}
+
+        graph_clause = f"GRAPH '{self._graph_name}'"
+        aql = f"""
+        LET anchor = DOCUMENT('nodes', @anchor)
+        LET out_e = (
+          anchor == null ? [] : (
+            /* one‑hop outbound traversal */
+            FOR v, e IN 1..1 OUTBOUND anchor {graph_clause}
+              LET etype = e.type
+              RETURN {{
+                type: etype,
+                from: anchor._key,
+                to: v._key,
+                timestamp: e.timestamp,
+                domain: (etype == 'ALIAS_OF' ? e.domain : null)
+              }}
+          )
+        )
+        LET in_e = (
+          anchor == null ? [] : (
+            /* one‑hop inbound traversal */
+            FOR v, e IN 1..1 INBOUND anchor {graph_clause}
+              LET etype = e.type
+              RETURN {{
+                type: etype,
+                from: v._key,
+                to: anchor._key,
+                timestamp: e.timestamp,
+                domain: (etype == 'ALIAS_OF' ? e.domain : null)
+              }}
+          )
+        )
+        RETURN {{
+          anchor: anchor ? anchor._key : @anchor,
+          edges: UNIQUE(APPEND(out_e, in_e))
+        }}
+        """
+        cursor = self.db.aql.execute(aql, bind_vars={"anchor": anchor_id})
+        docs = self._cursor_to_list(cursor)
+        view = docs[0] if docs else {"anchor": anchor_id, "edges": []}
+        try:
+            view.setdefault("meta", {})["snapshot_etag"] = self.get_snapshot_etag() or ""
+        except Exception:
+            pass
+        return view

@@ -1,0 +1,29 @@
+{
+  "role": "analyst",
+  "policy_version": "v3",
+  "namespaces": ["public"],
+  "domain_scopes": ["corp","eng","public"],
+  "edge_allowlist": ["LED_TO", "CAUSAL"],
+  "sensitivity_ceiling": "low",
+  "alias_max_hops": 0,
+  "field_visibility": {
+    "decision": {
+      "visible_fields": [
+        "title",
+        "timestamp",
+        "tags"
+      ],
+      "rationale_visible": false,
+      "allow_alias_projection": false
+    },
+    "event": {
+      "visible_fields": [
+        "title",
+        "timestamp",
+        "description"
+      ],
+      "allow_alias_projection": false
+    }
+  },
+  "extra_visible": []
+}

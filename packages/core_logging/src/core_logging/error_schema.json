@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault/core_logging/error_schema.json",
+  "title": "request_error_summary event",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["level", "service", "event", "error_count", "errors"],
+  "properties": {
+    "ts":       { "type": "string" },
+    "level":    { "const": "ERROR" },
+    "service":  { "type": "string", "minLength": 1 },
+    "event":    { "const": "request_error_summary" },
+    "request_id": { "type": "string" },
+    "trace_id":   { "type": "string" },
+    "span_id":    { "type": "string" },
+    "error_count": { "type": "integer", "minimum": 1 },
+    "cause":     { "type": "string" },
+    "errors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["code", "where", "message"],
+        "properties": {
+          "code":    { "type": "string", "minLength": 1 },
+          "where":   { "type": "string", "minLength": 1 },
+          "message": { "type": "string", "minLength": 1 },
+          "action":  { "type": "string" },
+          "context": { "type": "object" }
+        }
+      }
+    }
+  }
+}

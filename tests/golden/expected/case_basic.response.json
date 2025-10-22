@@ -1,0 +1,43 @@
+{
+  "response": {
+    "anchor": {
+      "id": "eng#d-eng-010",
+      "type": "DECISION",
+      "domain": "eng",
+      "title": "Adopt Stripe for EU billing",
+      "description": "Select and integrate Stripe to support EU billing and VAT handling for the Q4 launch.",
+      "timestamp": "2025-08-15T10:00:00Z",
+      "decision_maker": { "id": "org:vp-eng", "role": "VP Engineering", "name": "Sam Rivera", "org": "Engineering" },
+      "sensitivity": "internal",
+      "x-extra": { "okr": "ENG-2025Q4-01", "initiative": "EU Launch" }
+    },
+    "graph": {
+      "edges": [
+        { "type": "LED_TO", "from": "eng#e-eng-001", "to": "eng#d-eng-010", "timestamp": "2025-08-13T10:00:00Z", "orientation": "preceding" },
+        { "type": "LED_TO", "from": "eng#e-eng-002", "to": "eng#d-eng-010", "timestamp": "2025-08-14T12:00:00Z", "orientation": "preceding" },
+        { "type": "ALIAS_OF", "from": "sales#e-sales-alias-eng-010", "to": "eng#d-eng-010", "timestamp": "2025-08-18T09:00:00Z" },
+        { "type": "CAUSAL", "from": "eng#d-eng-010", "to": "eng#d-eng-011", "timestamp": "2025-09-05T09:30:00Z", "orientation": "succeeding" }
+      ]
+    },
+    "meta": {
+      "allowed_ids": [
+        "eng#d-eng-010",
+        "eng#d-eng-011",
+        "eng#e-eng-001",
+        "eng#e-eng-002",
+        "sales#e-sales-alias-eng-010"
+      ],
+      "fingerprints": { "graph_fp": "sha256:d270b1aa68e5b8f049c9feefbdb87b4900830d823abb4d9b7b003d291a224421" },
+      "allowed_ids_fp": "sha256:f60497af31338ab456e4e3b9fd478de5818cfb8bdf2e8c8c773b1b2ce8652a70",
+      "policy_fp": "sha256:799c0479e236980bdd08abd3842a0ef42615bf084010e75e7e10ab1026658c84",
+      "snapshot_etag": "95aae1ac6e93cbf92dac5ee49eb5a8e867542704ef724cbf10b5232c6b1f4feb",
+      "bundle_fp": "sha256:3f113db82e4f4187bba0b1f7e7499f2e3630bc7796c644219027ed9ca8d6bb2f",
+      "selector_policy_id": "sim_desc__ts_iso_desc__id_asc"
+    },
+    "answer": {
+      "short_answer": "Sam Rivera on 2025-08-15 — Adopt Stripe for EU billing — Select and integrate Stripe to support EU billing and VAT handling for the Q4 launch. Key Events: VAT blocker in EU markets; Security review cleared Stripe. Next: Define Stripe rollout plan.",
+      "cited_ids": ["eng#d-eng-010", "eng#e-eng-002", "eng#e-eng-001", "eng#d-eng-011"]
+    },
+    "completeness_flags": { "has_preceding": true, "has_succeeding": true, "event_count": 2 }
+  }
+}

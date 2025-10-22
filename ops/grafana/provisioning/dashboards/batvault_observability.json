@@ -1,34 +1,19 @@
 {
   "title": "BatVault Observability",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "panels": [
     {
       "type": "timeseries",
-      "title": "P95 TTFB (s)",
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(api_edge_ttfb_seconds_bucket[5m])) by (le))",
-          "legendFormat": "P95 TTFB"
-        }
-      ],
-      "options": {
-        "legend": { "displayMode": "list" },
-        "exemplars": true
-      },
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 }
-    },
-    {
-      "type": "timeseries",
-      "title": "Cache Hit Rate (resolver)",
-      "targets": [
-        {
-          "expr": "sum(rate(cache_hit_total{service=\\\"memory_api\\\"}[5m])) / (sum(rate(cache_hit_total{service=\\\"memory_api\\\"}[5m])) + sum(rate(cache_miss_total{service=\\\"memory_api\\\"}[5m])))",
-          "legendFormat": "hit-rate"
-        }
-      ],
+      "title": "Resolver Cache Hit Ratio (%)",
       "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(cache_hit_total{service=\"resolver\"}[5m])) / (sum(rate(cache_hit_total{service=\"resolver\"}[5m])) + sum(rate(cache_miss_total{service=\"resolver\"}[5m])))",
+          "legendFormat": "resolver hit %"
+        }
+      ],
       "options": {
         "legend": { "displayMode": "list" },
         "exemplars": true
@@ -37,18 +22,39 @@
     },
     {
       "type": "timeseries",
-      "title": "Selector Truncations / s (gateway)",
+      "title": "Boundary Signals",
       "targets": [
-        {
-          "expr": "sum(rate(selector_truncation[5m]))",
-          "legendFormat": "truncations"
-        }
+        { "expr": "sum(rate(memory_api_http_requests_total{code=~\"403|404\"}[5m]))", "legendFormat": "403/404 /s" },
+        { "expr": "sum(rate(memory_api_http_requests_total{code=\"412\"}[5m]))", "legendFormat": "412 /s" }
       ],
       "options": {
         "legend": { "displayMode": "list" },
         "exemplars": true
       },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "P95 TTFB (Gateway /v2/query)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(gateway_ttfb_seconds_bucket{route=\"/v2/query\"}[5m])) by (le))",
+          "legendFormat": "p95 s"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list" }, "exemplars": true },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Stage P95 (selector/bundle/expand)",
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(gateway_stage_selector_seconds_bucket[5m])) by (le))", "legendFormat": "selector p95" },
+        { "expr": "histogram_quantile(0.95, sum(rate(gateway_stage_bundle_seconds_bucket[5m])) by (le))", "legendFormat": "bundle p95" },
+        { "expr": "histogram_quantile(0.95, sum(rate(memory_stage_expand_seconds_bucket[5m])) by (le))", "legendFormat": "expand p95" }
+      ],
+      "options": { "legend": { "displayMode": "list" }, "exemplars": true },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 }
     }
   ],
   "time": { "from": "now-6h", "to": "now" },

@@ -1,0 +1,20 @@
+{
+  "role": "ceo",
+  "policy_version": "v3",
+  "namespaces": ["*"],
+  "domain_scopes": ["*"],
+  "edge_allowlist": ["LED_TO", "CAUSAL", "ALIAS_OF"],
+  "sensitivity_ceiling": "high",
+  "alias_max_hops": 3,
+  "field_visibility": {
+    "decision": {
+      "visible_fields": ["*", "x-extra"],
+      "allow_alias_projection": true
+    },
+    "event": {
+      "visible_fields": ["*", "x-extra"],
+      "allow_alias_projection": true
+    }
+  },
+  "extra_visible": ["*"]
+}

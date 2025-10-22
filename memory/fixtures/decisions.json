@@ -1,0 +1,35 @@
+[
+  {
+    "id": "d-eng-010",
+    "type": "DECISION",
+    "title": "Adopt Stripe for EU billing",
+    "description": "Select and integrate Stripe to support EU billing and VAT handling for the Q4 launch.",
+    "domain": "eng",
+    "timestamp": "2025-08-15T10:00:00Z",
+    "sensitivity": "medium",
+    "decision_maker": { "id": "org:vp-eng", "role": "VP Engineering", "name": "Sam Rivera", "org": "Engineering" },
+    "x-extra": { "tags": ["billing", "eu", "stripe"], "okr": "FY25: EU Launch" }
+  },
+  {
+    "id": "d-eng-011",
+    "type": "DECISION",
+    "title": "Approve EU billing production rollout",
+    "description": "Authorize production rollout after performance and compliance gates pass.",
+    "domain": "eng",
+    "timestamp": "2025-09-05T09:30:00Z",
+    "sensitivity": "high",
+    "decision_maker": { "id": "org:cto", "role": "CTO", "name": "Jamie Chen", "org": "Engineering" },
+    "x-extra": { "gates": ["perf", "pci", "gdpr"] }
+  },
+  {
+    "id": "d-sales-005",
+    "type": "DECISION",
+    "title": "Prioritize EU mid-market accounts",
+    "description": "Focus AE capacity on DE/FR mid-market in Q4 based on billing readiness and pipeline.",
+    "domain": "sales",
+    "timestamp": "2025-08-20T14:00:00Z",
+    "sensitivity": "low",
+    "decision_maker": { "id": "org:vp-sales", "role": "VP Sales", "name": "Taylor Morgan", "org": "Sales" },
+    "x-extra": { "region": ["de", "fr"], "tags": ["mid-market", "q4"] }
+  }
+]

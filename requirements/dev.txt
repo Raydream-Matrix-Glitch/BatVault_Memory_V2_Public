@@ -12,3 +12,6 @@ mypy>=1.11
 # Type stubs for stricter checks (optional)
 types-requests
 types-redis
+
+# Codegen (schemas → models/types)
+datamodel-code-generator>=0.25

@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/bundles.exec_summary.json",
+  "title": "Exec Summary (response.json)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "v3" },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "anchor": { "oneOf": [ { "$ref": "./decision.json" }, { "$ref": "./event.json" } ] },
+        "graph": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "edges": {
+              "type": "array",
+              "items": { "$ref": "./edge.oriented.json" }
+            }
+          },
+          "required": ["edges"]
+        },
+        "meta": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowed_ids": { "type": "array", "items": { "type": "string" } },
+            "fingerprints": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": { "graph_fp": { "type": "string" } },
+              "required": ["graph_fp"]
+            },
+            "allowed_ids_fp": { "type": "string" },
+            "policy_fp": { "type": "string" },
+            "snapshot_etag": { "type": "string" },
+            "bundle_fp": { "type": "string" },
+            "selector_policy_id": { "type": "string" },
+            "budget_cfg_fp": { "type": "string" }
+          },
+          "required": ["allowed_ids", "fingerprints", "allowed_ids_fp", "policy_fp", "snapshot_etag", "bundle_fp"]
+        },
+        "answer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "short_answer": { "type": "string" },
+            "cited_ids": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["short_answer", "cited_ids"]
+        },
+        "completeness_flags": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "has_preceding": { "type": "boolean" },
+            "has_succeeding": { "type": "boolean" },
+            "event_count": { "type": "integer" }
+          },
+          "required": ["has_preceding", "has_succeeding"]
+        }
+      },
+      "required": ["anchor", "graph", "meta", "answer", "completeness_flags"]
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "alg":       { "type": "string", "enum": ["ed25519"] },
+        "key_id":    { "type": "string", "minLength": 1 },
+        "sig":       { "type": "string", "minLength": 1 },
+        "covered":   { "type": "string", "minLength": 1 },
+        "signed_at": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" }
+      },
+      "required": ["alg","key_id","sig","covered","signed_at"]
+    }
+  },
+  "required": ["schema_version", "response", "signature"]
+}

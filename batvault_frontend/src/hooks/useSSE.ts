@@ -1,262 +1,102 @@
-import { useState, useRef, useCallback } from "react";
+import { useCallback, useRef, useState } from "react";
+import { postStream } from "../utils/sse";
+import { normalizeErrorMessage } from "../utils/errors";
+import type { BundleView, GraphView } from "../types/memory";
 
-/**
- * Generic streaming hook using the Fetch API and ReadableStream. It accepts
- * an endpoint and payload, establishes a connection, and emits tokens and
- * final data as they arrive. Authorization headers are supported via
- * optional token. If streaming fails, the promise rejects. On final
- * completion, audit metadata (request_id, prompt_fingerprint, snapshot_etag)
- * is propagated through the global window.setCurrentTrace helper when
- * available. Debug logs are emitted in development builds.
- */
-export function useSSE() {
-  const [tokens, setTokens] = useState<string[]>([]);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [error, setError] = useState<Error | null>(null);
-  const [finalData, setFinalData] = useState<any>(null);
-  // Normalize citations to keep both fields present during the migration.
-  const normalizeCitations = (p: any) => {
-    try {
-      if (p && p.answer) {
-        const c = Array.isArray(p.answer?.cited_ids)
-          ? p.answer.cited_ids
-          : (Array.isArray(p.answer?.supporting_ids) ? p.answer.supporting_ids : []);
-        p.answer.cited_ids = Array.isArray(c) ? c : [];
-        p.answer.supporting_ids = Array.isArray(c) ? c : [];
-      }
-    } catch { /* ignore */ }
-    return p;
-  };
-  // Track the abort controller so that consumers can cancel ongoing requests.
+interface StreamState<T> {
+  isStreaming: boolean;
+  error: string | null;
+  events: any[];
+  finalData: T | null;
+}
+
+export function useSSE<T = any>() {
+  const [state, setState] = useState<StreamState<T>>({
+    isStreaming: false,
+    error: null,
+    events: [],
+    finalData: null,
+  });
   const abortRef = useRef<AbortController | null>(null);
 
-  const startStream = useCallback(
-    async (url: string, body: any, token?: string) => {
-      // Reset state at the start of each call
-      setTokens([]);
-      setFinalData(null);
-      setError(null);
-      setIsStreaming(true);
-
-      // ----------------------------------------------------------------------
-      // TEST STUBS
-      // These branches emit synthetic responses used in unit tests and local
-      // development. They short‑circuit network calls when the payload
-      // contains sentinel values. Keep these in sync with tests.
-      // ----------------------------------------------------------------------
-      if (
-        (body as any).anchor_id === "mockaudit" ||
-        (body as any).decision_ref === "mockaudit" || (body as any).text === "mockaudit"
-      ) {
-        setTimeout(() => {
-          setTokens([]);
-          setFinalData({
-            answer: { short_answer: "Test answer.", cited_ids: [], supporting_ids: [] },
-            evidence: {
-              anchor: { id: "dec-1", snippet: "Anchor evidence.", tags: ["anchor"] },
-              events: [
-                { id: "evt-1", snippet: "Event one.", tags: ["tag1"], based_on: ["dec-1"] },
-              ],
-              transitions: {},
-              allowed_ids: ["dec-1", "evt-1"],
-            },
-            meta: {
-              policy_id: "pol-v1",
-              prompt_id: "prompt-v1",
-              retries: 1,
-              latency_ms: 500,
-              function_calls: ["search_similar", "get_graph_neighbors"],
-              routing_confidence: 0.86,
-              fallback_used: false,
-              cache_hit: false,
-              request_id: "req-123",
-              plan_fingerprint: "plan-fp",
-              prompt_envelope_fingerprint: "penv-fp",
-              selector_scores: { "dec-1": 0.95, "evt-1": 0.78 },
-              dropped_evidence_ids: ["evt-2"],
-              trace: ["resolve", "plan", "exec", "bundle", "prompt", "llm"],
-              prompt_envelope: { instructions: "Example" },
-              rendered_prompt: "Rendered prompt content",
-              raw_llm_json: { llm_output: "raw json" },
-              snapshot_etag: "etag-789",
-            },
-          });
-          setIsStreaming(false);
-        }, 300);
-        return;
-      }
-      if ((body as any).decision_ref === "mockgraph") {
-        setTimeout(() => {
-          setTokens([]);
-          setFinalData({
-            answer: { short_answer: "Test answer.", cited_ids: [], supporting_ids: [] },
-            evidence: {
-              anchor: { id: "dec-1", snippet: "Decision", tags: ["strategy"], based_on: [] },
-              events: [
-                { id: "evt-1", snippet: "Event A", tags: ["market"], based_on: ["dec-1"] },
-                { id: "evt-2", snippet: "Event B", tags: ["market"], based_on: ["dec-1", "evt-1"] },
-              ],
-              transitions: {},
-              allowed_ids: ["dec-1", "evt-1", "evt-2"],
-            },
-            meta: {},
-          });
-          setIsStreaming(false);
-        }, 300);
-        return;
-      }
-
-      // Real streaming call
-      const controller = new AbortController();
-      abortRef.current = controller;
-      try {
-        const headers: Record<string, string> = {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        };
-        if (token) {
-          headers["Authorization"] = `Bearer ${token}`;
+  const start = useCallback(async (endpoint: string, body: Record<string, unknown>, headers?: Record<string,string>) => {
+    abortRef.current?.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setState(s => ({ ...s, isStreaming: true, error: null, events: [], finalData: null }));
+    try {
+      await postStream({
+        endpoint,
+        body,
+        headers,
+        signal: ac.signal,
+        onEvent: (ev) => {
+          setState(s => ({ ...s, events: [...s.events, ev] }));
+        },
+        onDone: (finalObj) => {
+          // Normalise: accept either the envelope ({schema_version,"response":{...}})
+          // or the unwrapped WhyDecisionResponse (legacy streaming).
+          const normalized = (finalObj && (finalObj as any).response) ? (finalObj as any).response : finalObj;
+          setState(s => ({ ...s, finalData: normalized as T }));
         }
-        const res = await fetch(url, {
-          method: "POST",
-          body: JSON.stringify(body),
-          headers,
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          throw new Error(`Streaming request failed: ${res.status}`);
-        }
-        // If the server didn't switch to SSE, fall back to JSON body.
-        const ct = (res.headers.get("content-type") || "").toLowerCase();
-        if (!ct.includes("text/event-stream")) {
-          try {
-            const payload = await res.json();
-            setTokens([]);
-            setFinalData(normalizeCitations(payload));
-          } catch (e: any) {
-            setError(e instanceof Error ? e : new Error(String(e)));
-            throw e;
-          } finally {
-            setIsStreaming(false);
-          }
-          return;
-        }
-        if (!res.body) {
-          throw new Error(`Streaming request missing body`);
-        }
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        // Read SSE chunks until the stream ends
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          let nlIndex;
-          // Process complete lines. SSE messages are newline separated.
-          while ((nlIndex = buffer.indexOf("\n")) !== -1) {
-            let line = buffer.slice(0, nlIndex).trimEnd();
-            buffer = buffer.slice(nlIndex + 1);
-            if (!line) continue;
-            // Skip SSE comments or keepalive lines
-            if (line.startsWith(":")) continue;
-            // Strip leading 'data:' if present
-            if (line.startsWith("data:")) {
-              line = line.slice("data:".length).trim();
-            }
-            if (!line) continue;
-            // Ignore the special [DONE] sentinel emitted by the Gateway.  It marks
-            // the end of the stream but is not valid JSON.
-            if (line === "[DONE]") {
-              continue;
-            }
-            try {
-              const payload = JSON.parse(line);
-              if (payload.token) {
-                // Token event
-                setTokens((prev) => {
-                  const next = [...prev, payload.token as string];
-                  if (process.env.NODE_ENV !== "production") {
-                    try {
-                      console.debug("[sse.token]", payload.token);
-                    } catch {
-                      /* ignore logging errors */
-                    }
-                  }
-                  return next;
-                });
-              } else {
-                // Final event; stream finished
-                setFinalData(normalizeCitations(payload));
-                setIsStreaming(false);
-                // Fire global trace callback if audit metadata present
-                try {
-                  const meta = payload.meta ?? {};
-                  if (
-                    typeof window !== "undefined" &&
-                    typeof (window as any).setCurrentTrace === "function"
-                  ) {
-                    const trace: any = {};
-                    if (meta.request_id) trace.request_id = meta.request_id;
-                    // Prefer explicit prompt_fingerprint; fall back to envelope fingerprint
-                    if (meta.prompt_fingerprint) trace.prompt_fingerprint = meta.prompt_fingerprint;
-                    if (!trace.prompt_fingerprint && meta.prompt_envelope_fingerprint) {
-                      trace.prompt_fingerprint = meta.prompt_envelope_fingerprint;
-                    }
-                    if (meta.snapshot_etag) trace.snapshot_etag = meta.snapshot_etag;
-                    if (Object.keys(trace).length > 0) {
-                      if (process.env.NODE_ENV !== "production") {
-                        console.debug("[sse.trace]", trace);
-                      }
-                      (window as any).setCurrentTrace(trace);
-                    }
-                  }
-                } catch {
-                  /* ignore errors when calling global trace */
-                }
-                if (process.env.NODE_ENV !== "production") {
-                  try {
-                    const rid = payload.meta?.request_id;
-                    if (rid) {
-                      console.debug("[sse.done]", rid);
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-              }
-            } catch {
-              // Silently ignore malformed JSON lines
-            }
-          }
-        }
-        // In case the server sent a single-line JSON without an ending newline,
-        // parse any trailing buffer so we still render the final data.
-        const leftover = buffer.trim();
-        if (leftover) {
-          try {
-            setFinalData(normalizeCitations(JSON.parse(leftover)));
-          } catch {/* ignore */}
-        }
-        setIsStreaming(false);
-      } catch (err: any) {
-        // Handle cancellation separately
-        if (err?.name === "AbortError") {
-          setIsStreaming(false);
-          return;
-        }
-        setError(err instanceof Error ? err : new Error(String(err)));
-        setIsStreaming(false);
-        throw err;
-      }
-    },
-    []
-  );
+      });
+    } catch (e: any) {
+      setState(s => ({ ...s, error: normalizeErrorMessage(e?.message ?? String(e)) }));
+    } finally {
+      setState(s => ({ ...s, isStreaming: false }));
+    }
+  }, []);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();
-    setIsStreaming(false);
+    setState(s => ({ ...s, isStreaming: false }));
   }, []);
 
-  return { tokens, isStreaming, error, finalData, startStream, cancel };
+  return { ...state, start, cancel };
+}
+
+// ---- Offline mock helpers (V3-shaped) ----
+
+export function mockBundle(decisionRef = "mock-decision-001"): BundleView {
+  const now = new Date();
+  const iso = new Date(Math.floor(now.getTime()/1000)*1000).toISOString().replace(/\.\d{3}Z$/,'Z');
+  const allowed = ["e1","e2","e3","d_next"];
+  const edges: GraphView["graph"]["edges"] = [
+    { type: "LED_TO", from: "e1", to: decisionRef, timestamp: iso, domain: "market", orientation: "preceding" },
+    { type: "CAUSAL", from: decisionRef, to: "d_next", timestamp: iso, domain: "strategy", orientation: "succeeding" },
+    { type: "ALIAS_OF", from: "ae1", to: decisionRef, timestamp: iso, domain: "product" }
+  ];
+  const memory: GraphView = {
+    anchor: { id: decisionRef, kind: "DECISION", title: decisionRef, timestamp: iso },
+    graph: { edges },
+    meta: {
+      allowed_ids: allowed,
+      fingerprints: { graph_fp: "mock_graph_fp" },
+      allowed_ids_fp: "mock_allowed_ids_fp",
+      policy_fp: "mock_policy_fp",
+      snapshot_etag: "mock_snapshot_etag",
+      stage_ms: { resolver: 12, evidence: 18, selector: 9, budget: 3, prompt: 7, llm: 42, render: 6 },
+      memory_spans_ms: { resolve_anchor: 5, k1_domain: 2, alias_inbound: 1, alias_tail: 1, dedupe_edges: 1, build_meta: 1 },
+      alias: { partial: false, returned: ["ae1"], max_depth: 1 }
+    }
+  };
+  return {
+    answer: { short_answer: "Mock short answer.", cited_ids: ["e1","e2"] },
+    memory,
+    meta: {
+      request_id: "mock_rid_123",
+      bundle_fp: "mock_bundle_fp",
+      budget_cfg_fp: "mock_budget_cfg_fp",
+      policy_fp: memory.meta.policy_fp,
+      allowed_ids_fp: memory.meta.allowed_ids_fp,
+      graph_fp: memory.meta.fingerprints.graph_fp,
+      snapshot_etag: memory.meta.snapshot_etag,
+      stage_ms: memory.meta.stage_ms,
+      memory_spans_ms: memory.meta.memory_spans_ms
+    }
+  };
+}
+
+export function mockTopicHits(q = "semis"): { query: string; hits: string[] } {
+  return { query: q, hits: ["id_a","id_b","id_c"] };
 }

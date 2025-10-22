@@ -4,6 +4,11 @@ from typing import Optional
 
 
 # Legacy byte caps (kept for backward-compat in logs only)
+# Deprecated: MAX_PROMPT_BYTES and SELECTOR_TRUNCATION_THRESHOLD were formerly used
+# to cap prompt sizes and selector truncation thresholds.  These constants are
+# retained for logs only and should not be referenced by services.  All new
+# services must rely on the token-aware budgets below (CONTROL_CONTEXT_WINDOW
+# and SELECTOR_TRUNCATION_THRESHOLD_TOKENS).  See Baseline §5.2.
 MAX_PROMPT_BYTES = int(os.getenv("MAX_PROMPT_BYTES", "8192"))
 SELECTOR_TRUNCATION_THRESHOLD = int(os.getenv("SELECTOR_TRUNCATION_THRESHOLD", "6144"))
 
@@ -22,17 +27,22 @@ CONTROL_PROMPT_GUARD_TOKENS = int(os.getenv("CONTROL_PROMPT_GUARD_TOKENS", "32")
 LLM_MIN_COMPLETION_TOKENS = int(os.getenv("LLM_MIN_COMPLETION_TOKENS", "16"))
 GATE_SAFETY_HEADROOM_TOKENS = int(os.getenv("GATE_SAFETY_HEADROOM_TOKENS", "128"))
 # Unified short-answer character cap:
-# Prefer SHORT_ANSWER_MAX_CHARS; fall back to legacy ANSWER_CHAR_CAP to keep older envs working.
-# If neither is set, default to 320 to match historical behavior.
-SHORT_ANSWER_MAX_CHARS = int(os.getenv("SHORT_ANSWER_MAX_CHARS") or os.getenv("ANSWER_CHAR_CAP", "320"))
+# Baseline §8 forbids legacy fallback names.  Only SHORT_ANSWER_MAX_CHARS should be
+# used; no fallback to ANSWER_CHAR_CAP.  Default to 320 when unset.
+SHORT_ANSWER_MAX_CHARS = int(os.getenv("SHORT_ANSWER_MAX_CHARS", "320"))
 
 # Maximum number of sentences permitted in short answers.
-# Prefer new SHORT_ANSWER_MAX_SENTENCES; fall back to legacy ANSWER_SENTENCE_CAP; default 2.
+# Baseline §8 forbids legacy fallback names.  Only SHORT_ANSWER_MAX_SENTENCES should be
+# used; no fallback to ANSWER_SENTENCE_CAP.  Default to 2 when unset.
 try:
-    _sent_env: Optional[str] = os.getenv("SHORT_ANSWER_MAX_SENTENCES") or os.getenv("ANSWER_SENTENCE_CAP") or "2"
+    _sent_env: Optional[str] = os.getenv("SHORT_ANSWER_MAX_SENTENCES") or "2"
     SHORT_ANSWER_MAX_SENTENCES = int(_sent_env)
 except Exception:
     SHORT_ANSWER_MAX_SENTENCES = 2
+
+# Number of key events (LED_TO→anchor) to include in short answers (Baseline v3 = 3).
+# Centralized knob so FE/BE remain aligned; used by the templater.
+KEY_EVENTS_COUNT = int(os.getenv("KEY_EVENTS_COUNT", "3"))
 
 # -------- Gate shrink knobs (deterministic) -------------------------------
 GATE_COMPLETION_SHRINK_FACTOR = float(os.getenv("GATE_COMPLETION_SHRINK_FACTOR", "0.8"))
@@ -47,30 +57,13 @@ SELECTOR_TRUNCATION_THRESHOLD_TOKENS = int(
 MIN_EVIDENCE_ITEMS = int(os.getenv("MIN_EVIDENCE_ITEMS", "1"))
 SELECTOR_MODEL_ID = os.getenv("SELECTOR_MODEL_ID", "selector_v1")
 
-# Redis TTL constants (Milestone 2 – caching strategy §H)
-_ttl_resolver_new = os.getenv("TTL_RESOLVER_CACHE_SEC")
-_ttl_resolver_old = os.getenv("CACHE_TTL_RESOLVER_SEC")
-if _ttl_resolver_new is not None:
-    TTL_RESOLVER_CACHE_SEC = int(_ttl_resolver_new)
-    # If both are set and differ, warn and prefer the new one
-    if _ttl_resolver_old is not None and _ttl_resolver_old != _ttl_resolver_new:
-        warnings.warn(
-            "Both TTL_RESOLVER_CACHE_SEC and CACHE_TTL_RESOLVER_SEC are set; "
-            "preferring TTL_RESOLVER_CACHE_SEC. Please remove CACHE_TTL_RESOLVER_SEC.",
-            DeprecationWarning,
-        )
-elif _ttl_resolver_old is not None:
-    # Back-compat: accept the old var if the new one isn't set
-    TTL_RESOLVER_CACHE_SEC = int(_ttl_resolver_old)
-else:
-    TTL_RESOLVER_CACHE_SEC = 300  # default 5 min
+# Cache TTL constants (Baseline §5.2)
+# Services MUST NOT read env for these; only core_config defines them.
+TTL_EVIDENCE_CACHE_SEC = 180   # 3 minutes
+TTL_LLM_CACHE_SEC      = 900   # 15 minutes
+TTL_BUNDLE_CACHE_SEC   = 900   # 15 minutes
 
-# Back-compat alias so legacy imports still work during deprecation
-CACHE_TTL_RESOLVER_SEC = TTL_RESOLVER_CACHE_SEC
-TTL_EXPAND_CACHE_SEC   = int(os.getenv("TTL_EXPAND_CACHE_SEC",   "60"))    # 1 min
-TTL_EVIDENCE_CACHE_SEC = int(os.getenv("TTL_EVIDENCE_CACHE_SEC", "900"))   # 15 min
-
-# ── Gateway schema-mirror cache (Milestone-4 §I1) ────────────────────────
+# ── Schema/Policy registry cache (versioned; long-lived) ─────────────────
 TTL_SCHEMA_CACHE_SEC = int(os.getenv("TTL_SCHEMA_CACHE_SEC", "600"))
 
 # Model identifiers (override via ENV)
