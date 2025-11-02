@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.batvault.dev/gateway.plan.json",
+  "title": "Gateway Plan (Deterministic)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["selector_policy_id","budgets","truncation_action"],
+  "properties": {
+    "selector_policy_id": {"type":"string","minLength":1},
+    "truncation_action": {"type":"string","enum":["render","clip","render_retry","stop"]},
+    "budgets": {
+      "type":"object","additionalProperties":false,
+      "required":["max_edges","max_events","timeout_ms"],
+      "properties": {
+        "max_edges":{"type":"integer","minimum":0},
+        "max_events":{"type":"integer","minimum":0},
+        "timeout_ms":{"type":"integer","minimum":0}
+      }
+    }
+  }
+}

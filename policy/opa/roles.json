@@ -1,0 +1,67 @@
+{
+  "roles": {
+    "analyst": {
+      "sensitivity_ceiling": "low",
+      "field_visibility": {
+        "event": { "visible_fields": ["id", "type", "domain", "title", "timestamp"] },
+        "decision": { "visible_fields": ["id", "type", "domain", "title", "timestamp"] },
+        "person": { "visible_fields": ["id", "type", "domain", "display_name"] },
+        "company": { "visible_fields": ["id", "type", "domain", "name"] },
+        "project": { "visible_fields": ["id", "type", "domain", "name"] }
+      },
+      "extra_visible": []
+    },
+    "engineer": {
+      "sensitivity_ceiling": "medium",
+      "field_visibility": {
+        "event": { "visible_fields": ["id", "type", "domain", "title", "timestamp", "decision_ref"] },
+        "decision": { "visible_fields": ["id", "type", "domain", "title", "timestamp", "decision_maker"] },
+        "person": { "visible_fields": ["id", "type", "domain", "display_name", "role"] },
+        "company": { "visible_fields": ["id", "type", "domain", "name", "segment"] },
+        "project": { "visible_fields": ["id", "type", "domain", "name", "status"] }
+      },
+      "extra_visible": []
+    },
+    "manager": {
+      "sensitivity_ceiling": "medium",
+      "field_visibility": {
+        "event": { "visible_fields": ["id", "type", "domain", "title", "timestamp", "decision_ref", "description"] },
+        "decision": { "visible_fields": ["id", "type", "domain", "title", "timestamp", "decision_maker", "description"] },
+        "person": { "visible_fields": ["id", "type", "domain", "display_name", "role"] },
+        "company": { "visible_fields": ["id", "type", "domain", "name", "segment"] },
+        "project": { "visible_fields": ["id", "type", "domain", "name", "status"] }
+      },
+      "extra_visible": ["business_context.*"]
+    },
+    "ceo": {
+      "sensitivity_ceiling": "high",
+      "field_visibility": {
+        "event": { "visible_fields": ["*", "x-extra"] },
+        "decision": { "visible_fields": ["*", "x-extra"] },
+        "person": { "visible_fields": ["*", "x-extra"] },
+        "company": { "visible_fields": ["*", "x-extra"] },
+        "project": { "visible_fields": ["*", "x-extra"] }
+      },
+      "extra_visible": ["*"]
+    },
+    "admin": {
+      "sensitivity_ceiling": "high",
+      "field_visibility": {
+        "event": { "visible_fields": ["*", "x-extra"] },
+        "decision": { "visible_fields": ["*", "x-extra"] },
+        "person": { "visible_fields": ["*", "x-extra"] },
+        "company": { "visible_fields": ["*", "x-extra"] },
+        "project": { "visible_fields": ["*", "x-extra"] }
+      },
+      "extra_visible": ["*"]
+    },
+    "anonymous": {
+      "sensitivity_ceiling": "low",
+      "field_visibility": {
+        "event": { "visible_fields": ["id", "type", "domain", "timestamp"] },
+        "decision": { "visible_fields": ["id", "type", "domain"] }
+      },
+      "extra_visible": []
+    }
+  }
+}

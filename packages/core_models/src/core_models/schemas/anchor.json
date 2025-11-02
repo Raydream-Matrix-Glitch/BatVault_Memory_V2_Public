@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/anchor.json",
+  "title": "Anchor (string)",
+  "description": "Canonical anchor '<domain>#<id>' where domain is slash-scoped lower-kebab per domain.json and id matches [a-z0-9._:-]+.",
+  "type": "string",
+  "pattern": "^([a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*)#[a-z0-9._:-]+$",
+  "$comment": "The domain component MUST match domain.json. Keep these in lock-step."
+}

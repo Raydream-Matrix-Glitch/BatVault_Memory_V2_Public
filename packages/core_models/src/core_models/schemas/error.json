@@ -1,0 +1,22 @@
+{ "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/error.json",
+  "title": "Standard Error Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "code": {
+      "type": "string",
+      "enum": [
+        "precondition_failed","policy_denied","invalid_edge",
+        "validation_failed","contract_violation","opa_error",
+        "internal","upstream_timeout","upstream_error",
+        "storage_unavailable","storage_timeout",
+        "cache_unavailable","bundle_signature_missing"
+      ]
+    },
+    "message": { "type": "string", "minLength": 1 },
+    "request_id": { "type": "string", "minLength": 1 },
+    "details": { "type": ["object","string"] }
+  },
+  "required": ["code","message","request_id"]
+}

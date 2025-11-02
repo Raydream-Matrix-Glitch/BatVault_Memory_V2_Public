@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/memory.resolve.response.json",
+  "title": "Memory Resolve Response (v3)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["query", "matches", "vector_used", "resolved_id"],
+  "properties": {
+    "query": { "type": "string" },
+    "matches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "score"],
+        "properties": {
+          "id":    { "type": "string", "pattern": "^[^#]+#.+|^.*$" },
+          "score": { "type": "number" },
+          "title": { "type": ["string", "null"] },
+          "type":  { "type": ["string", "null"] }
+        }
+      }
+    },
+    "vector_used": { "type": "boolean" },
+    "resolved_id": { "type": "string" },
+    "meta": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "runtime": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "cache_hit": { "type": "boolean" },
+            "stage_latencies_ms": {
+              "type": "object",
+              "additionalProperties": { "type": "number" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

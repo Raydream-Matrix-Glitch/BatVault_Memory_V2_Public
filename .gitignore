@@ -43,3 +43,20 @@ docker-data/
 **/build/lib/
 **/dist/
 **/*.egg-info/
+
+#generated
+# frontend generated
+batvault_frontend/src/types/generated/
+batvault_frontend/openapi/
+batvault_frontend/sdk/
+batvault_frontend/packages/
+
+# python generated
+packages/core_models_gen/
+
+# tools
+.tools/
+
+# local scripts you don't want
+scripts/*.sh
+scripts/*.py

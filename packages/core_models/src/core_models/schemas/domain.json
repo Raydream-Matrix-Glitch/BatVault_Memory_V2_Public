@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/domain.json",
+  "title": "Domain (string)",
+  "description": "Slash-scoped lower-kebab domain. One or more segments separated by '/', each '[a-z0-9]+(?:-[a-z0-9]+)*'.",
+  "type": "string",
+  "pattern": "^(?:[a-z0-9]+(?:-[a-z0-9]+)*)(?:/(?:[a-z0-9]+(?:-[a-z0-9]+)*))*$"
+}

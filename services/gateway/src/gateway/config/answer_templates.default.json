@@ -1,0 +1,16 @@
+{
+  "default": "exec_summary_v1",
+  "templates": [
+    {
+      "blocks": [
+        "lead",
+        "description",
+        "key_events",
+        "next",
+        "owner"
+      ],
+      "constraints": {},
+      "id": "exec_summary_v1"
+    }
+  ]
+}

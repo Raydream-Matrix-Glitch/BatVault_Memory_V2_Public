@@ -8,3 +8,5 @@ Dockerfile     text eol=lf
 *.ts           text eol=lf
 *.tsx          text eol=lf
 *.js           text eol=lf
+scripts/*.py text eol=lf
+*.py          text eol=lf

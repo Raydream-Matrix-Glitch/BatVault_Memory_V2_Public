@@ -1,0 +1,23 @@
+[project]
+name = "core_cache"
+version = "0.1.0"
+description = "Async Redis cache helpers"
+requires-python = ">=3.11"
+dependencies = [
+  "redis>=5.0.3",
+  "core_config",
+  "core_logging",
+]
+
+[project.optional-dependencies]
+dev = [
+  "fakeredis>=2.21.0",
+]
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["core_cache*"]

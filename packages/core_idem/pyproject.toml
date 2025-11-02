@@ -1,0 +1,17 @@
+[project]
+name = "core_idem"
+version = "0.1.0"
+description = "Idempotency helpers for BatVault"
+requires-python = ">=3.11"
+dependencies = [
+  "core_utils",
+  "core_logging",
+]
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["core_idem*"]

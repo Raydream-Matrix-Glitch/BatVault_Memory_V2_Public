@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/bundle.manifest.json",
+  "title": "Bundle Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name":         { "type": "string", "minLength": 1 },
+          "sha256":       { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "bytes":        { "type": "integer", "minimum": 0 },
+          "content_type": { "type": "string", "minLength": 1 }
+        },
+        "required": ["name","sha256","bytes","content_type"]
+      }
+    }
+  },
+  "required": ["artifacts"]
+}

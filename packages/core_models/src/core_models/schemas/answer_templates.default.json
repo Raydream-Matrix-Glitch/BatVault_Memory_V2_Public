@@ -1,0 +1,37 @@
+{
+  "default": "short",
+  "templates": [
+    {
+      "id": "short",
+      "blocks": ["lead","description","key_events","next","owner","decision_id"],
+      "constraints": {
+        "lead":        { "max_chars": 160 },
+        "description": { "max_chars": 400 },
+        "key_events":  { "max_items": 3 }
+      }
+    },
+    {
+      "id": "exec",
+      "blocks": ["lead","key_events","next","owner","decision_id"],
+      "constraints": {
+        "lead":       { "max_chars": 140 },
+        "key_events": { "max_items": 3 }
+      }
+    },
+    {
+      "id": "change-log",
+      "blocks": ["lead","description","key_events","decision_id"],
+      "constraints": { "description": { "max_chars": 500 }, "key_events": { "max_items": 5 } }
+    },
+    {
+      "id": "attestation",
+      "blocks": ["lead","decision_id","owner"],
+      "constraints": { "owner": { "required": true } }
+    },
+    {
+      "id": "impact-preview",
+      "blocks": ["lead","key_events","next","decision_id"],
+      "constraints": { "key_events": { "max_items": 4 } }
+    }
+  ]
+}

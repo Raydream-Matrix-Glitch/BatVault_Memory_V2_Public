@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://batvault.dev/schemas/receipt.json",
+  "title": "Receipt (signature over canonical response bundle)",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "alg":       { "type": "string", "enum": ["ed25519"] },
+    "key_id":    { "type": "string", "minLength": 1 },
+    "sig":       { "type": "string", "minLength": 1 },
+    "covered":   { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "signed_at": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" }
+  },
+  "required": ["alg","key_id","sig","covered","signed_at"]
+}
