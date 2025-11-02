@@ -36,6 +36,10 @@ ANCHOR_RE      = re.compile(r"^(?P<domain>[a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(
 EDGE_ID_RE     = re.compile(r"^(ledto|causal|alias):(?P<from>.+?):(?P<to>.+)$")
 TIMESTAMP_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+def is_valid_anchor(anchor: str) -> bool:
+    """Return True if anchor matches ANCHOR_RE (canonical)."""
+    return bool(ANCHOR_RE.match(anchor or ""))
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def make_anchor(domain: str, node_id: str) -> str:
     if not DOMAIN_RE.match(str(domain or "")):
@@ -99,6 +103,6 @@ __all__ = [
     "NodeType","EdgeType","Sensitivity","TruncationAction","assert_truncation_action",
     "SCHEMA_ID_DECISION","SCHEMA_ID_EVENT","SCHEMA_ID_EDGE",
     "ID_RE","DOMAIN_RE","ANCHOR_RE","EDGE_ID_RE","TIMESTAMP_Z_RE",
-    "make_anchor","parse_anchor","canonical_edge_type","edge_id","utc_z",
+    "make_anchor","parse_anchor","canonical_edge_type","edge_id","utc_z","is_valid_anchor",
     "CAUSAL_EDGE_TYPES","ALIAS_EDGE_TYPES","EDGE_TYPES",
 ]

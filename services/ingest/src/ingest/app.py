@@ -1,23 +1,21 @@
+import os
+import httpx
+import inspect
 from fastapi import FastAPI, Request
 from core_logging import get_logger, log_stage
 from core_utils.fastapi_bootstrap import setup_service
 from core_utils.health import attach_health_routes
 from core_utils.ids import generate_request_id
 from core_config import get_settings 
-import core_metrics, time
 from core_http.client import get_http_client
 from core_config.constants import timeout_for_stage
-import os
-import httpx
-from fastapi.responses import JSONResponse, Response
-import inspect
 from core_observability.otel import inject_trace_context
 
 app = FastAPI(title="BatVault Ingest", version="0.1.0")
 _INGEST_UPSTREAM_BASE = os.getenv("INGEST_UPSTREAM_BASE", "http://gateway:8081").rstrip("/")
 setup_service(app, 'ingest')
 
-logger = get_logger("ingest"); logger.propagate = False
+logger = get_logger("ingest")
 
 @app.on_event("startup")
 async def _log_effective_sensitivity_order() -> None:

@@ -23,12 +23,20 @@ def ensure_bucket(client, bucket: str, retention_days: int, *, request_id: str |
             client.make_bucket(bucket)
             newly_created = True
     except S3Error as exc:
-        log_stage(
-            logger, "artifacts", "minio_bucket_error",
-            bucket=bucket, error=str(exc), request_id=(request_id or "startup")
-        )
-        raise
-
+        # Idempotency across concurrent starters: treat existing buckets as success.
+        code = getattr(exc, "code", "")
+        if code in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
+            log_stage(
+                logger, "artifacts", "minio_bucket_exists",
+                bucket=bucket, request_id=(request_id or "startup")
+            )
+            newly_created = False
+        else:
+            log_stage(
+                logger, "artifacts", "minio_bucket_error",
+                bucket=bucket, error=str(exc), request_id=(request_id or "startup")
+            )
+            raise
     try:
         log_stage(
             logger, "artifacts", "minio_lifecycle_config_begin",

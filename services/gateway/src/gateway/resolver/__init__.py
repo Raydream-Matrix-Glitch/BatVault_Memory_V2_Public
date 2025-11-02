@@ -1,9 +1,9 @@
 from __future__ import annotations
-import hashlib
 import os
 import re
 import inspect
 from typing import Dict, Any
+from core_utils.fingerprints import sha256_hex
 from redis.exceptions import RedisError, ConnectionError
 from core_http.client import fetch_json
 from core_utils import jsonx
@@ -11,7 +11,7 @@ from core_cache.redis_client import get_redis_pool
 from core_metrics import counter as _metric_counter, histogram as _metric_histogram
 from core_logging import trace_span, get_logger, log_stage
 from .fallback_search import search_bm25
-from core_utils.domain import is_valid_anchor
+from core_models.ontology import is_valid_anchor
 from core_config import get_settings
 from core_config.constants import TTL_EVIDENCE_CACHE_SEC as CACHE_TTL
 
@@ -102,7 +102,7 @@ async def _cache_setex(key: str, ttl: int, value: bytes):
 # ---------------------------------------------------------------------------#
 # Public API                                                                 #
 # ---------------------------------------------------------------------------#
-@trace_span("resolver", logger=logger)
+@trace_span("gateway.resolver", logger=logger)
 async def resolve_decision_text(
     text: str,
     *,
@@ -157,7 +157,7 @@ async def resolve_decision_text(
             _metric_counter("resolver_anchor_short_circuit_error_total", 1, service="resolver")
 
     # ---------- 2️⃣  BM25 → Cross-encoder path --------------------------- #
-    key = "resolver:" + hashlib.sha256(text.encode()).hexdigest()
+    key = "resolver:" + sha256_hex(text.encode())
     cached = await _cache_get(key)
     if cached:
         _metric_counter("cache_hit_total", 1, service="resolver")

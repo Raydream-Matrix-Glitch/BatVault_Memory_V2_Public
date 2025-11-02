@@ -13,31 +13,33 @@ from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span
 from core_utils.fastapi_bootstrap import setup_service
 from core_utils.fingerprints import schema_dir_fp
-from core_http.errors import attach_standard_error_handlers
+from core_http.errors import attach_standard_error_handlers, raise_http_error
+from core_logging.error_codes import ErrorCode
 from core_observability.otel import inject_trace_context
 from core_storage import ArangoStore
 from core_utils.health import attach_health_routes
 from core_utils.ids import generate_request_id
 from core_policy_opa import opa_decide_if_enabled, OPADecision
 from core_logging import log_once
-from core_utils.domain import is_valid_anchor, anchor_to_storage_key, storage_key_to_anchor
+from core_models.ontology import is_valid_anchor
+from core_utils.domain import anchor_to_storage_key, storage_key_to_anchor
 from core_models.graph_view import to_wire_edges
-from core_models.ontology import CAUSAL_EDGE_TYPES, ALIAS_EDGE_TYPES
+from core_models.ontology import EDGE_TYPES, CAUSAL_EDGE_TYPES, ALIAS_EDGE_TYPES, canonical_edge_type
 from core_utils import jsonx
-from core_utils.graph import alias_meta
+from core_utils.graph import alias_meta, compute_allowed_ids
 from core_validator import validate_graph_view
-from core_utils.fingerprints import graph_fp as fp_graph, allowed_ids_fp as fp_allowed_ids
+from core_utils.fingerprints import graph_fp as fp_graph, allowed_ids_fp as fp_allowed_ids, normalize_fingerprint
 from core_cache import keys as cache_keys
 from core_cache.redis_cache import RedisCache
 from core_cache.redis_client import get_redis_pool
 from core_http.client import get_http_client
 from core_config.constants import timeout_for_stage, TTL_EVIDENCE_CACHE_SEC
-from core_metrics import histogram as metric_histogram
+from core_metrics import histogram as metric_histogram, counter as metric_counter
 from .policy import compute_effective_policy, field_mask, field_mask_with_summary, acl_check, PolicyHeaderError
+from core_http.headers import REQUEST_SNAPSHOT_ETAG, RESPONSE_SNAPSHOT_ETAG, BV_POLICY_FP, BV_ALLOWED_IDS_FP, BV_GRAPH_FP, BV_POLICY_ENGINE_FP, ETAG, IF_NONE_MATCH
 
 settings = get_settings()
 logger = get_logger("memory_api")
-logger.propagate = False
 
 app = FastAPI(title="BatVault Memory_API", version="0.1.0")
 
@@ -53,6 +55,46 @@ def _schema_fp() -> str | None:
     return _SCHEMA_FP
 setup_service(app, 'memory_api')
 attach_standard_error_handlers(app, service="memory_api")
+
+# ────────────────────────────────────────────────────────────
+# Anchor helpers (single source of truth)
+def _validate_anchor_or_400(anchor: str) -> str:
+    """Ensure the given wire anchor has the canonical '<domain>#<id>' shape."""
+    if not isinstance(anchor, str) or not anchor or not is_valid_anchor(anchor):
+        raise HTTPException(status_code=400, detail="invalid anchor (expected '<domain>#<id>')")
+    return anchor.strip()
+
+# ────────────────────────────────────────────────────────────
+# Domain invariants (single source of truth)
+def _assert_anchor_domain(
+    anchor: str,
+    node_domain: str | None,
+    *,
+    request_id: str,
+    status_code: int = 409,
+    storage_node_id: str | None = None,
+) -> None:
+    """
+    Fail-closed with precise error codes:
+      - DOMAIN_MISSING  when storage returned a node without 'domain'
+      - DOMAIN_MISMATCH when anchor.domain != node.domain
+    """
+    wire = _validate_anchor_or_400(anchor)
+    a_dom = wire.split("#", 1)[0]
+    if not node_domain:
+        log_stage(
+            logger, "expand", "domain_missing",
+            request_id=request_id, anchor_id=wire, storage_node_id=(storage_node_id or "")
+        )
+        raise HTTPException(status_code=status_code, detail="acl:domain_missing")
+    if a_dom != node_domain:
+        log_stage(
+            logger, "expand", "domain_mismatch",
+            request_id=request_id, anchor_id=wire,
+            anchor_domain=a_dom, node_domain=node_domain,
+            storage_node_id=(storage_node_id or "")
+        )
+        raise HTTPException(status_code=status_code, detail="acl:domain_mismatch")
 
 # ────────────────────────────────────────────────────────────
 # M6 — stage timing helper (local to memory_api)
@@ -82,6 +124,28 @@ class _StageTimers:
                 self.stop(name)
         return _Ctx()
 
+def _maybe_add_policy_advice_header(response: Response, request: Request, policy_fp: str) -> None:
+    """
+    If client provided X-Policy-Key and it doesn't match server-computed policy_fp,
+    add an actionable hint for the client to use the canonical fingerprint.
+    """
+    provided = (request.headers.get("X-Policy-Key") or request.headers.get("x-policy-key") or "").strip()
+    if provided and policy_fp and provided != str(policy_fp).strip():
+        response.headers["X-Policy-Advice"] = f"Use X-Policy-Key: {policy_fp}"
+
+def _log_policy_fp_pair(*, stage: str, request_id: str | None, local_fp: str | None, engine_fp: str | None) -> None:
+    """
+    One-line structured audit comparing local (header-derived) policy_fp vs engine (OPA) fp.
+    Does not affect behavior; helps diagnose mixed-policy compositions.
+    """
+    if local_fp or engine_fp:
+        log_stage(
+            logger, stage, "policy.fp_pair",
+            request_id=(request_id or ""),
+            policy_fp_local=(str(local_fp) if local_fp else None),
+            policy_fp_engine=(str(engine_fp) if engine_fp else None),
+        )
+
 def _clear_store_cache() -> None:  # pragma: no cover – trivial utility
     """Best-effort cache invalidation that tolerates monkey-patched *store*."""
     clear_fn = getattr(store, "cache_clear", None)  # type: ignore[attr-defined]
@@ -89,12 +153,22 @@ def _clear_store_cache() -> None:  # pragma: no cover – trivial utility
         clear_fn()
 
 def _policy_from_request_headers(h: Mapping[str, str]) -> dict:
-    """Centralized policy parsing with consistent error mapping."""
+    """Centralized policy parsing with consistent error mapping + explicit logging."""
     try:
         return compute_effective_policy({k: v for k, v in h.items()})
     except PolicyHeaderError as e:
-        raise HTTPException(status_code=400, detail=f"policy_error:{type(e).__name__}")
+        # Log which headers are bad, if available on the exception
+        log_stage(
+            logger, "policy", "header_error",
+            detail=str(e),
+            missing=getattr(e, "missing", None),
+            empty=getattr(e, "empty", None),
+            invalid=getattr(e, "invalid", None),
+        )
+        # Return the detailed string (e.g., "missing_required_headers:missing=x-sensitivity-ceiling")
+        raise HTTPException(status_code=400, detail=str(e))
     except (ValueError, KeyError) as e:
+        log_stage(logger, "policy", "header_error", detail=type(e).__name__)
         raise HTTPException(status_code=400, detail=f"policy_error:{type(e).__name__}")
 
 async def _ping_arango_ready() -> bool:
@@ -118,7 +192,7 @@ async def _readiness() -> dict:
     Tests monkey-patch ``_ping_gateway_ready`` with a *synchronous* lambda.
     Accept both sync & async call-sites.
     """
-    res = _ping_arango_ready()
+    res = _ping_gateway_ready()
     ok = await res if inspect.isawaitable(res) else bool(res)
     return {
         "status": "ready" if ok else "degraded",
@@ -163,24 +237,6 @@ async def bootstrap_arango():
 # Shared helper: always attach the current snapshot ETag
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _compute_allowed_ids(anchor: dict, edges: list) -> list[str]:
-    """
-    Compute nodes-only allowed_ids from the masked k=1 slice (edges-only).
-    Include anchor.id and all `from`/`to` ids from edges.
-    """
-    ids: set[str] = set()
-    aid = str((anchor or {}).get("id") or "").strip()
-    if aid:
-        ids.add(aid)
-    for t in (edges or []):
-        f = str((t or {}).get("from") or "").strip()
-        if f:
-            ids.add(f)
-        to = str((t or {}).get("to") or "").strip()
-        if to:
-            ids.add(to)
-    return sorted(ids)
-
 def _json_response_with_etag(payload: dict, etag: Optional[str] = None) -> JSONResponse:
     """
     Build a JSONResponse and, when available, mirror the repository’s current
@@ -189,7 +245,7 @@ def _json_response_with_etag(payload: dict, etag: Optional[str] = None) -> JSONR
     """
     resp = JSONResponse(content=payload)
     if etag:
-        resp.headers["x-snapshot-etag"] = etag
+        resp.headers[RESPONSE_SNAPSHOT_ETAG] = etag
     sfp = _schema_fp()
     if sfp:
         resp.headers["X-BV-Schema-FP"] = sfp
@@ -197,21 +253,96 @@ def _json_response_with_etag(payload: dict, etag: Optional[str] = None) -> JSONR
         meta = payload.get("meta")
         if isinstance(meta, dict):
             fps = meta.get("fingerprints")
-            pfp = (meta.get("policy_fp")
-                   or (fps.get("policy_fingerprint") if isinstance(fps, dict) else None))
+            pfp = (meta.get("policy_fp"))
             if pfp:
-                resp.headers["X-BV-Policy-Fingerprint"] = str(pfp)
+                resp.headers[BV_POLICY_FP] = str(pfp)
             aid_fp = meta.get("allowed_ids_fp")
             if aid_fp:
-                resp.headers["X-BV-Allowed-Ids-FP"] = str(aid_fp)
+                resp.headers[BV_ALLOWED_IDS_FP] = str(aid_fp)
             if isinstance(fps, dict):
                 gfp = fps.get("graph_fp")
-                if isinstance(gfp, str) and gfp:
-                    resp.headers["X-BV-Graph-FP"] = gfp
+                # Only echo Graph-FP when the payload actually contains a 'graph' block
+                if isinstance(gfp, str) and gfp and isinstance(payload.get('graph'), dict):
+                    resp.headers[BV_GRAPH_FP] = gfp
+                    # Observability: header adoption (once per request)
+                    try:
+                        log_once(logger, key=f"graph_fp_header_set:{gfp}",
+                                 event="view.graph_fp_header_set", stage="view", graph_fp=gfp)
+                        metric_counter('memory_view_graph_fp_header_set_total', 1)
+                    except (TypeError, ValueError):
+                        pass
     return resp
 
 def _attach_snapshot_meta(doc: dict, etag: Optional[str]) -> dict:
+    """Attach/normalize snapshot_etag inside doc.meta, if an etag is available.
+    - No-op for non-dict docs (defensive).
+    - Does not create meta unless there's a non-empty etag.
+    - Idempotent when the existing value already matches.
+    """
+    if not isinstance(doc, dict):
+        return doc
+    et = (etag or "").strip() if isinstance(etag, str) else ""
+    if not et:
+        return doc
+    meta = doc.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    if meta.get("snapshot_etag") != et:
+        meta["snapshot_etag"] = et
+    doc["meta"] = meta
     return doc
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Shared helper: strict snapshot precondition (412 on missing/mismatch)
+# ──────────────────────────────────────────────────────────────────────────────
+def _require_snapshot_precondition(
+    request: Request,
+    *,
+    payload: Optional[Mapping[str, object]] = None,
+    stage: str = "read",
+) -> str:
+    """Return the current snapshot etag if the precondition passes; otherwise 412."""
+    try:
+        _raw = store().get_snapshot_etag()
+    except (RuntimeError, OSError, AttributeError):
+        _raw = None
+    # Normalize EXACTLY like HEAD /api/enrich so clients can use the sentinel
+    # value before the first ingest.
+    etag_now = (_raw or "unknown").strip()
+    precond = ""
+    if payload and isinstance(payload, Mapping):
+        val = payload.get("snapshot_etag")
+        if isinstance(val, str):
+            precond = val.strip()
+    if not precond:
+        precond = str(request.headers.get(REQUEST_SNAPSHOT_ETAG) or "").strip()
+    # Provide precise reasons while remaining fail-closed.
+    if not etag_now:
+        log_stage(logger, stage, "precondition_no_snapshot",
+                  provided=(precond or "<missing>"), current="<none>")
+        raise HTTPException(
+            status_code=412,
+            detail="precondition:no_snapshot",
+            headers={RESPONSE_SNAPSHOT_ETAG: etag_now},
+        )
+    if not precond:
+        log_stage(logger, stage, "precondition_missing",
+                  provided="<missing>", current=etag_now)
+        raise HTTPException(
+            status_code=412,
+            detail="precondition:missing",
+            headers={RESPONSE_SNAPSHOT_ETAG: etag_now},
+        )
+    if precond != etag_now:
+        log_stage(logger, stage, "precondition_mismatch",
+                  provided=precond, current=etag_now)
+        raise HTTPException(
+            status_code=412,
+            detail="precondition:snapshot_etag_mismatch",
+            headers={RESPONSE_SNAPSHOT_ETAG: etag_now},
+        )
+    # Success: return the normalized snapshot etag for callers to mirror in meta & headers
+    return etag_now
 
 # ------------------ Scope assembly (shared between expand & enrich) ------------------
 def _edges_with_acl_and_alias_tail(
@@ -223,15 +354,25 @@ def _edges_with_acl_and_alias_tail(
     Dedup/sort/wire-shaping is centralized in core_models.graph_view.to_wire_edges to avoid drift.
     """
     # Edge allowlist (default: canonical three types)
-    allowed_types = set((policy.get("edge_allowlist") or [])) if isinstance(policy, dict) else set()
+    # Normalize policy allowlist (accept CSV/list/synonyms)
+    allowed_types = set()
+    if isinstance(policy, dict):
+        raw = policy.get("edge_allowlist")
+        if isinstance(raw, str):
+            tokens = [t for t in raw.split(",") if t]
+        elif isinstance(raw, (list, tuple, set)):
+            tokens = list(raw)
+        else:
+            tokens = list(EDGE_TYPES)
+        allowed_types = {canonical_edge_type(t) for t in tokens}
     if not allowed_types:
-        allowed_types = {"LED_TO", "CAUSAL", "ALIAS_OF"}
+        allowed_types = set(EDGE_TYPES)
 
     edges_in: list = (st.get_edges_adjacent(node_id) or {}).get("edges") or []
     edges_kept: list = []
 
     for e in edges_in:
-        et = (e or {}).get("type")
+        et = canonical_edge_type((e or {}).get("type"))
         if et not in allowed_types:
             continue
         f = (e or {}).get("from"); t = (e or {}).get("to")
@@ -267,7 +408,11 @@ def _edges_with_acl_and_alias_tail(
     anchor_id_storage = node_id
     alias_event_ids: list[str] = []
     for e in edges_in:
-        if (e or {}).get("type") not in set(ALIAS_EDGE_TYPES):
+        try:
+            et = canonical_edge_type((e or {}).get("type"))
+        except ValueError:
+            continue
+        if et not in set(ALIAS_EDGE_TYPES):
             continue
         if (e or {}).get("to") != anchor_id_storage:
             continue
@@ -287,6 +432,11 @@ def _edges_with_acl_and_alias_tail(
        # node id is already a storage key.
         try:
             alias_anchor = storage_key_to_anchor(ev_id)
+            try:
+                log_stage(logger, "policy", "id_normalized",
+                          before=str(ev_id), after=str(alias_anchor), request_id=request_id)
+            except (RuntimeError, ValueError, TypeError):
+                pass
         except (ValueError, TypeError, AttributeError):
             alias_anchor = str(ev_id)
 
@@ -302,6 +452,11 @@ def _edges_with_acl_and_alias_tail(
             if other_id:
                 try:
                     dec_anchor = storage_key_to_anchor(other_id)
+                    try:
+                        log_stage(logger, "policy", "id_normalized",
+                                  before=str(other_id), after=str(dec_anchor), request_id=request_id)
+                    except (RuntimeError, ValueError, TypeError):
+                        pass
                 except (ValueError, TypeError, AttributeError):
                     dec_domain = (d or {}).get("domain")
                     dec_id = other_id
@@ -311,7 +466,6 @@ def _edges_with_acl_and_alias_tail(
                         dec_anchor = str(other_id)
             edge = (d or {}).get("edge") or {}
             try:
-                from core_models.ontology import canonical_edge_type
                 et = canonical_edge_type(edge.get("type"))
             except (ValueError, TypeError):
                 et = str(edge.get("type") or "")
@@ -322,10 +476,40 @@ def _edges_with_acl_and_alias_tail(
                     {"type": et, "from": alias_anchor, "to": dec_anchor, "timestamp": ts}
                 )
     if alias_edges_to_add:
-        edges_kept.extend(alias_edges_to_add)
+        # Enforce ACL on alias-tail decision targets before adding edges (prevents id-only leaks)
+        guarded: list[dict] = []
+        for ed in alias_edges_to_add:
+            tgt_wire = ed.get("to")
+            if not isinstance(tgt_wire, str):
+                continue
+            # Fetch the target doc by storage key (convert from anchor) and run ACL
+            try:
+                tgt_key = anchor_to_storage_key(tgt_wire)
+            except (ValueError, TypeError, AttributeError):
+                # If anchor is malformed, skip the edge
+                try:
+                    log_stage(logger, "alias_tail", "edge_dropped_malformed_anchor",
+                              to=str(tgt_wire), request_id=request_id)
+                except (RuntimeError, ValueError, TypeError):
+                    pass
+                continue
+            try:
+                tgt_doc = st.get_node(tgt_key) or {}
+            except (RuntimeError, OSError):
+                tgt_doc = {}
+            ok, _reason = acl_check(tgt_doc, policy)
+            if ok:
+                guarded.append(ed)
+            else:
+                try:
+                    log_stage(logger, "alias_tail", "edge_dropped_acl",
+                              to=str(tgt_wire), request_id=request_id)
+                except (RuntimeError, ValueError, TypeError):
+                    pass
+        edges_kept.extend(guarded)
         try:
             log_stage(logger, "alias_tail", "added",
-                      added_count=len(alias_edges_to_add), request_id=request_id)
+                      added_count=len(guarded), request_id=request_id)
         except (ValueError, TypeError, RuntimeError):
             pass
     return edges_kept
@@ -334,43 +518,65 @@ def _edges_with_acl_and_alias_tail(
 # --------------- Enrichment -------------
 @app.get("/api/enrich")
 async def enrich(anchor: str, response: Response, request: Request):
-    """
-    Type-agnostic enrich: lookup by anchor (Decision, Event, future types).
+    """Type-agnostic enrich: lookup by anchor (Decision, Event, future types).
+    Snapshot policy: STRICT — requires X-Snapshot-ETag matching the current snapshot; missing/mismatch → 412.
+    Headers: mirrors x-snapshot-etag and X-BV-Policy-Fingerprint; does NOT set X-BV-Graph-FP (no graph in the payload).
+    Contract: returns a single masked node plus mask_summary.
     """
     rid = (request.headers.get("x-request-id") or request.headers.get("X-Request-Id") or "")
     # Fail-closed policy headers (centralized)
     policy = _policy_from_request_headers(request.headers)
-    # Validate anchor on the wire
-    if not anchor or not is_valid_anchor(anchor):
-        raise HTTPException(status_code=400, detail="invalid anchor (expected '<domain>#<id>')")
+    # Validate anchor on the wire (single helper) and map to storage
+    anchor = _validate_anchor_or_400(anchor)
     key = anchor_to_storage_key(anchor)
+    # Strict snapshot precondition (enforce early to avoid wasted work)
+    safe_etag = _require_snapshot_precondition(request, stage="enrich")
     # Blocking store call → thread
     def _work() -> Optional[dict]:
         return store().get_enriched_node(key)
-    try:
-        with trace_span("memory.enrich", anchor=anchor):
+    with trace_span("memory.enrich", anchor=anchor):
+        try:
             budget_s = max(0.1, float(get_settings().timeout_enrich_ms) / 1000.0)
             doc = await asyncio.wait_for(asyncio.to_thread(_work), timeout=budget_s)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="timeout")
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="timeout")
     if doc is None:
         raise HTTPException(status_code=404, detail="not_found")
-    try:
-        etag = store().get_snapshot_etag()
-    except (RuntimeError, OSError, AttributeError):
-        etag = None
-    safe_etag = etag or "unknown"
+    # (precondition already enforced; safe_etag available)
+
     # Audit & attach snapshot meta
     if isinstance(doc, dict):
-        doc = _attach_snapshot_meta(doc, etag)
+        doc = _attach_snapshot_meta(doc, safe_etag)
     # Domain required + must match anchor’s domain (fail-closed)
-    anchor_domain = (anchor.split("#", 1)[0] or "").strip()
-    node_domain = (doc or {}).get("domain")
-    if not node_domain or (anchor_domain and node_domain != anchor_domain):
-        log_stage(logger, "enrich", "domain_mismatch_or_missing",
-                  anchor=anchor, node_domain=node_domain, request_id=rid)
-        raise HTTPException(status_code=int(policy.get("denied_status") or 403),
-                            detail="acl:domain_mismatch_or_missing")
+    _assert_anchor_domain(
+        anchor,
+        (doc or {}).get("domain"),
+        request_id=rid,
+        status_code=int(policy.get("denied_status") or 403),
+        storage_node_id=key,
+    )
+    # --- OPA/Rego decision (parity with expand/enrich_batch) -----------------
+    # Use engine decision for visibility/scopes; DO NOT override locally computed policy_fp.
+    opa_decision: OPADecision | None = opa_decide_if_enabled(
+        anchor_id=anchor,
+        edges=[],  # single-node enrich; no edges context
+        headers={k: v for k, v in request.headers.items()},
+        snapshot_etag=safe_etag,
+        intents=["enrich"],
+    )
+    engine_fp: str | None = None
+    if opa_decision:
+        engine_fp = getattr(opa_decision, "policy_fp", None) or None
+        if getattr(opa_decision, "denied_status", None):
+            policy["denied_status"] = int(opa_decision.denied_status)
+        explain = getattr(opa_decision, "explain", None)
+        if isinstance(explain, dict):
+            fv = (explain.get("field_visibility") or {})
+            if fv:
+                policy.setdefault("role_profile", {})["field_visibility"] = fv
+        if getattr(opa_decision, "extra_visible", None):
+            policy["extra_visible"] = opa_decision.extra_visible    
+
     # ACL then mask
     allowed, reason = acl_check(doc, policy)
     if not allowed:
@@ -383,40 +589,58 @@ async def enrich(anchor: str, response: Response, request: Request):
             request_id=rid,
         )
         raise HTTPException(status_code=403, detail=reason or "acl:denied")
-    # Avoid inferring a type when missing.  Base document is copied verbatim; type
-    # inference is handled by the policy/schema.  See Baseline §1.1.
+    # Normalize id to WIRE form to prevent "eng#eng_..." double-prefix anchors
+    # (storage_key_to_anchor("eng_d-eng-010") → "eng#d-eng-010")
+    wire_anchor = storage_key_to_anchor(key)
     base = dict(doc)
+    base["id"] = wire_anchor  # single source of truth for downstream extras
     masked, mask_summary = field_mask_with_summary(base, policy)
-    return _json_response_with_etag({"mask_summary": mask_summary, **masked}, safe_etag)
+    _resp = _json_response_with_etag({"mask_summary": mask_summary, **masked}, safe_etag)
+    # Mirror policy fingerprint for audits (node-only response; no graph_fp)
+    _pfp = policy.get("policy_fp") if isinstance(policy, dict) else None
+    if isinstance(_pfp, str) and _pfp:
+        _resp.headers[BV_POLICY_FP] = str(_pfp)
+    if engine_fp:
+        _resp.headers[BV_POLICY_ENGINE_FP] = str(engine_fp)
+    _log_policy_fp_pair(stage="enrich", request_id=rid, local_fp=(_pfp if isinstance(_pfp, str) else None), engine_fp=engine_fp)
+    _maybe_add_policy_advice_header(_resp, request, str(policy.get("policy_fp") or ""))
+    return _resp
 
 @app.head("/api/enrich")
-async def enrich_head(anchor: str, response: Response, request: Request):
+async def enrich_head(anchor: str, request: Request):
     """
-    Cheap freshness check for Gateway: returns only ETag/x-snapshot-etag.
-    No read-time normalization; no body.
+    Cheap freshness check: returns only ETag (quoted) and x-snapshot-etag; no body.
+    No snapshot precondition required. Use If-None-Match with the quoted ETag to get 304.
     """
+    _validate_anchor_or_400(anchor)
     etag = store().get_snapshot_etag() if store() else None
     safe_etag = etag or "unknown"
-    inm = request.headers.get("if-none-match") or request.headers.get("If-None-Match")
-    # Reflect ETag headers (quote per RFC)
-    response.headers["ETag"] = f"\"{safe_etag}\""
-    response.headers["x-snapshot-etag"] = safe_etag
-    if inm and inm.strip("\"") == safe_etag:
-        return Response(status_code=304)
-    return Response(status_code=200)
+    inm = request.headers.get(IF_NONE_MATCH)
+    # Mirror standard freshness headers only (HEAD returns no policy headers)
+    headers = {
+        ETAG: f"\"{safe_etag}\"",
+        RESPONSE_SNAPSHOT_ETAG: safe_etag,
+    }
+    if isinstance(inm, str) and inm.strip("\"") == safe_etag:
+        return Response(status_code=304, headers=headers)
+    return Response(status_code=200, headers=headers)
 
 @app.get("/api/enrich/event")
 async def enrich_event(anchor: str, response: Response, request: Request):
-    """
-    Return a fully enriched event document.  The synchronous store call is offloaded
-    to a worker thread with a configurable timeout to avoid blocking the event loop.
-    Missing events return 404 and timeouts return 504.
+    """Event-only enrich by anchor.
+    Snapshot policy: STRICT — same as /api/enrich (requires X-Snapshot-ETag).
+    Headers: mirrors x-snapshot-etag and X-BV-Policy-Fingerprint; does NOT set X-BV-Graph-FP.
     """
     # Fail-closed: centralized policy parsing
     rid = (request.headers.get("x-request-id") or request.headers.get("X-Request-Id") or "")
     policy = _policy_from_request_headers(request.headers)
-    # Resolve anchor to storage key (was missing; caused NameError on node_id)
-    node_id = anchor_to_storage_key(anchor)
+    # Validate wire anchor and map to storage key
+    anchor = _validate_anchor_or_400(anchor)
+    # Strict snapshot precondition: require X-Snapshot-ETag; 412 on missing/mismatch
+    safe_etag = _require_snapshot_precondition(request, stage="enrich_event")
+    from core_utils.domain import anchor_to_storage_key, storage_key_to_anchor, parse_anchor
+    _, node_id = parse_anchor(anchor)  # keep if you need wire-vs-storage comparisons later
+    key = anchor_to_storage_key(anchor)
     with trace_span("memory.enrich_event", node_id=node_id):
         def _work() -> Optional[dict]:
             st = store()
@@ -428,24 +652,59 @@ async def enrich_event(anchor: str, response: Response, request: Request):
             raise HTTPException(status_code=504, detail="timeout")
         if doc is None:
             raise HTTPException(status_code=404, detail="event_not_found")
-        try:
-            etag = store().get_snapshot_etag()
-        except (RuntimeError, OSError, AttributeError):
-            etag = None
-        safe_etag = etag or "unknown"
     if isinstance(doc, dict):
-        doc = _attach_snapshot_meta(doc, etag)
+        doc = _attach_snapshot_meta(doc, safe_etag)
+    # Domain required + must match anchor’s domain (fail-closed, parity with /api/enrich)
+    _assert_anchor_domain(
+        anchor,
+        (doc or {}).get("domain"),
+        request_id=rid,
+        status_code=int(policy.get("denied_status") or 403),
+        storage_node_id=node_id,
+    )
+
+    # --- OPA/Rego decision (event parity) -----------------------------------
+    opa_decision: OPADecision | None = opa_decide_if_enabled(
+        anchor_id=anchor,
+        edges=[],  # event-only enrich
+        headers={k: v for k, v in request.headers.items()},
+        snapshot_etag=safe_etag,
+        intents=["enrich_event"],
+    )
+    engine_fp: str | None = None
+    if opa_decision:
+        engine_fp = getattr(opa_decision, "policy_fp", None) or None
+        if getattr(opa_decision, "denied_status", None):
+            policy["denied_status"] = int(opa_decision.denied_status)
+        explain = getattr(opa_decision, "explain", None)
+        if isinstance(explain, dict):
+            fv = (explain.get("field_visibility") or {})
+            if fv:
+                policy.setdefault("role_profile", {})["field_visibility"] = fv
+        if getattr(opa_decision, "extra_visible", None):
+            policy["extra_visible"] = opa_decision.extra_visible    
+
     # ---- Policy-aware masking + ACL guard (parity with decision) -------------
     allowed, reason = acl_check(doc, policy)
     if not allowed:
         log_stage(logger, "enrich", "acl_denied",
                   node_type="event", node_id=node_id, reason=reason, request_id=rid)
         raise HTTPException(status_code=403, detail=reason or "acl:denied")
-    # Avoid forcing the type to EVENT.  Copy the document as-is and apply field masking.
+    # Normalize id to WIRE form just like /api/enrich
+    wire_anchor = storage_key_to_anchor(key)
     base = dict(doc)
+    base["id"] = wire_anchor
     masked, mask_summary = field_mask_with_summary(base, policy)
-    result = {"mask_summary": mask_summary, "event": masked}
-    return _json_response_with_etag(result, safe_etag)
+    _resp = _json_response_with_etag({"mask_summary": mask_summary, "event": masked}, safe_etag)
+    # Mirror policy fingerprint + advise if client sent a mismatched X-Policy-Key
+    _pfp = policy.get("policy_fp") if isinstance(policy, dict) else None
+    if isinstance(_pfp, str) and _pfp:
+        _resp.headers[BV_POLICY_FP] = str(_pfp)
+    if engine_fp:
+        _resp.headers[BV_POLICY_ENGINE_FP] = str(engine_fp)
+    _log_policy_fp_pair(stage="enrich_event", request_id=rid, local_fp=(_pfp if isinstance(_pfp, str) else None), engine_fp=engine_fp)
+    _maybe_add_policy_advice_header(_resp, request, str(policy.get("policy_fp") or ""))
+    return _resp
 
 # --------------- Batch Enrichment (bounded, policy- & snapshot-bound) -------------
 @app.post("/api/enrich/batch")
@@ -465,37 +724,23 @@ async def enrich_batch(payload: dict, response: Response, request: Request):
     try:
         policy = _policy_from_request_headers(request.headers)
     except HTTPException:
-        log_stage(logger, "policy", "header_error", request_id=(payload or {}).get("request_id"))
+        log_stage(logger, "policy", "header_error", request_id=(request.headers.get("x-request-id") or request.headers.get("X-Request-Id") or ""))
         raise
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="invalid_payload")
-    anchor_wire = str((payload.get("anchor_id") or "")).strip()
-    if not anchor_wire or not is_valid_anchor(anchor_wire):
-        raise HTTPException(status_code=400, detail="invalid anchor (expected '<domain>#<id>')")
+    anchor_wire = _validate_anchor_or_400(str((payload.get("anchor_id") or "")).strip())
     wanted_ids = [str(i).strip() for i in (payload.get("ids") or []) if isinstance(i, (str,))]
 
-    # Snapshot precondition
-    etag_now = (store().get_snapshot_etag() or "") if store() else ""
-    precond = str((
-        payload.get("snapshot_etag")
-        or request.headers.get("X-Snapshot-ETag")
-        or request.headers.get("X-Snapshot-Etag")
-        or request.headers.get("x-snapshot-etag")
-        or ""
-    )).strip()
-    # Baseline v3: precondition is REQUIRED. Missing OR mismatched -> 412.
-    if (not precond) or (not etag_now) or (precond != etag_now):
-        log_stage(logger, "enrich_batch", "precondition_failed",
-                  provided=(precond or "<missing>"), current=(etag_now or "<unknown>"),
-                  request_id=rid)
-        raise HTTPException(status_code=412, detail="precondition:snapshot_etag_mismatch")
+    # Snapshot precondition (accept header or body), 412 on missing/mismatch
+    etag_now = _require_snapshot_precondition(request, payload=payload, stage="enrich_batch")
 
     # Recompute scope deterministically (same as expand_candidates)
-    node_id = anchor_to_storage_key(anchor_wire)
+    from core_utils.domain import parse_anchor, anchor_to_storage_key, storage_key_to_anchor
+    _, node_id = parse_anchor(anchor_wire)               # wire id (domain-less)
+    key = anchor_to_storage_key(anchor_wire)             # storage key (domain_prefix)
     try:
         st = store()
-        edges_adjacent = st.get_edges_adjacent(node_id)
-        anchor_doc = st.get_node(node_id) or {}
+        anchor_doc = st.get_node(key) or {}
     except (RuntimeError, OSError, AttributeError) as e:
         log_stage(logger, "enrich_batch", "store_unavailable",
                   error=type(e).__name__, request_id=rid)
@@ -509,16 +754,17 @@ async def enrich_batch(payload: dict, response: Response, request: Request):
         raise HTTPException(status_code=int(policy.get("denied_status") or 403),
                             detail=reason or "acl:denied")
     # Domain required + must match anchor’s domain (fail-closed)
-    anchor_domain = (anchor_wire.split("#", 1)[0] or "").strip()
-    if not (anchor_doc or {}).get("domain") or (anchor_domain and (anchor_doc or {}).get("domain") != anchor_domain):
-        log_stage(logger, "enrich_batch", "domain_mismatch_or_missing",
-                  anchor=anchor_wire, node_domain=(anchor_doc or {}).get("domain"))
-        raise HTTPException(status_code=int(policy.get("denied_status") or 403),
-                            detail="acl:domain_mismatch_or_missing")
+    _assert_anchor_domain(
+        anchor_wire,
+        (anchor_doc or {}).get("domain"),
+        request_id=rid,
+        status_code=int(policy.get("denied_status") or 403),
+        storage_node_id=key,
+    )
 
     # Recompute scope deterministically (k=1 + bounded alias tail) using shared helper
     edges_kept = _edges_with_acl_and_alias_tail(
-        st, node_id, anchor_doc, policy, request_id=rid
+        st, key, anchor_doc, policy, request_id=rid
     )
     # Use the same SoT for shaping/dedup before computing allowed_ids to avoid drift
     _edges_wire_for_ids: List[dict] = to_wire_edges(edges_kept)
@@ -530,24 +776,43 @@ async def enrich_batch(payload: dict, response: Response, request: Request):
     except (RuntimeError, ValueError, TypeError, KeyError):
         pass
 
-    # --- OPA/Rego externalized decision (fallback to deterministic local computation) ---
+    # --- Compute deterministic local allowed_ids from the scoped edges (fail-closed) ---
+    local_allowed_ids: List[str] = compute_allowed_ids({"id": anchor_wire}, _edges_wire_for_ids)
+    # Start with local view by default; OPA may only reduce this via intersection.
+    allowed_wire_ids: List[str] = sorted(set(local_allowed_ids))
+
+    # --- OPA/Rego externalized decision (only narrows via intersection) ---
     opa_decision: OPADecision | None = opa_decide_if_enabled(
         anchor_id=anchor_wire,
         edges=_edges_wire_for_ids,
         headers={k: v for k, v in request.headers.items()},
         snapshot_etag=etag_now,
+        intents=["enrich_batch"],
     )
+    engine_fp: str | None = None
     if opa_decision and opa_decision.allowed_ids:
-        allowed_wire_ids = opa_decision.allowed_ids
-        # Surface engine-chosen policy_fp & extra_visible to downstream masking
-        try:
-            policy["policy_fp"] = opa_decision.policy_fp  # prefer engine fingerprint
-            if opa_decision.extra_visible:
-                policy["extra_visible"] = opa_decision.extra_visible
-        except Exception:
-            log_once(logger, "opa_apply_policy_metadata_failed", level="warning")
-    else:
-        allowed_wire_ids = _compute_allowed_ids({"id": anchor_wire}, _edges_wire_for_ids)
+        # Intersect OPA with our deterministic local set to avoid overexposure.
+        opa_ids = set(opa_decision.allowed_ids)
+        before_local = len(allowed_wire_ids)
+        before_opa   = len(opa_ids)
+        allowed_wire_ids = sorted(set(local_allowed_ids) & opa_ids)
+        log_stage(
+            logger, "enrich_batch", "allowed_ids_intersection",
+            local=before_local, opa=before_opa, effective=len(allowed_wire_ids),
+            anchor=anchor_wire
+        )
+        # Engine fingerprint only for telemetry; keep local policy_fp stable.
+        engine_fp = getattr(opa_decision, "policy_fp", None) or None
+        if opa_decision.denied_status is not None:
+            policy["denied_status"] = int(opa_decision.denied_status)
+        # OPA-driven field visibility for masking
+        explain = getattr(opa_decision, "explain", None)
+        if isinstance(explain, dict):
+            fv = (explain.get("field_visibility") or {})
+            if fv:
+                policy.setdefault("role_profile", {})["field_visibility"] = fv
+        if getattr(opa_decision, "extra_visible", None):
+            policy["extra_visible"] = opa_decision.extra_visible
 
     # Intersect deterministically and enforce policy per node
     out: dict = {}
@@ -580,12 +845,12 @@ async def enrich_batch(payload: dict, response: Response, request: Request):
     for wid in ids_to_fetch:
         try:
             storage_key = anchor_to_storage_key(wid)
-        except Exception:
+        except (ValueError, TypeError):
             continue
         doc = None
         try:
             doc = store().get_enriched_node(storage_key)
-        except Exception:
+        except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
             doc = None
         if not isinstance(doc, dict):
             continue
@@ -597,11 +862,15 @@ async def enrich_batch(payload: dict, response: Response, request: Request):
         out[wid] = masked
 
     if etag_now:
-        response.headers["x-snapshot-etag"] = etag_now
+        response.headers[RESPONSE_SNAPSHOT_ETAG] = etag_now
     # Emit fingerprints in meta for FE cache keys (and mirrors in headers for audit drawers)
-    response.headers["X-BV-Policy-Fingerprint"] = str(policy.get("policy_fp") or "")
+    response.headers[BV_POLICY_FP] = str(policy.get("policy_fp") or "")
+    if engine_fp:
+        response.headers[BV_POLICY_ENGINE_FP] = str(engine_fp)
+    _log_policy_fp_pair(stage="enrich_batch", request_id=rid, local_fp=(policy.get("policy_fp") if isinstance(policy, dict) else None), engine_fp=engine_fp)
+    _maybe_add_policy_advice_header(response, request, str(policy.get("policy_fp") or ""))
     meta_allowed_ids_fp = fp_allowed_ids(allowed_wire_ids)
-    response.headers["X-BV-Allowed-Ids-FP"] = meta_allowed_ids_fp
+    response.headers[BV_ALLOWED_IDS_FP] = meta_allowed_ids_fp
     # Surface compact policy meta for FE audit drawers (parity across routes)
     try:
         _extra = policy.get("extra_visible") if isinstance(policy, dict) else None
@@ -611,7 +880,7 @@ async def enrich_batch(payload: dict, response: Response, request: Request):
             response.headers["X-BV-Policy-Meta"] = _orjson.dumps(
                 {"extra_visible": _extra}
             ).decode("utf-8")
-    except Exception:
+    except (RuntimeError, OSError, ValueError, TypeError):
         # do not fail response on header encoding issues
         pass
     # Trim meta to *returned_count* (no totals). Keep allowlist/fps for FE/cache determinism.
@@ -621,7 +890,7 @@ async def enrich_batch(payload: dict, response: Response, request: Request):
             "returned_count": len(out),
             "allowed_ids": allowed_wire_ids,
             "allowed_ids_fp": meta_allowed_ids_fp,
-            "policy_fp": str(policy.get("policy_fp") or "unknown"),
+            "policy_fp": normalize_fingerprint(str(policy.get("policy_fp") or "")),
             "snapshot_etag": etag_now,
         },
     }
@@ -646,7 +915,7 @@ async def resolve_text(payload: dict, response: Response, request: Request):
         raise HTTPException(status_code=400, detail=f"policy_error:{type(e).__name__}")
     try:
         etag_for_cache = store().get_snapshot_etag()
-    except Exception:
+    except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
         etag_for_cache = None
     cache_key = None
     if etag_for_cache and q:
@@ -676,11 +945,14 @@ async def resolve_text(payload: dict, response: Response, request: Request):
                 meta = (cached.get("meta") or {})
                 fps  = meta.get("fingerprints") or {}
                 pfp  = meta.get("policy_fp") or fps.get("policy_fingerprint")
+                res = _json_response_with_etag(_attach_snapshot_meta(cached, etag_for_cache), etag_for_cache)
                 if pfp:
-                    response.headers["X-BV-Policy-Fingerprint"] = pfp
+                    res.headers[BV_POLICY_FP] = pfp
+                _maybe_add_policy_advice_header(res, request, str(policy.get("policy_fp") or ""))
+                return res
             except (TypeError, KeyError, AttributeError, ValueError):
-                pass
-            return _json_response_with_etag(_attach_snapshot_meta(cached, etag_for_cache), etag_for_cache)
+                # Fall back if cached meta is malformed
+                return _json_response_with_etag(_attach_snapshot_meta(cached, etag_for_cache), etag_for_cache)
         else:
             log_stage(logger, "cache", "miss", layer="resolve", cache_key=cache_key)
     # Vector mode is opt-in only: honour explicit payload flags; no auto-embedding.
@@ -690,9 +962,10 @@ async def resolve_text(payload: dict, response: Response, request: Request):
     if not q and not (use_vector and query_vector):
         return {"matches": [], "query": q, "vector_used": False}
     if q and is_valid_anchor(q):
+        q = _validate_anchor_or_400(q)
         try:
             node = store().get_node(anchor_to_storage_key(q))
-        except Exception:
+        except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
             node = None
         if node:
             doc = {
@@ -711,7 +984,7 @@ async def resolve_text(payload: dict, response: Response, request: Request):
             }
             try:
                 etag = store().get_snapshot_etag()
-            except Exception:
+            except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
                 etag = None
             safe_etag = etag or "unknown"
             try:
@@ -762,7 +1035,7 @@ async def resolve_text(payload: dict, response: Response, request: Request):
     except (RuntimeError, OSError, AttributeError):
         etag = None
     if etag:
-        response.headers["x-snapshot-etag"] = etag
+        response.headers[RESPONSE_SNAPSHOT_ETAG] = etag
     # Also surface the snapshot in the body for simpler audit drawers
     doc.setdefault("meta", {})
     doc["meta"]["snapshot_etag"] = etag or "unknown"
@@ -788,9 +1061,9 @@ async def resolve_text(payload: dict, response: Response, request: Request):
         doc['meta']['runtime']['cache_hit'] = bool(_any_cache_hit)
         try:
             doc['meta']['runtime']['timeout_ms'] = int(1000 * timeout_for_stage("search"))
-        except Exception:
+        except (ValueError, TypeError):
             pass
-    except Exception:
+    except (ValueError, TypeError, RuntimeError, KeyError):
         pass
     # - Uses shared Redis client + wrapper
     # - Key: cache_keys.mem_resolve(snapshot_etag, policy_fp, query)
@@ -805,18 +1078,24 @@ async def resolve_text(payload: dict, response: Response, request: Request):
         except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
             # best-effort; avoid raising on cache write
             pass
-        except Exception:
-                # swallow Redis errors silently (deterministic fallback)
-                pass
-        except Exception:
-            pass
     matches = doc.get("matches", []) or []
     n = len(matches)
     result_flag = "0" if n == 0 else ("1" if n == 1 else "n")
-    return _json_response_with_etag(doc, etag)
+    _resp = _json_response_with_etag(doc, etag)
+    try:
+        _resp.headers[BV_POLICY_FP] = str(policy.get("policy_fp") or "")
+        _maybe_add_policy_advice_header(_resp, request, str(policy.get("policy_fp") or ""))
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return _resp
 
 @app.post("/api/graph/expand_candidates")
 async def expand_candidates(payload: dict, response: Response, request: Request):
+    """Edges-only graph view around the anchor (k=1).
+    Snapshot policy: STRICT — requires X-Snapshot-ETag (or `snapshot_etag` in body); missing/mismatch → 412. Mirrors x-snapshot-etag in responses for cache keys.
+    Headers: sets X-BV-Graph-FP and mirrors X-BV-Policy-Fingerprint (graph fingerprint also present at meta.fingerprints.graph_fp).
+    Contract: meta.fingerprints ONLY contains graph_fp; bundle_fp is never present here.
+    """
     _timers = _StageTimers()
 
     # Ensure *etag* is always bound, even when the store raises and we
@@ -824,36 +1103,19 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
     etag: Optional[str] = None
     # Anchors only on the wire
     anchor = (payload or {}).get("anchor")
-    if not anchor or not is_valid_anchor(anchor):
-        log_stage(logger, "expand", "input_error",
-                  reason="invalid_anchor_format", expected="<domain>#<id>", anchor=anchor)
-        raise HTTPException(status_code=400, detail="invalid anchor (expected '<domain>#<id>')")
-    node_id = anchor_to_storage_key(anchor)
+    anchor = _validate_anchor_or_400(anchor)
+    from core_utils.domain import parse_anchor
+    _, node_id = parse_anchor(anchor)
+    # storage key (eng#d-eng-010 -> eng_d-eng-010)
+    key = anchor_to_storage_key(anchor)
     # Always bound to 1 for the demo (policy may request lower).
     k = 1
     # Resolve effective policy BEFORE storage to avoid referencing undefined policy in worker.
-    try:
-        policy = compute_effective_policy({k: v for k, v in request.headers.items()})
-    except PolicyHeaderError as e:
-        # Narrow, structured error for auditability
-        log_stage(
-            logger, "policy", "header_error",
-            request_id=(payload.get("request_id") if isinstance(payload, dict) else None),
-        )
-        raise HTTPException(status_code=400, detail=f"policy_error:{type(e).__name__}")
-    except (ValueError, KeyError) as e:
-        log_stage(
-            logger, "policy", "header_error",
-            request_id=(payload.get("request_id") if isinstance(payload, dict) else None),
-        )
-        raise HTTPException(status_code=400, detail=f"policy_error:{type(e).__name__}")
-    # Snapshot etag for cache keys
-    try:
-        _st_for_etag = store()
-        safe_etag = _st_for_etag.get_snapshot_etag() or "unknown"
-    except Exception:
-        _st_for_etag = None
-        safe_etag = "unknown"
+    policy = _policy_from_request_headers(request.headers)
+    # Stable request id for structured logs
+    rid = (request.headers.get("x-request-id") or request.headers.get("X-Request-Id") or "")
+    # Strict snapshot precondition (body `snapshot_etag` OR `X-Snapshot-ETag`)
+    safe_etag = _require_snapshot_precondition(request, payload=payload, stage="expand")
 
     # ---- M5 cache (expand) : bv:mem:v1:expand:{fp(etag,policy_fp,anchor)} ----
     from core_cache import keys as cache_keys  # local import to avoid import churn on startup
@@ -874,10 +1136,20 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
                 cached = None
             if isinstance(cached, dict):
                 log_stage(logger, "cache", "hit", layer="expand", cache_key=cache_key)
-                # mirror what resolve_text does: propagate policy & snapshot in headers
-                response.headers["x-snapshot-etag"] = safe_etag
-                response.headers["X-BV-Policy-Fingerprint"] = str(policy.get("policy_fp") or "")
-                return _json_response_with_etag(cached, safe_etag)
+                # Heal meta for older cached entries (ensure body mirrors headers)
+                meta = (cached.get("meta") or {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                if not meta.get("snapshot_etag"):
+                    meta["snapshot_etag"] = safe_etag
+                if not meta.get("policy_fp"):
+                    meta["policy_fp"] = normalize_fingerprint(str(policy.get("policy_fp") or ""))
+                cached["meta"] = meta
+                # Build the actual response, then attach headers to it.
+                res = _json_response_with_etag(cached, safe_etag)  # sets x-snapshot-etag
+                res.headers[BV_POLICY_FP] = str(policy.get("policy_fp") or "")
+                _maybe_add_policy_advice_header(res, request, str(policy.get("policy_fp") or ""))
+                return res
     except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
         # best-effort; fall through on cache errors
         pass
@@ -886,48 +1158,49 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
     # Storage fetch: edges adjacent to anchor + snapshot etag
     def _work():
         st = store()
-        return st.get_edges_adjacent(node_id), st.get_snapshot_etag(), st
+        return st.get_edges_adjacent(key), st.get_snapshot_etag(), st
     # Fetch edges directly without using legacy expand/masked caches.
     _timers.start('expand')
     try:
         with trace_span("memory.expand_candidates", anchor=anchor, k=k):
             doc, etag, st = await asyncio.wait_for(asyncio.to_thread(_work), timeout=timeout_for_stage("expand"))
     except asyncio.TimeoutError:
-        # Honour timeout semantics by returning an empty candidate set on timeout.
-        log_stage(
-            logger, "expand", "timeout_fallback",
-            request_id=(payload.get("request_id") if isinstance(payload, dict) else None),
-            snapshot_etag=safe_etag,
-            policy_fp=(policy.get("policy_fp") if isinstance(policy, dict) else None),
-        )
-        doc, st = {
-            "node_id": node_id, "edges": [], "meta": {"snapshot_etag": safe_etag}
-        }, store()
+        log_stage(logger, "expand", "timeout",
+                  request_id=(payload.get("request_id") if isinstance(payload, dict) else None),
+                  snapshot_etag=safe_etag,
+                  policy_fp=(policy.get("policy_fp") if isinstance(policy, dict) else None))
+        raise raise_http_error(504, ErrorCode.upstream_timeout, "expand_candidates timed out",
+                               request_id=(payload.get("request_id") if isinstance(payload, dict) else None))
     except (ConnectionError, RuntimeError, ValueError) as e:
-        # Defensive guardrail: on connection errors or other runtime issues, return an empty candidate set.
-        log_stage(
-            logger, "expand", "fallback_empty",
-            error=type(e).__name__,
-            request_id=(payload.get("request_id") if isinstance(payload, dict) else None),
-            snapshot_etag=safe_etag,
-            policy_fp=(policy.get("policy_fp") if isinstance(policy, dict) else None),
-        )
-        doc, st = {
-            "node_id": node_id, "edges": [], "meta": {"snapshot_etag": safe_etag}
-        }, store()
+        log_stage(logger, "expand", "store_unavailable",
+                  error=type(e).__name__,
+                  request_id=(payload.get("request_id") if isinstance(payload, dict) else None),
+                  snapshot_etag=safe_etag,
+                  policy_fp=(policy.get("policy_fp") if isinstance(policy, dict) else None))
+        raise raise_http_error(503, ErrorCode.storage_unavailable, "storage unavailable",
+                               request_id=(payload.get("request_id") if isinstance(payload, dict) else None))
     finally:
         # Record expand timing to Prom regardless of outcome
         try:
             _timers.stop('expand')
             _ms = int((_timers.as_dict() or {}).get("expand", 0))
             metric_histogram("memory_stage_expand_seconds", float(_ms) / 1000.0)
-        except Exception:
+        except (RuntimeError, ValueError, TypeError):
             pass
     # Normalise contract keys from storage
     result = {"node_id": (doc.get("node_id") or doc.get("anchor")), "edges": list(doc.get("edges") or []), "meta": dict(doc.get("meta") or {})}
 
     # Determine whether an alias-follow changed the anchor (0/1 for dashboards)
-    alias_followed = 1 if (result.get("node_id") and result["node_id"] != node_id) else 0
+    # result["node_id"] is a storage key; compare as wire IDs for accuracy
+    alias_followed = 1 if (result.get("node_id")
+                           and storage_key_to_anchor(result["node_id"]) != anchor) else 0
+    # Observability: record the redirect explicitly (cheap + schema-safe)
+    try:
+        log_stage(logger, "alias", "followed", value=int(alias_followed))
+        metric_counter("memory_alias_followed_total", int(alias_followed))
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        # observability is best-effort; never fail the request on log/metric issues
+        pass
     
     # -------------------------
     # 🔐 Policy Pre-Selector (edges-only)
@@ -946,15 +1219,11 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
         request_id=policy.get("request_id"),
         trace_id=policy.get("trace_id"),
     )
-    # Derive the final snapshot etag; if unknown, we skip caching
-    safe_etag = (etag or (result.get("meta") or {}).get("snapshot_etag")) or "unknown"
-
-    # (M5) Masked-cache already handled earlier; remove legacy preselector cache.
 
     # Mask the anchor document according to role visibility
     try:
         anchor_doc = st.get_node(result["node_id"])
-    except Exception:
+    except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
         anchor_doc = None
     # 🔐 Fail-closed: if caller isn't allowed to see the anchor, deny expansion early.
     allowed_anchor, reason = acl_check(anchor_doc or {}, policy)
@@ -970,17 +1239,26 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
         raise HTTPException(status_code=403, detail=reason or "acl:denied")
     # Compute the wire-format anchor id from the storage key…
     _wire_anchor_id = storage_key_to_anchor(result["node_id"]) if result.get("node_id") else ""
+    if result.get("node_id"):
+        try:
+            log_stage(logger, "policy", "id_normalized",
+                      before=str(result["node_id"]), after=str(_wire_anchor_id),
+                      request_id=(payload.get("request_id") if isinstance(payload, dict) else None))
+        except (RuntimeError, ValueError, TypeError):
+            pass
     # Copy the anchor doc and override id with the wire anchor
     _anchor_doc_copy = {} if not anchor_doc else dict(anchor_doc)
     _anchor_doc_copy["id"] = _wire_anchor_id or result["node_id"]
-    # Require that the stored anchor has a domain and it matches wire anchor’s domain
-    anchor_domain = (anchor.split("#", 1)[0] or "").strip()
-    node_domain = (anchor_doc or {}).get("domain")
-    if not node_domain or (anchor_domain and node_domain != anchor_domain):
-        log_stage(logger, "expand", "domain_mismatch_or_missing",
-                  anchor=anchor, node_domain=node_domain)
-        raise HTTPException(status_code=int(policy.get("denied_status") or 403),
-                            detail="acl:domain_mismatch_or_missing")
+    # Require that the stored anchor has a domain and it matches the wire anchor’s domain
+    _assert_anchor_domain(
+        anchor,
+        (anchor_doc or {}).get("domain"),
+        request_id=rid,
+        status_code=int(policy.get("denied_status") or 403),
+        # include storage key to make domain violations immediately traceable
+        # in structured logs (parity with /api/enrich and /api/enrich/event)
+        storage_node_id=result.get("node_id"),
+    )
     masked_anchor = field_mask(_anchor_doc_copy or {"id": _wire_anchor_id or result["node_id"]}, policy)
 
     # Apply edge allowlist + ACL, then append bounded alias tails (shared helper)
@@ -991,11 +1269,7 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
     # Canonical wire-view shaping & dedup (single source of truth in core_models)
     edges_kept_wire: List[dict] = to_wire_edges(edges_kept)
     # audit: counts only (no payloads)
-    try:
-        log_stage(logger, "view", "wire_edges", count_in=len(edges_kept), count_out=len(edges_kept_wire))
-    except Exception:
-        pass
-    _edge_count = len(edges_kept_wire)
+    log_stage(logger, "view", "wire_edges", count_in=len(edges_kept), count_out=len(edges_kept_wire))
 
     # Derive alias meta STRICTLY from the edges we will return
     wire_anchor_id = (
@@ -1005,10 +1279,7 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
     )
     # Canonical alias summary (single source of truth; prevents drift)
     alias_block = alias_meta(wire_anchor_id, edges_kept_wire)
-    try:
-        log_stage(logger, "alias", "returned_count", count=len(alias_block.get("returned", [])))
-    except Exception:
-        pass
+    log_stage(logger, "alias", "returned_count", count=len(alias_block.get("returned", [])))
     # Ensure alias meta has a well-formed 'returned' array (Baseline §3.2)
     if not isinstance(alias_block.get('returned'), list):
         alias_block['returned'] = []
@@ -1019,13 +1290,19 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
         edges=edges_kept_wire,
         headers={k: v for k, v in request.headers.items()},
         snapshot_etag=safe_etag,
+        intents=["expand_candidates"],
     )
+    engine_fp: str | None = None
     if opa_decision and opa_decision.allowed_ids:
         _ids = opa_decision.allowed_ids
-        # Adopt engine fingerprint for cache keys/audit
-        policy["policy_fp"] = opa_decision.policy_fp
+        # Keep engine fingerprint for telemetry only; do NOT override local policy_fp
+        engine_fp = getattr(opa_decision, "policy_fp", None) or None
+        # OPA-driven field visibility for masking
+        if getattr(opa_decision, "explain", None):
+            fv = (opa_decision.explain or {}).get("field_visibility") or {}
+            policy.setdefault("role_profile", {})["field_visibility"] = fv
     else:
-        _ids = _compute_allowed_ids({"id": _wire_anchor_id}, edges_kept_wire)
+        _ids = compute_allowed_ids({"id": _wire_anchor_id}, edges_kept_wire)
 
     # ── Assemble final wire Graph View (Baseline §3.2) ──────────────────────
     _timers.start('preselector')
@@ -1033,19 +1310,30 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
         "anchor": masked_anchor,
         "graph": {"edges": edges_kept_wire},
         "meta": {
+            # mirror header if present; fallback to store etag
             "snapshot_etag": safe_etag,
-            "policy_fp": policy.get("policy_fp"),
+            # canonicalize to ^sha256:[0-9a-f]{64}$ (guards double-hex)
+            "policy_fp": normalize_fingerprint(str(policy.get("policy_fp") or "")),
             "fingerprints": { "graph_fp": fp_graph(wire_anchor_id, edges_kept_wire) },
             "alias": alias_block,
         },
     }
+    # Observability: graph_fp computed (adoption/drift)
+    try:
+        _gfp = (candidate_set.get('meta') or {}).get('fingerprints', {}).get('graph_fp')
+        if isinstance(_gfp, str) and _gfp:
+            log_stage(logger, 'view', 'view.graph_fp_computed', graph_fp=_gfp)
+            metric_counter('memory_view_graph_fp_computed_total', 1)
+    except (TypeError, ValueError):
+        pass
+
     # allowed_ids (WIRE) — non-optional (schema-required)
     candidate_set["meta"]["allowed_ids"] = _ids
     candidate_set["meta"]["allowed_ids_fp"] = fp_allowed_ids(_ids)
     candidate_set["meta"]["returned_count"] = len(_ids)
     try:
         log_stage(logger, "build_meta", "allowed_ids_set", count=len(_ids), sample=_ids[:3])
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, KeyError):
         pass
 
     # Emit build_meta fingerprint log (observability §5.3)
@@ -1060,7 +1348,7 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
             allowed_ids_fp=_meta.get("allowed_ids_fp"),
             graph_fp=_fps.get("graph_fp"),
         )
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, KeyError):
         pass
 
     # Deterministic policy_fp logging (no legacy fallbacks; no try/except)
@@ -1074,22 +1362,17 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
     try:
         _raw_edges = (candidate_set.get('graph') or {}).get('edges') or []
         _edge_count2 = len(_raw_edges)
-        _node_ids = set([ (candidate_set.get('anchor') or {}).get('id') ])
-        for _e in _raw_edges:
-            for _k in ('from', 'to'):
-                _nid = (_e or {}).get(_k)
-                if _nid:
-                    _node_ids.add(_nid)
+        _node_ids_list = compute_allowed_ids((candidate_set.get('anchor') or {}), _raw_edges)
         log_stage(
             logger, 'audit', 'hidden_counts',
             request_id=(payload.get('request_id') if isinstance(payload, dict) else None),
             snapshot_etag=safe_etag,
             policy_fp=(policy.get('policy_fp') if isinstance(policy, dict) else None),
             allowed_ids_fp=((candidate_set.get('meta') or {}).get('allowed_ids_fp') if isinstance(candidate_set, dict) else None),
-            nodes_considered=len(_node_ids),
+            nodes_considered=len(_node_ids_list),
             edges_considered=int(_edge_count2),
         )
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, KeyError):
         pass
     # Validate outbound payload against schema (fail-closed)
     _ok, _errors = True, []
@@ -1102,7 +1385,7 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
             _ok, _errors = bool(_res[0]), list(_res[1] or [])
         else:
             _ok = True
-    except Exception as e:
+    except (RuntimeError, ValueError, TypeError) as e:
         _ok, _errors = False, [str(e)]
     if not _ok:
         try:
@@ -1117,16 +1400,39 @@ async def expand_candidates(payload: dict, response: Response, request: Request)
                 graph_fp=_fps.get("graph_fp"),
                 error_count=len(_errors), sample_error=(_errors[0] if _errors else None),
             )
-        except Exception:
+        except (RuntimeError, ValueError, TypeError, KeyError):
             pass
         raise HTTPException(status_code=500, detail="validation_error:graph_view_invalid")
 
     # Write-through store (same TTL as resolve cache)
+    # Skip cache writes if the snapshot ETag is unknown to prevent cross-snapshot reuse.
     try:
         rc = RedisCache(get_redis_pool())
-        await rc.setex(cache_key, int(TTL_EVIDENCE_CACHE_SEC), jsonx.dumps(candidate_set))
-        log_stage(logger, "cache", "store", layer="expand", cache_key=cache_key, ttl=int(TTL_EVIDENCE_CACHE_SEC))
+        cache_key = cache_keys.mem_expand_candidates(
+            safe_etag, str(policy.get("policy_fp") or ""), anchor
+        )
+        if safe_etag == "unknown":
+            log_stage(logger, "cache", "store_skipped_etag_unknown", layer="expand", cache_key=cache_key)
+        else:
+            await rc.setex(cache_key, int(TTL_EVIDENCE_CACHE_SEC), jsonx.dumps(candidate_set))
+            log_stage(logger, "cache", "store", layer="expand", cache_key=cache_key, ttl=int(TTL_EVIDENCE_CACHE_SEC))
     except (RuntimeError, OSError, AttributeError, TypeError, ValueError):
         pass
-    return _json_response_with_etag(candidate_set, safe_etag)
+    res = _json_response_with_etag(candidate_set, safe_etag)
+    # Surface as a header for the FE/audit drawer without touching the schema
+    try:
+        res.headers["X-BV-Alias-Followed"] = str(int(alias_followed))
+    except (RuntimeError, ValueError, TypeError, KeyError):
+        pass
+    # Observability-only: include engine FP and structured pair log
+    if engine_fp:
+        res.headers[BV_POLICY_ENGINE_FP] = str(engine_fp)
+    _log_policy_fp_pair(
+        stage="expand_candidates",
+        request_id=rid,
+        local_fp=(policy.get("policy_fp") if isinstance(policy, dict) else None),
+        engine_fp=engine_fp,
+    )
+    _maybe_add_policy_advice_header(res, request, str(policy.get("policy_fp") or ""))
+    return res
 

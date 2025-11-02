@@ -1,9 +1,9 @@
 from __future__ import annotations
-import base64, hashlib, os
+import base64, os
 from datetime import datetime, timezone
 from typing import Dict, Any
 from core_logging import get_logger, log_stage
-from core_utils.fingerprints import canonical_json
+from core_utils.fingerprints import canonical_json, sha256_hex, ensure_sha256_prefix
 
 logger = get_logger("gateway")
 
@@ -23,25 +23,10 @@ def _ed25519_backend_available() -> bool:
 
 def _load_priv_b64() -> str:
     """
-    Deterministically load the Ed25519 seed (base64 of 32 bytes).
-    Priority:
-      1) GATEWAY_ED25519_PRIV_B64 (env)
-      2) GATEWAY_ED25519_PRIV_B64_FILE (path to file containing the base64 seed)
-    Returns "" when not set/readable. No fallbacks to other algos (v3 baseline).
+    Deterministically load the Ed25519 seed (base64 of 32 bytes) from env only.
+    This hardens the setup: if the key isn't in the environment, we fail closed.
     """
-    v = (os.getenv("GATEWAY_ED25519_PRIV_B64") or "").strip()
-    if v:
-        return v
-    path = (os.getenv("GATEWAY_ED25519_PRIV_B64_FILE") or "").strip()
-    if path:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return fh.read().strip()
-        except (OSError, IOError, UnicodeDecodeError) as exc:
-            # May run at startup; use deterministic correlation
-            log_stage(logger, "signing", "key_file_unreadable",
-                      path=path, error=type(exc).__name__, request_id="startup")
-    return ""
+    return (os.getenv("GATEWAY_ED25519_PRIV_B64") or "").strip()
 
 def select_and_sign(response_obj: Dict[str, Any], *, request_id: str) -> Dict[str, Any]:
     """
@@ -60,9 +45,10 @@ def select_and_sign(response_obj: Dict[str, Any], *, request_id: str) -> Dict[st
     _m.pop("bundle_fp", None)
     resp_for_hash["meta"] = _m
     canon = canonical_json(resp_for_hash)
-    covered = "sha256:" + hashlib.sha256(canon).hexdigest()
+    covered = ensure_sha256_prefix(sha256_hex(canon))
 
     # Decide signer once, without try-and-fallback noise
+    key_id = (os.getenv("GATEWAY_SIGN_KEY_ID") or "gateway/k1").strip()
     if priv_b64 and _ed25519_backend_available():
         try:
             raw = base64.b64decode(priv_b64)
@@ -78,7 +64,7 @@ def select_and_sign(response_obj: Dict[str, Any], *, request_id: str) -> Dict[st
             log_stage(logger, "signing", "algo_selected", request_id=request_id, algo="ed25519")
             return {
                 "alg": "ed25519",
-                "key_id": "gateway/k1",
+                "key_id": key_id,
                 "sig": base64.b64encode(sig_raw).decode("ascii"),
                 "covered": covered,
                 "signed_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00","Z"),
@@ -92,5 +78,6 @@ def select_and_sign(response_obj: Dict[str, Any], *, request_id: str) -> Dict[st
             raise SigningError("no_signer_configured") from exc
 
     # Nothing configured → explicit, deterministic failure
-    log_stage(logger, "signing", "signing.signature_skipped", request_id=request_id, reason="no_signer_configured")
+    log_stage(logger, "signing", "signing.signature_skipped",
+              request_id=request_id, reason="no_signer_configured")
     raise SigningError("no_signer_configured")

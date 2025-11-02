@@ -3,3 +3,6 @@ python3 -m venv .venv
 python -m ensurepip --upgrade
 python -m pip install -r requirements/runtime.txt
 scripts/codegen_schemas.sh
+python3 scripts/generate_ed25519_keypair.py # copy generated private and public key into .env
+scripts/build_frontend.sh
+scripts/seed_memory.sh

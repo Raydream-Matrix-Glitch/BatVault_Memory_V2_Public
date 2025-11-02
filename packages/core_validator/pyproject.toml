@@ -5,9 +5,8 @@ description     = "Validator helpers for BatVault"
 requires-python = ">=3.11"
 dependencies    = [
     "core_models",
-    "python-dateutil>=2.9.0",  # used in validator, jsonschema not imported here
     "core_logging",
-    "jsonschema>=4.21.1",
+    "jsonschema>=4.21.1,<5",
 ]
 
 [project.optional-dependencies]

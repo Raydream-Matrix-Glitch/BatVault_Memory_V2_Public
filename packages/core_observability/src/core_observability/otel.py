@@ -138,7 +138,8 @@ def instrument_fastapi_app(app, service_name: Optional[str] = None) -> None:
                             except ImportError:
                                 # last-resort stable id
                                 synthetic_tid = hashlib.blake2b(repr(request).encode("utf-8"), digest_size=16).hexdigest()
-                        bind_trace_ids(synthetic_tid, synthetic_tid[:16])
+                        # Do not spoof span_id in fallback: keep summaries trace-only.
+                        bind_trace_ids(synthetic_tid, None)
                 response = await call_next(request)
                 # Always surface an x-trace-id for audit correlation (real → upstream → synthetic)
                 from core_observability.otel import current_trace_id_hex as _cur_tid  # type: ignore
@@ -212,35 +213,68 @@ def current_trace_id_hex() -> Optional[str]:
 
 def inject_trace_context(headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """
-    Returns headers with W3C trace context (when available) and *always* sets `x-trace-id`
-    so cross-service correlation works even when OTEL is inactive.
+    Build **sanitised** outbound headers with W3C trace context and a safe `x-trace-id`.
+    Hardenings:
+    - Do **not** forward any incoming `x-trace-id`, `traceparent`, or `tracestate`.
+    - Prefer OTEL propagators; otherwise derive from current logging/OTEL context; otherwise synthesise.
     """
-    hdrs = dict(headers or {})
-    injected = False
+    # 1) Copy & strip any user-supplied context headers (case-insensitive)
+    hdrs_in = dict(headers or {})
+    hdrs: Dict[str, str] = {k: v for k, v in hdrs_in.items() if k.lower() not in ("x-trace-id","traceparent","tracestate")}
+
+    # 2) Inject from current span if OTEL is present
     try:
         from opentelemetry.propagate import inject  # type: ignore
-        inject(hdrs)  # mutates in place
-        injected = True
+        inject(hdrs)  # sets traceparent/tracestate from current context
     except ImportError:
-        injected = False
+        pass
+
+    # 3) Fallback: ensure `traceparent` exists even without OTEL
     if not any(k.lower() == "traceparent" for k in hdrs.keys()):
+        tid_hex = None; sid_hex = None
         try:
-            from core_logging import current_trace_ids  # type: ignore
-            tid, sid = current_trace_ids()
-            if tid and sid:
-                hdrs["traceparent"] = f"00-{tid}-{sid}-01"
+            from opentelemetry import trace as _t  # type: ignore
+            _sp = _t.get_current_span()
+            _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+            if _ctx and getattr(_ctx, "trace_id", 0) and getattr(_ctx, "span_id", 0):
+                tid_hex = f"{_ctx.trace_id:032x}"; sid_hex = f"{_ctx.span_id:016x}"
         except ImportError:
             pass
-    # Always propagate x-trace-id
-    _tid = current_trace_id_hex()
-    if not _tid:
+        if not (tid_hex and sid_hex):
+           try:
+                from core_logging import current_trace_ids  # type: ignore
+                tid_hex, sid_hex = current_trace_ids()
+           except ImportError:
+                tid_hex, sid_hex = (None, None)
+        if not tid_hex:
+            import uuid as _uuid
+            tid_hex = _uuid.uuid4().hex + _uuid.uuid4().hex  # 32 hex
+        if not sid_hex:
+            import uuid as _uuid
+            sid_hex = _uuid.uuid4().hex[:16]  # 16 hex
+        hdrs["traceparent"] = f"00-{tid_hex}-{sid_hex}-01"
+
+    # 4) Always set/overwrite safe `x-trace-id`
+    def _current_trace_id_hex() -> Optional[str]:
+        try:
+            from opentelemetry import trace as _t  # type: ignore
+            _sp = _t.get_current_span()
+            _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+            if _ctx and getattr(_ctx, "trace_id", 0):
+                return f"{_ctx.trace_id:032x}"
+        except ImportError:
+            pass
         try:
             from core_logging import current_trace_ids  # type: ignore
-            _tid, _sid = current_trace_ids()
+            tid, _ = current_trace_ids()
+            return tid
         except ImportError:
-            _tid = None
-    if _tid and not any(k.lower() == "x-trace-id" for k in hdrs.keys()):
-        hdrs["x-trace-id"] = _tid
+            return None
+    _tid = _current_trace_id_hex()
+    if not _tid:
+        import uuid as _uuid
+        _tid = _uuid.uuid4().hex + _uuid.uuid4().hex
+    hdrs["x-trace-id"] = _tid
     return hdrs
 
 # ---------------------------------------------------------------------------

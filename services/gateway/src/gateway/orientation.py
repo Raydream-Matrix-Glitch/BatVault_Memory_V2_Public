@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional, Mapping, Any, Iterable
-from core_models.ontology import CAUSAL_EDGE_TYPES
+from core_models.ontology import CAUSAL_EDGE_TYPES, canonical_edge_type
 
 ORIENT_PRECEDING = "preceding"
 ORIENT_SUCCEEDING = "succeeding"
@@ -51,7 +51,10 @@ def classify_edge_orientation(
       - Otherwise None.
     """
     try:
-        et = str(edge.get("type") or "").upper()
+        try:
+            et = canonical_edge_type(edge.get("type"))
+        except ValueError:
+            return None  # unknown → no orientation
         # Never orient non-causal edges (incl. ALIAS_OF), even if a hint is supplied.
         # Baseline §§2.2.1, 5.
         if et not in _CAUSAL_TYPES:

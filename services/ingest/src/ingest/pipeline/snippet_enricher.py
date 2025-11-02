@@ -1,7 +1,7 @@
 import re
-import hashlib
 from typing import Dict
 from core_logging import get_logger, log_stage, current_request_id
+from core_utils.ids import stable_hex_id
 
 logger = get_logger("ingest-snippet")
 
@@ -19,7 +19,7 @@ def _clip(s: str, max_len: int = _MAX_LEN) -> str:
 
 def _mk_snippet_id(kind: str, node_id: str, snippet: str) -> str:
     raw = f"{kind}|{node_id}|{snippet}"
-    return hashlib.sha1(raw.encode()).hexdigest()[:12]
+    return stable_hex_id(raw, length=12)
 
 def enrich_decision(doc: Dict) -> None:
     parts = [doc.get("title"), doc.get("summary"), doc.get("rationale"), doc.get("option")]

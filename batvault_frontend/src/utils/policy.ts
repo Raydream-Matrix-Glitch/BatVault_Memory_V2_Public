@@ -1,31 +1,40 @@
 import { DEFAULT_ROLE } from "./roles";
+// NOTE: sensitivity ceiling is server-derived; FE must not set it.
+
+// Fallback 32-hex generator (for X-Trace-Id / default X-Request-Id)
+function randomHex32(): string {
+  const arr = new Uint8Array(16);
+  if (typeof globalThis !== "undefined" && globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(arr);
+  } else {
+    for (let i=0;i<arr.length;i++) arr[i] = Math.floor(Math.random()*256);
+  }
+  return Array.from(arr).map(b=>b.toString(16).padStart(2, "0")).join("");
+}
+// Accept a caller-supplied requestId (UUID v4 or 32-hex) so UI can reuse it across calls.
 export function buildPolicyHeaders(reqId?: string, traceId?: string): Record<string, string> {
   const w: any = window as any;
-  const role = (w.BV_ACTIVE_ROLE || DEFAULT_ROLE).toLowerCase();
+  const role = String(w.BV_ACTIVE_ROLE || DEFAULT_ROLE).toLowerCase();
   const user = w.BV_USER_ID || "demo-user";
-  const version = w.BV_POLICY_VERSION || "v3-demo";
+  const version = w.BV_POLICY_VERSION || "v3";
   const keyRaw = String(
-      w.BV_POLICY_KEY ||
-        (import.meta as any).env?.VITE_POLICY_KEY ||
-        ""
-    ).trim();
-  // Always send a non-empty policy key so the backend can respond with
-  // a policy_key_mismatch (from which we learn the computed fingerprint).
+    w.BV_POLICY_KEY ||
+    (import.meta as any).env?.VITE_POLICY_KEY ||
+    ""
+  );
   const key = keyRaw.length > 0 ? keyRaw : "probe";
+  // Sensitivity ceiling: explicit override > role mapping
+  const sensOverride = String(
+    w.BV_SENSITIVITY_CEILING ||
+    (import.meta as any).env?.VITE_SENSITIVITY_CEILING ||
+    ""
+  ).trim().toLowerCase();
+  const ROLE_CEILING: Record<string, string> = { analyst: "low", manager: "medium", ceo: "high" };
+  const ceiling = sensOverride || ROLE_CEILING[(role as keyof typeof ROLE_CEILING)] || "low";
 
-  // Deterministic 32-hex request/trace ids (fallback to random)
-  function randomHex32(): string {
-    try {
-      const a = crypto.getRandomValues(new Uint8Array(16));
-      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
-    } catch {
-      let out = "";
-      for (let i = 0; i < 32; i++) out += Math.floor(Math.random() * 16).toString(16);
-      return out;
-    }
-  }
-  const rid = reqId || randomHex32();
-  const tid = traceId || randomHex32();
+  // Prefer the caller-provided reqId (UUID or 32-hex). Fallback to stable 32-hex.
+  const rid = (reqId && String(reqId).trim()) || randomHex32();
+  const tid = (traceId && String(traceId).trim()) || randomHex32();
 
   return {
     "X-User-Id": user,

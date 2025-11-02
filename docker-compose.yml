@@ -123,8 +123,12 @@ services:
       dockerfile: ops/docker/Dockerfile.python
     environment:
       - OTEL_SERVICE_NAME=api_edge
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
       - SERVICE_NAME=api_edge
       - BATVAULT_HEALTH_PORT=8080
+      - CORS_ORIGINS=${CORS_ORIGINS}
     env_file:
       - .env
     command: ["python", "-m", "api_edge.__main__"]
@@ -154,12 +158,15 @@ services:
         SERVICE_NAME: gateway
     environment:
       - OTEL_SERVICE_NAME=gateway
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
       - SERVICE_NAME=gateway
       - BATVAULT_HEALTH_PORT=8081
       - BATVAULT_SCHEMAS_DIR=/app/packages/core_models/src/core_models/schemas
-      # Prefer secrets or exported env for the signing key:
-      # - GATEWAY_ED25519_PRIV_B64=${GATEWAY_ED25519_PRIV_B64}
-      - GATEWAY_ED25519_PRIV_B64_FILE=/run/secrets/gateway_signing_seed_b64
+      - GATEWAY_TEMPLATE_REGISTRY_PATH=/app/packages/core_models/src/core_models/schemas/answer_templates.default.json
+      - MEMORY_API_URL=http://memory_api:8000
+      - CORS_ORIGINS=${CORS_ORIGINS}
     env_file:
       - .env
     command: ["python", "-m", "gateway.__main__"]
@@ -178,18 +185,21 @@ services:
       minio:
         condition: service_healthy
     restart: unless-stopped
-    secrets:
-      - gateway_signing_seed_b64
     networks: [batnet]
 
   memory_api:
     image: batvault/python-svc:dev
     environment:
+      - LOG_SUMMARY_EMIT=1
       - OTEL_SERVICE_NAME=memory_api
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
       - SERVICE_NAME=memory_api
       - BATVAULT_HEALTH_PORT=8000
       - POLICY_DIR=/app/policy/roles
       - OPA_URL=http://opa:8181
+      - CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
     env_file:
       - .env
     command: ["python", "-m", "memory_api.__main__"]
@@ -247,11 +257,11 @@ services:
 
   frontend:
     build:
-      context: ./batvault_frontend
-      dockerfile: dockerfile
+      context: .
+      dockerfile: batvault_frontend/dockerfile
       args:
-        VITE_GATEWAY_BASE: ${VITE_API_BASE:-http://localhost:8080}
-        VITE_MEMORY_BASE:  ${VITE_MEMORY_BASE:-http://localhost:8082}
+        VITE_GATEWAY_BASE: ""
+        VITE_MEMORY_BASE:  ""
     ports:
       - "5173:80"
     depends_on:
@@ -271,7 +281,3 @@ volumes:
 networks:
   batnet:
     driver: bridge
-
-secrets:
-  gateway_signing_seed_b64:
-    file: ./ops/secrets/gateway_signing_seed_b64

@@ -5,7 +5,7 @@ import time
 import inspect
 import functools
 import contextvars
-import hashlib
+from core_utils.fingerprints import sha256_hex
 
 # ────────────────────────────────────────────────────────────
 # Request-level aggregation & summary emission
@@ -33,12 +33,22 @@ def _should_summarize() -> bool:
     # Default to compact summary mode; set LOG_EMIT_MODE=verbose to disable
     return (os.getenv("LOG_EMIT_MODE", "summary").lower() in ("summary","summarize","compact"))
 
+def _should_emit_summary_for_service() -> bool:
+    """
+    Env-gated switch to allow only one service to emit request summaries.
+    Set LOG_SUMMARY_EMIT=0 on leaf services to avoid duplicate summaries.
+    """
+    return (os.getenv("LOG_SUMMARY_EMIT", "1").lower() in ("1","true","yes","on"))
+
 def _is_error_like(event: str, extras: Dict[str, Any]) -> bool:
     ev = (event or "").lower()
     if "error" in extras or extras.get("level") == "ERROR" or int(extras.get("status_code", 200)) >= 500:
         return True
     # Policy denies are legitimate ACL outcomes – never classify as errors.
     if ev == "opa_decide_denied" or extras.get("error_code") == "OPA_DECIDE_DENIED":
+        return False
+    # Treat policy fingerprint mismatches as warnings (request proceeds)
+    if ev == "policy_fp_mismatch":
         return False
     for k in ("error","failed","exception","invalid","mismatch","timeout"):
         if k in ev:
@@ -90,9 +100,13 @@ def _agg_note(stage: str, event: str, extras: Dict[str, Any]) -> None:
             "attrs": {k: v for k, v in extras.items() if k not in ("message","event")}
         })
 
+    # Capture first-seen trace/span for later use in summaries (span context may be closed by then)
+    tid, sid = current_trace_ids()
+    if tid and "trace_id" not in agg.last:   agg.last["trace_id"] = tid
+
 def emit_request_summary(logger: logging.Logger, *, service: Optional[str]=None) -> None:
     """Emit one compact per-request summary line when summary mode is active."""
-    if not _should_summarize():
+    if not _should_summarize() or not _should_emit_summary_for_service():
         return
     agg = _REQ_AGG.get()
     if not agg:
@@ -142,6 +156,17 @@ def emit_request_summary(logger: logging.Logger, *, service: Optional[str]=None)
             payload["request_id"] = rid
     except Exception:
         pass
+    # Attach frozen trace/span if available (top-level fields are allowed)
+    tid = agg.last.get("trace_id") or current_trace_ids()[0]
+    sid = agg.last.get("span_id")  or current_trace_ids()[1]
+    if tid:
+        payload["trace_id"] = tid
+    # Only include span_id when it's not the synthetic fallback (tid[:16])
+    if sid and not (tid and isinstance(sid, str) and sid == tid[:16]):
+        payload["span_id"] = sid
+    elif sid and tid and sid == tid[:16]:
+        # Make it explicit in summaries when we're in fallback correlation mode
+        payload["span_synthetic"] = True
     logger.info("request_summary", extra=_sanitize_extra(payload))
     _REQ_AGG.set(None)
 
@@ -235,12 +260,19 @@ def emit_request_error_summary(logger: logging.Logger, *, service: Optional[str]
     except Exception:
         pass
     # Optionally derive a coarse "cause" for dashboards (prefix before dot)
-    try:
-        if errors:
-            cause = str(errors[0].get("code") or "").split(".", 1)[0].lower() or "unknown"
-            payload["cause"] = cause
-    except Exception:
-        pass
+    # Prefer precondition-style errors if present; otherwise fall back to first
+    if errors:
+        codes = [str(e.get("code") or "").lower() for e in errors]
+        preferred = next((c for c in codes if c.startswith("precondition")), codes[0])
+        payload["cause"] = (preferred.split(".", 1)[0] or "unknown")
+    # Gate emission to avoid duplicates across services
+    if not _should_emit_summary_for_service():
+        return
+    # Attach frozen trace/span like the success summary
+    tid = (agg.last or {}).get("trace_id") or current_trace_ids()[0]
+    sid = (agg.last or {}).get("span_id")  or current_trace_ids()[1]
+    if tid: payload["trace_id"] = tid
+    if sid: payload["span_id"]  = sid
     logger.error("request_error_summary", extra=_sanitize_extra(payload))
 
 # ────────────────────────────────────────────────────────────
@@ -261,7 +293,20 @@ _REQUEST_ID: contextvars.ContextVar[Optional[str]] = \
     contextvars.ContextVar("_REQUEST_ID", default=None)
 
 def bind_trace_ids(trace_id: Optional[str], span_id: Optional[str]) -> None:
-    """Bind trace/span IDs into the local context for logging fallbacks."""
+    """Bind trace/span IDs into the local context for logging fallbacks.
+    If `span_id` looks synthetic (tid[:16]) and there's no active OTEL span,
+    drop it to avoid misleading summaries.
+    """
+    # Heuristic: treat tid[:16] as synthetic unless a real span is active
+    if trace_id and span_id and isinstance(trace_id, str) and isinstance(span_id, str) and span_id == trace_id[:16]:
+        try:
+            from opentelemetry import trace as _t  # type: ignore
+            _ctx = _t.get_current_span().get_span_context()  # type: ignore[attr-defined]
+            if not getattr(_ctx, "span_id", 0):
+                span_id = None
+        except Exception:
+            # OTEL not present or no active span → drop synthetic sid
+            span_id = None
     try:
         _TRACE_IDS.set((trace_id, span_id))
     except Exception:
@@ -345,6 +390,8 @@ _TOP_LEVEL: set[str] = {
     "status_code",
     "path",
     "method",
+    "trace_id",
+    "span_id",
 }
 
 def _default(obj):
@@ -389,8 +436,6 @@ class JsonFormatter(logging.Formatter):
             span_id  = sid
         if trace_id:
             base["trace_id"] = trace_id
-        if span_id:
-            base["span_id"] = span_id
 
         meta: Dict[str, Any] = {}
 
@@ -496,6 +541,10 @@ def get_logger(name: str = "app", level: str | None = None) -> logging.Logger:
         logger.addFilter(_SnapshotFilter())
     if not any(isinstance(f, _RequestIdFilter) for f in getattr(logger, "filters", [])):
         logger.addFilter(_RequestIdFilter())
+    if is_service_root:
+        log_once_process(logger, key="summary_emit_config",
+                         event="summary.emit_config", enabled=_should_emit_summary_for_service(),
+                         mode=os.getenv("LOG_EMIT_MODE", "summary"))
     return logger
 
 def log_event(logger: logging.Logger, event: str, **kwargs: Any) -> None:
@@ -731,10 +780,10 @@ def _sanitize_extra(extra: Dict[str, Any] | None) -> Dict[str, Any]:
     return safe
 
 # ---------------------------------------------------------------------------#
-# log_once – emit a line only once per process key (strategic logs)          #
+# log_once_process – emit a line only once per process key (strategic logs)     #
 # ---------------------------------------------------------------------------#
 _ONCE_KEYS: set[str] = set()
-def log_once(logger: logging.Logger, key: str, *, level: int = logging.INFO, event: str, **kwargs: Any) -> None:
+def log_once_process(logger: logging.Logger, key: str, *, level: int = logging.INFO, event: str, **kwargs: Any) -> None:
     """
     Emit a structured log exactly once per *key* for the lifetime of the process.
     Useful for one-shot diagnostics (e.g., schema directory resolution).
@@ -750,7 +799,8 @@ def log_once(logger: logging.Logger, key: str, *, level: int = logging.INFO, eve
 def cache_key_fp(key: Any) -> str:
     """Deterministic fingerprint for cache keys (avoid logging raw keys)."""
     s = str(key)
-    return "sha1:" + hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+    # Use shared helper to keep hashing consistent across services
+    return "sha256:" + sha256_hex(s)[:16]
 
 def log_cache_hit(logger: logging.Logger, *, backend: str, namespace: str, key: Any,
                   ttl_remaining_ms: Optional[int] = None, shared: bool = True, latency_ms: Optional[int] = None) -> None:

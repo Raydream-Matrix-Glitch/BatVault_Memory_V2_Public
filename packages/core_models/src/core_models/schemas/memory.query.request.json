@@ -10,10 +10,7 @@
       "type": "string",
       "minLength": 1
     },
-    "anchor": {
-      "type": "string",
-      "minLength": 1
-    },
+    "anchor": { "$ref": "./anchor.json" },
     "policy": {
       "type": "object"
     },

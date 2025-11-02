@@ -1,4 +1,4 @@
-import sys, os, argparse, json, glob, hashlib
+import sys, os, argparse, json, glob
 from pathlib import Path
 from json import JSONDecodeError
 from typing import Dict, Any
@@ -6,16 +6,13 @@ from core_logging import get_logger, log_stage, trace_span, set_snapshot_etag
 from core_utils.snapshot import compute_snapshot_etag_for_files
 from core_config import get_settings
 from core_storage import ArangoStore
-from ingest.pipeline.graph_upsert import upsert_pipeline
+from ingest.pipeline.graph_upsert import upsert_pipeline, compute_expected_edges
 if os.getenv("BATVAULT_INGEST_PROCESS") != "1":
     print("ERROR: BATVAULT_INGEST_PROCESS=1 required for ingest environment", file=sys.stderr)
     sys.exit(2)
 from ingest.pipeline.normalize import normalize_once
 
 logger = get_logger("ingest.cli")
-
-def _stable_id(value: str) -> str:
-    return hashlib.sha1(value.encode()).hexdigest()[:8]
 
 def _load_json_files(dir_path: Path) -> tuple[list[dict], list[dict]]:
     nodes, edges = [], []
@@ -60,12 +57,22 @@ def run_dir(dir_path: str) -> int:
     # Silence Arango bootstrap logs by default (opt-in via ARANGO_BOOTSTRAP_VERBOSE=1)
     os.environ.setdefault("ARANGO_BOOTSTRAP_VERBOSE", "0")
     store = ArangoStore(lazy=True)
-    # Optional deterministic pruning to avoid (domain,id) unique-index 409s on reseed
+    # Optional deterministic pruning to avoid 409s and prevent stale data.
     if os.getenv("ARANGO_PRUNE_BEFORE_UPSERT", "1") == "1":
+        planned_edges = compute_expected_edges(nodes, edges, snapshot_etag=snapshot_etag)
+        anchors = [f"{n['domain']}#{n['id']}" for n in nodes]
+        edge_ids = [e["id"] for e in planned_edges]
         with trace_span("ingest.cli.prune", stage="ingest"):
-            n_nodes, n_edges = store.prune_stale(snapshot_etag)
-        log_stage(logger, "ingest", "pruned", snapshot_etag=snapshot_etag,
-                  nodes_removed=int(n_nodes), edges_removed=int(n_edges))
+            n_nodes, n_edges, cleaned = store.prune_to_current_snapshot(
+                anchors, edge_ids, request_id=snapshot_etag
+            )
+        log_stage(
+            logger, "ingest", "pruned",
+            snapshot_etag=snapshot_etag,
+            nodes_removed=int(n_nodes),
+            edges_removed=int(n_edges),
+            fields_cleaned=int(cleaned),
+        )
     with trace_span("ingest.cli.upsert", stage="ingest"):
         summary: Dict[str, Any] = upsert_pipeline(store, nodes, edges, snapshot_etag=snapshot_etag)
     # Persist the new snapshot to meta for read preconditions (Memory reads this)

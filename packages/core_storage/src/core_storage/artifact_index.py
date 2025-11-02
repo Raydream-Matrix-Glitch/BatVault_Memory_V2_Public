@@ -8,6 +8,12 @@ from typing import Dict, Tuple
 from core_utils import jsonx
 from core_logging import get_logger, log_stage
 from core_utils.backoff import compute_backoff_delay_ms
+try:
+    # MinIO / S3 client error type
+    from minio.error import S3Error  # type: ignore
+except Exception:  # pragma: no cover - tests may not install minio
+    class S3Error(Exception):  # minimal stand-in
+        pass
 
 logger = get_logger("artifact_index")
 
@@ -53,7 +59,7 @@ def upload_named_bundles(client, bucket: str, request_id: str, bundles: Dict[str
         for attempt in range(1, max_retries + 2):  # retries=N → attempts=N+1
             try:
                 return fn(*args, **kwargs)
-            except (OSError, RuntimeError) as e:
+            except (OSError, RuntimeError, S3Error) as e:
                 last_exc = e
                 if attempt <= max_retries:
                     delay_ms = compute_backoff_delay_ms(attempt, base_ms=base_ms, jitter_ms=jitter_ms, cap_ms=cap_ms, mode="exp_equal_jitter")
@@ -72,7 +78,17 @@ def upload_named_bundles(client, bucket: str, request_id: str, bundles: Dict[str
 
     # Ensure bucket exists (idempotent; may already exist)
     try:
-        _retry("make_bucket", client.make_bucket, bucket)
+        # Prefer a cheap existence check if available
+        if hasattr(client, "bucket_exists") and not client.bucket_exists(bucket):
+            _retry("make_bucket", client.make_bucket, bucket)
+    except S3Error as exc:
+        # Idempotency across concurrent starters / multiple writers
+        code = getattr(exc, "code", "") or ""
+        if code in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
+            log_stage(logger, "artifacts", "minio_bucket_exists", bucket=bucket, request_id=request_id)
+        else:
+            # Propagate unexpected S3 errors
+            raise
     except (OSError, RuntimeError):
         # Continue if bucket already exists or creation is racing elsewhere
         pass

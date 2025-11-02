@@ -26,20 +26,12 @@
       "additionalProperties": false,
       "required": ["id", "type", "domain"],
       "properties": {
-        "id": {
-          "type": "string",
-          "pattern": "^([a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*)#[a-z0-9._:-]+$",
-          "$comment": "Anchor regex kept in sync with edge.wire.json"
-        },
+        "id": { "$ref": "./anchor.json" },
         "type": {
           "type": "string",
           "enum": ["DECISION", "EVENT"]
         },
-        "domain": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128
-        },
+        "domain": { "$ref": "./domain.json" },
         "timestamp": {
           "type": "string",
           "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"

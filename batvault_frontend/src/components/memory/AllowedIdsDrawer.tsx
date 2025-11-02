@@ -30,8 +30,6 @@ export default function AllowedIdsDrawer(props: AllowedIdsDrawerProps) {
   const [itemsById, setItemsById] = useState<Record<string, EnrichedNode>>({});
   // Local selection state for the embedded graph
   const [selectedGraphId, setSelectedGraphId] = useState<string | undefined>(undefined);
-
-
   const cacheKey = useMemo(() => `${snapshotEtag}|${allowedIdsFp}|${policyFp}`, [snapshotEtag, allowedIdsFp, policyFp]);
 
   async function openAndLoad() {
@@ -71,8 +69,24 @@ export default function AllowedIdsDrawer(props: AllowedIdsDrawerProps) {
     const nodes: EnrichedNode[] = [];
     allowedIds.forEach((id) => {
       const n = itemsById[id];
-      if (n) nodes.push(n);
-      else nodes.push({ id, type: id.includes("#e-") ? "EVENT" : "DECISION", domain: id.split("#")[0], title: id });
+      if (n) {
+        nodes.push(n);
+      } else {
+        // UI-only fallback object: do not parse/construct anchors for logic.
+        // We refrain from hand-rolling domain parsing; display-only hint:
+        let domain = "";
+        const hashIdx = typeof id === "string" ? id.indexOf("#") : -1;
+        if (hashIdx > 0) {
+          // Safe substring for UX label only; never used to build anchors.
+          domain = id.slice(0, hashIdx);
+        }
+        nodes.push({
+          id,
+          type: id.includes("#e-") ? "EVENT" : "DECISION",
+          domain,
+          title: id
+        });
+      }
     });
     const toDate = (s?: string) => (s ? Date.parse(s) || 0 : 0);
     nodes.sort((a, b) => {
@@ -197,7 +211,7 @@ export default function AllowedIdsDrawer(props: AllowedIdsDrawerProps) {
           )}
         </div>
 
-        {/* Graph – its own section and header at the same level as “Short answer” */}
+        {/* Graph — edges are already oriented in v3 */}
         {Array.isArray(edges) && edges.length > 0 ? (
           <>
             <div className="mt-6">

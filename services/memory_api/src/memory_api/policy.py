@@ -1,11 +1,207 @@
-import os, json, fnmatch, hashlib
-from functools import lru_cache
+import os, json, fnmatch
+from pathlib import Path
+from core_utils.fingerprints import canonical_json, sha256_hex, ensure_sha256_prefix, normalize_fingerprint
+import orjson
 from typing import Dict, Any, List, Optional, Tuple
 from core_logging import get_logger, log_stage, log_once
 from core_config import get_settings
 from core_utils.domain import storage_key_to_anchor, is_valid_anchor
+from core_http.headers import REQUIRED_POLICY_HEADERS_LOWER
+from core_utils.identity import identity_from_headers
 
 logger = get_logger("memory_api")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Roles / policy configuration (single source of truth: policy/roles.json)
+# ──────────────────────────────────────────────────────────────────────────────
+_ROLES_CACHE: dict | None = None
+_ROLES_MTIME: float | None = None
+
+def _roles_config_path() -> Path:
+    """
+    Resolve roles.json location:
+    1) settings.roles_config_path (if set),
+    2) ./policy/roles.json alongside this module,
+    3) environment POLICY_ROLES_PATH.
+    """
+    try:
+        s = get_settings()
+        p = getattr(s, "roles_config_path", None)
+        if p:
+            return Path(str(p))
+    except (RuntimeError, ValueError, TypeError):
+        pass
+    env = os.getenv("POLICY_ROLES_PATH")
+    if env:
+        return Path(env)
+    return Path(__file__).parent.joinpath("policy", "roles.json")
+
+def _load_roles_config() -> dict:
+    """Load roles.json with a simple mtime cache."""
+    global _ROLES_CACHE, _ROLES_MTIME
+    path = _roles_config_path()
+    try:
+        mtime = path.stat().st_mtime
+    except (FileNotFoundError, OSError):
+        # Safe default if roles.json is missing
+        if _ROLES_CACHE is None:
+            _ROLES_CACHE = {"roles": {}}
+            _ROLES_MTIME = None
+        return _ROLES_CACHE
+    if _ROLES_CACHE is not None and _ROLES_MTIME == mtime:
+        return _ROLES_CACHE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) or {}
+        if not isinstance(data, dict):
+            data = {"roles": {}}
+        _ROLES_CACHE = data
+        _ROLES_MTIME = mtime
+        log_stage(logger, "policy", "roles_config_loaded", path=str(path))
+        return _ROLES_CACHE
+    except (ValueError, OSError) as e:
+        log_stage(logger, "policy", "roles_config_failed", path=str(path), error=type(e).__name__)
+        if _ROLES_CACHE is None:
+            _ROLES_CACHE = {"roles": {}}
+        return _ROLES_CACHE
+
+def _role_entry(role: str) -> dict:
+    cfg = _load_roles_config()
+    return (cfg.get("roles") or {}).get((role or "").strip().lower(), {}) or {}
+
+def _role_field_visibility(role: str) -> dict:
+    return (_role_entry(role).get("field_visibility") or {})
+
+def _role_extra_visible(role: str) -> List[str]:
+    ev = _role_entry(role).get("extra_visible")
+    if isinstance(ev, list):
+        return [str(x) for x in ev if str(x).strip()]
+    return []
+
+def _role_default_ceiling(role: str) -> str:
+    """
+    Optional role-based ceiling in roles.json:
+      { "roles": { "<role>": { "sensitivity_ceiling": "medium" } } }
+    Fallback to environment/default order if not present.
+    """
+    ent = _role_entry(role)
+    raw = ent.get("sensitivity_ceiling")
+    if isinstance(raw, str) and raw.strip():
+        return _normalize_ceiling(raw)
+    # legacy fallback by role if not configured in roles.json
+    defaults = {
+        "ceo": "high",
+        "admin": "high",
+        "manager": "medium",
+        "engineer": "medium",
+        "analyst": "low",
+        "anonymous": "low",
+    }
+    return defaults.get((role or "").strip().lower(), "low")
+
+def _normalize_ceiling(raw: str) -> str:
+    """Return a valid ceiling in the configured order, or 'low'."""
+    try:
+        val = (raw or "").strip().lower()
+    except (ValueError, TypeError, AttributeError):
+        return "low"
+    if not val:
+        return "low"
+    order = _sensitivity_order()
+    return val if val in set(order) else "low"
+
+def _derive_ceiling_from_role(role: str) -> str:
+    """Map a role to its default ceiling via roles.json (fallback to legacy defaults)."""
+    return _role_default_ceiling(role)
+
+def compute_effective_policy(headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Minimal, header-derived policy context.
+    Role profile (field_visibility/extra_visible) sourced from roles.json;
+    OPA may override later at the handler level.
+    """
+    _require_headers(headers)
+    h = _headers_lc(headers)
+    ident = identity_from_headers(headers)
+
+    user_id        = (ident.get("user_id") or "").strip()
+    policy_version = h["x-policy-version"].strip()
+    policy_key_hdr = h["x-policy-key"].strip()
+    request_id     = h["x-request-id"].strip()
+    trace_id       = h["x-trace-id"].strip()
+
+    roles = ident.get("roles") or []
+    # Prefer explicit active role header if your identity helper provides it (BC: first role)
+    role = (roles[0] if roles else "").strip().lower()
+    if not role:
+        raise PolicyHeaderError("missing_required_headers:x-user-roles")
+
+    try:
+        _ds = str((h.get("x-denied-status") or "").strip())
+        denied_status = 404 if _ds == "404" else 403
+    except (ValueError, TypeError):
+        denied_status = 403
+
+    # Role defaults from roles.json (overridable via headers and OPA)
+    role_profile_vis = _role_field_visibility(role)
+    role_extra_default = _role_extra_visible(role)
+
+    extra_visible    = _csv(h.get("x-extra-allow")) or role_extra_default
+    user_namespaces  = _csv(h.get("x-user-namespaces"))
+    effective_scopes = _csv(h.get("x-domain-scopes"))
+    effective_edges  = _csv(h.get("x-edge-allow"))
+    raw_cap = (h.get("x-sensitivity-ceiling") or "").strip().lower()
+    # Always cap requested ceiling by the role default.
+    # Example: manager(default=medium) + header=high  ⇒ effective=medium
+    role_default = _derive_ceiling_from_role(role)
+    if raw_cap:
+        requested  = _normalize_ceiling(raw_cap)
+        order      = _sensitivity_order()
+        # lower index == less sensitive; take the MIN of the two
+        idx_role   = order.index(role_default)
+        idx_req    = order.index(requested)
+        eff_sens   = order[min(idx_role, idx_req)]
+        if eff_sens != requested:
+            # Explicitly log when a cap is applied (auditable, deterministic)
+            log_stage(
+                logger, "policy", "sensitivity_cap_applied",
+                role=role, requested=requested, role_default=role_default, effective=eff_sens
+            )
+    else:
+        # No header provided → role default
+        eff_sens = role_default
+
+
+    fp_basis = {
+        "user_id": user_id,
+        "role": role,
+        "namespaces": sorted(user_namespaces),
+        "scopes": sorted(effective_scopes),
+        "edge_allowlist": sorted(effective_edges),
+        "sensitivity": eff_sens,
+        "policy_version": policy_version,
+        "extra_visible": extra_visible
+    }
+    computed_fp = normalize_fingerprint(policy_fingerprint(fp_basis))
+    if policy_key_hdr and policy_key_hdr != computed_fp:
+        log_stage(logger, "policy", "policy_fp_mismatch",
+                  provided_fp=policy_key_hdr, computed_fp=computed_fp, request_id=request_id)
+
+    return {
+        "user_id": user_id,
+        "role": role,
+        "role_profile": {"field_visibility": role_profile_vis} if role_profile_vis else {},
+        "namespaces": user_namespaces,
+        "domain_scopes": effective_scopes,
+        "edge_allowlist": effective_edges,
+        "sensitivity_ceiling": eff_sens,
+        "extra_visible": extra_visible,
+        "policy_fp": computed_fp,
+        "denied_status": denied_status,
+        "request_id": request_id,
+        "trace_id": trace_id,
+        "policy_version": policy_version
+    }
+
 
 def _filter_x_extra(xextra: Any, allow: List[str]) -> Optional[Dict[str, Any]]:
     """Return a filtered shallow copy of the x-extra object based on an allow-list
@@ -48,12 +244,11 @@ def _filter_x_extra(xextra: Any, allow: List[str]) -> Optional[Dict[str, Any]]:
     return out or None
 
 def policy_fingerprint(policy: Dict[str, Any]) -> str:
-    """Canonical fingerprint: sha256(json.dumps(policy, sort_keys=True, separators=(',', ':')).utf8)."""
+    """Canonical fingerprint using core canonical JSON (sorted keys, no microseconds)."""
     try:
-        payload = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return "sha256:" + hashlib.sha256(payload).hexdigest()
-    except (TypeError, ValueError, UnicodeEncodeError):
-        # Never raise on fingerprinting
+        return ensure_sha256_prefix(sha256_hex(canonical_json(policy)))
+    except orjson.JSONEncodeError:
+        # Never raise on fingerprinting — return a stable sentinel
         return "sha256:unknown"
 
 class PolicyHeaderError(Exception):
@@ -62,67 +257,29 @@ class PolicyHeaderError(Exception):
 
 # Canonical list of required headers (fail-closed, no defaults).
 # NOTE: keys are matched case-insensitively at runtime.
-REQUIRED_HEADERS = [
-    "x-user-id",
-    "x-policy-version",
-    "x-policy-key",
-    "x-request-id",
-    "x-trace-id",
-    "x-user-roles",
-]
+REQUIRED_HEADERS = list(REQUIRED_POLICY_HEADERS_LOWER) + ["x-request-id", "x-trace-id"]
 
 def _headers_lc(headers: Dict[str, str]) -> Dict[str, str]:
     return {str(k).lower(): v for k, v in (headers or {}).items()}
 
 def _require_headers(headers: Dict[str, str]) -> None:
     h = _headers_lc(headers)
-    missing = [name for name in REQUIRED_HEADERS if not (h.get(name) or "").strip()]
-    if missing:
-        # Strategic, structured logging for the audit drawer & ops
+    present = [name for name in REQUIRED_HEADERS if name in h]
+    empty   = [name for name in present if not (h.get(name) or "").strip()]
+    missing = [name for name in REQUIRED_HEADERS if name not in h]
+    if empty or missing:
         log_stage(
             logger, "policy", "missing_headers",
-            missing=",".join(missing),
+            missing=",".join(missing) if missing else "",
+            empty=",".join(empty) if empty else "",
+            present=",".join(present),
             request_id=(h.get("x-request-id") or ""),
+            trace_id=(h.get("x-trace-id") or ""),
         )
-        raise PolicyHeaderError(f"missing_required_headers:{','.join(missing)}")
-
-@lru_cache(maxsize=32)
-def _policy_dir() -> str:
-    """
-    Resolve the policy registry directory.
-    Priority:
-      1) $POLICY_DIR
-      2) repo-root policy/roles (module-relative)
-      3) /app/policy/roles
-      4) ./policy/roles (dev CWD)
-    """
-    here = os.path.abspath(os.path.dirname(__file__))
-    repo_roles = os.path.abspath(os.path.join(here, "../../../../policy/roles"))
-    candidates = [
-        os.getenv("POLICY_DIR"),
-        repo_roles,
-        "/app/policy/roles",
-        os.path.abspath(os.path.join(os.getcwd(), "policy", "roles")),
-    ]
-    for c in candidates:
-        if c and os.path.isdir(c):
-            return c
-    # Last-resort default (kept for compatibility; will likely 404 on read)
-    return "/app/policy/roles"
-
-@lru_cache(maxsize=64)
-def load_role_profile(role: str) -> Dict[str, Any]:
-    """Load a role profile JSON from the policy registry."""
-    role_token = (role or "").strip().lower()
-    fname = f"role-{role_token}.json" if not role_token.startswith("role-") else f"{role_token}.json"
-    policy_dir = _policy_dir()
-    full = os.path.join(policy_dir, fname)
-    try:
-        with open(full, "r") as f:
-            return json.load(f)
-    except FileNotFoundError as e:
-        # Raise a clearer error with the resolved directory for debuggability
-        raise FileNotFoundError(f"role profile not found: {full} (policy_dir={policy_dir})") from e
+        parts = []
+        if missing: parts.append("missing=" + ",".join(missing))
+        if empty:   parts.append("empty=" + ",".join(empty))
+        raise PolicyHeaderError("missing_required_headers:" + ";".join(parts))
 
 def _csv(header_val: Optional[str]) -> List[str]:
     if not header_val:
@@ -143,12 +300,33 @@ def _sensitivity_order() -> List[str]:
         order = [x.strip() for x in (os.getenv("SENSITIVITY_ORDER", "low,medium,high") or "").split(",") if x.strip()]
     return order or ["low", "medium", "high"]
 
+_SENS_SYNONYMS = {
+    "hi": "high",
+    "very_high": "high",
+    "confidential": "high",
+    "med": "medium",
+    "mid": "medium",
+    "lo": "low",
+}
+
+def _normalize_sensitivity_value(level: Optional[str]) -> str:
+    """Normalize arbitrary sensitivity tokens; fail-conservative."""
+    val = (level or "low")
+    try:
+        val = str(val).strip().lower()
+    except (RuntimeError, ValueError, TypeError):
+        val = "low"
+    val = _SENS_SYNONYMS.get(val, val)
+    order = set(_sensitivity_order())
+    return val if val in order else "high"  # unknown → treat as high
+
 def _sens_rank(level: Optional[str]) -> int:
     order = _sensitivity_order()
+    norm = _normalize_sensitivity_value(level)
     try:
-        return 1 + order.index((level or "low"))
+        return 1 + order.index(norm)
     except (ValueError, AttributeError):
-        return 1  # default to least restrictive
+        return len(order)  # most restrictive
 
 def _min_sensitivity(a: str, b: Optional[str]) -> str:
     if not b:
@@ -167,131 +345,6 @@ def _edge_allowed(edge_type: Optional[str], allowlist: List[str]) -> bool:
         return True
     return edge_type in allowlist
 
-def compute_effective_policy(headers: Dict[str, str]) -> Dict[str, Any]:
-    # Starlette/FastAPI provides headers in lowercase; normalise and fail-close.
-    _require_headers(headers)
-    h = _headers_lc(headers)
-
-    user_id        = h["x-user-id"].strip()
-    policy_version = h["x-policy-version"].strip()
-    policy_key_hdr = h["x-policy-key"].strip()
-    request_id     = h["x-request-id"].strip()
-    trace_id       = h["x-trace-id"].strip()
-
-    role = (h.get("x-user-roles") or "").split(",")[0].strip().lower()
-    if not role:
-        # Redundant because _require_headers enforces x-user-roles, but keep as guard.
-        raise PolicyHeaderError("missing_required_headers:x-user-roles")
-    try:
-        role_profile = load_role_profile(role)
-    except FileNotFoundError as e:
-        # Fail-closed: unknown/unsupported role — treat as policy error (400) upstream
-        log_stage(logger, "policy", "role_not_found", role=role)
-        raise PolicyHeaderError("unknown_role") from e
-
-    # Denial status toggle (default 403; allow header override to 404)
-    try:
-        _ds = str((h.get("x-denied-status") or "").strip())
-        denied_status = 404 if _ds == "404" else 403
-    except (ValueError, TypeError):
-        denied_status = 403
-
-    # Extra field visibility for x-extra (default deny)
-    extra_visible = role_profile.get("extra_visible") or []
-
-    # Namespaces: intersect requested with role-allowed (fail-closed semantics)
-    user_namespaces = _csv(h.get("x-user-namespaces"))
-    role_ns = [ns for ns in (role_profile.get("namespaces") or []) if isinstance(ns, str)]
-    if role_ns:
-        user_namespaces = [ns for ns in user_namespaces if ns in role_ns]
-
-    # Scopes: prefer requested, else role default
-    hdr_scopes = _csv(h.get("x-domain-scopes"))
-    effective_scopes = hdr_scopes or (role_profile.get("domain_scopes") or [])
-
-    # Edge allowlist: role baseline, optionally narrowed by header
-    hdr_edges = _csv(h.get("x-edge-allow"))
-    role_edges = [e for e in (role_profile.get("edge_allowlist") or []) if isinstance(e, str)]
-    effective_edges = [e for e in role_edges if (not hdr_edges) or (e in hdr_edges)]
-
-    eff_sens = _min_sensitivity(role_profile.get("sensitivity_ceiling", "low"),
-                                h.get("x-sensitivity-ceiling"))
-    try:
-        max_hops = min(int(h.get("x-max-hops", "1") or "1"), 1)  # k=1 hard cap
-    except Exception:
-        max_hops = 1
-
-    # ---- ALIAS behaviour knobs (policy-driven) --------------------------------
-    # Allow ALIAS projection if role allows it (policy-owned; request header only toggles follow on/off).
-    allow_alias = bool(((role_profile.get("field_visibility") or {}).get("event") or {}).get("allow_alias_projection", False))
-    follow_alias_hdr = (h.get("x-follow-alias") or "").strip().lower() in {"1","true","yes","on"}
-    # Maximum hops is clamped by role profile (alias_max_hops); header may request fewer but never more.
-    try:
-        role_alias_max = int((role_profile.get("alias_max_hops") or 3))
-    except (ValueError, TypeError):
-        role_alias_max = 3
-    try:
-        alias_hdr_val = int(h.get("x-alias-hops", str(role_alias_max)) or role_alias_max)
-    except (ValueError, TypeError):
-        alias_hdr_val = role_alias_max
-    alias_hops = max(0, min(alias_hdr_val, role_alias_max))
-
-    # Deterministic policy fingerprint for audit/replay (does NOT include runtime ids)
-    # Include a stable hash of field_visibility so policy_fp changes if mask patterns change.
-    try:
-        _fv_cfg = (role_profile.get("field_visibility") or {})
-        _fv_bytes = json.dumps(_fv_cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        _fv_hash = hashlib.sha256(_fv_bytes).hexdigest()
-    except (TypeError, ValueError, UnicodeEncodeError):
-        _fv_hash = "unknown"
-
-    fp_basis = {
-        "role": role_profile.get("role") or role,
-        "namespaces": sorted(user_namespaces),
-        "scopes": sorted(effective_scopes),
-        "edge_allowlist": sorted(effective_edges),
-        "sensitivity": eff_sens,
-        "max_hops": max_hops,
-        "policy_version": policy_version,
-        "extra_visible": extra_visible,
-        "fv_hash": _fv_hash,
-    }
-    computed_fp = policy_fingerprint(fp_basis)
-    # Defer single fingerprint emission to the response assembly path.
-
-    # Only warn when a caller asserts a fingerprint that truly disagrees.
-    if policy_key_hdr and policy_key_hdr != computed_fp:
-        if isinstance(policy_key_hdr, str) and policy_key_hdr.startswith("sha256:"):
-            # Explicit mismatch is an error-like event -> keep as an immediate log
-            log_stage(logger, "policy", "policy_fp_mismatch",
-                      provided_fp=policy_key_hdr, computed_fp=computed_fp, request_id=request_id)
-        else:
-            # Human-readable keys: emit the computed fingerprint once per request (no spam)
-            log_once(logger, key="policy_fp", event="policy_fp", stage="policy",
-                     computed_fp=computed_fp, request_id=request_id)
-
-    return {
-        "user_id": user_id,
-        "role": role_profile.get("role") or role,
-        "role_profile": role_profile,
-        "namespaces": user_namespaces,
-        "domain_scopes": effective_scopes,
-        "edge_allowlist": effective_edges,
-        "sensitivity_ceiling": eff_sens,
-        "max_hops": max_hops,
-        "allow_alias": allow_alias,
-        "follow_alias": follow_alias_hdr,
-        "alias_hops": alias_hops,
-        "alias_max_hops": role_alias_max,
-        "policy_key": policy_key_hdr,     # from header (required)
-        "policy_version": policy_version, # from header (required)
-        "request_id": request_id,
-        "trace_id": trace_id,
-        "policy_fp": computed_fp,
-        "denied_status": denied_status,
-        "extra_visible": extra_visible,
-    }
-
 def acl_check(node: Dict[str, Any], policy: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """Return (allowed, reason) for ACL evaluation on a node."""
     if not isinstance(node, dict):
@@ -306,7 +359,8 @@ def acl_check(node: Dict[str, Any], policy: Dict[str, Any]) -> Tuple[bool, Optio
     node_ns = node.get("namespaces") or []
     if node_ns and not (set(node_ns) & set(namespaces)):
         return False, "acl:namespace_mismatch"
-    node_sens = node.get("sensitivity") or "low"
+    # Normalize sensitivity rigorously; unknown values are treated as 'high'
+    node_sens = _normalize_sensitivity_value(node.get("sensitivity") or "low")
     if _sens_rank(node_sens) > _sens_rank(ceiling):
         return False, "acl:sensitivity_exceeded"
     node_domain = node.get("domain") or ""
@@ -328,9 +382,13 @@ def field_mask(node: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
     node = node or {}
     # Avoid inferring a type when missing; use the raw type string only.
     node_type_raw = node.get("type") or ""
+    # Reserved fields must never leak into the wire anchor/items
+    # NOTE: snapshot_etag is required in the wire meta → do NOT reserve/mask it.
+    _reserved = {"meta"}
     node_type_lc = node_type_raw.lower()
     node_type_uc = node_type_raw.upper()
     role_profile = policy.get("role_profile") or {}
+    # Merge strategy: OPA explain (if handlers injected it) takes precedence over roles.json seed.
     fv = (role_profile.get("field_visibility") or {}).get(node_type_lc or "", {})
     visible = list(fv.get("visible_fields") or [])
     include_all = any(v == "*" for v in visible)
@@ -357,7 +415,7 @@ def field_mask(node: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
         if _raw_id and _raw_id != _wire_id:
             try:
                 log_stage(logger, "policy", "id_normalized",
-                          frm=_raw_id, to=_wire_id, request_id=(policy or {}).get("request_id"))
+                          before=_raw_id, after=_wire_id, request_id=(policy or {}).get("request_id"))
             except (RuntimeError, ValueError, TypeError):
                 pass
     elif isinstance(_raw_id, str) and _raw_id:
@@ -366,7 +424,7 @@ def field_mask(node: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
         if _raw_id != _wire_id:
             try:
                 log_stage(logger, "policy", "id_normalized",
-                          frm=_raw_id, to=_wire_id, request_id=(policy or {}).get("request_id"))
+                          before=_raw_id, after=_wire_id, request_id=(policy or {}).get("request_id"))
             except (RuntimeError, ValueError, TypeError):
                 pass
     out: Dict[str, Any] = {"id": _wire_id}
@@ -396,6 +454,17 @@ def field_mask(node: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if k in {"id", "type"}:
             continue
+        # Hard stop on reserved/leaky fields regardless of role policy
+        if k in _reserved:
+            # Emit once per request to help catch schema regressions without noisy logs
+            try:
+                log_once(
+                    logger, key=f"masked_reserved:{k}",
+                    stage="policy", event="mask.reserved_field", field=k
+                )
+            except (RuntimeError, ValueError, TypeError):
+                pass
+            continue
         if k == "x-extra":
             continue  # handled above
         # When include_all is set, include all fields except internal keys and x-extra
@@ -423,7 +492,6 @@ def field_mask_with_summary(node: Dict[str, Any], policy: Dict[str, Any]) -> Tup
     role_profile = policy.get("role_profile") or {}
     fv = (role_profile.get("field_visibility") or {}).get(node_type or "", {})
     visible = set(fv.get("visible_fields") or [])
-    rationale_visible = fv.get("rationale_visible")
     for k in list(original.keys()):
         if k in {"_key","_id","_rev","id","type","domain","edge","meta","x-extra"}:
             continue
@@ -453,7 +521,7 @@ def field_mask_with_summary(node: Dict[str, Any], policy: Dict[str, Any]) -> Tup
             kept_keys = set(_flatten(allowed_xe))
             for k in sorted(orig_keys - kept_keys):
                 removed_items.append({"field": f"x-extra.{k}", "reason_code": "policy:field_denied"})
-    except Exception:
+    except (RuntimeError, ValueError, TypeError):
         pass
     summary = {"total_removed": len(removed_items), "items": removed_items}
     return masked, summary

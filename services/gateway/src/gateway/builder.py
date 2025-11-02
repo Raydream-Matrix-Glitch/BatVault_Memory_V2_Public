@@ -1,12 +1,13 @@
 from __future__ import annotations
 from typing import Any, Tuple, Dict
-import time, uuid, os, hashlib
+import time, uuid, os
 from datetime import datetime, timezone
 from core_models_gen import GraphEdgesModel
 from core_utils.graph import derive_events_from_edges
-from core_utils.fingerprints import canonical_json, sha256_hex, ensure_sha256_prefix, allowed_ids_fp as compute_allowed_ids_fp
+from core_utils.fingerprints import canonical_json, sha256_hex
+from core_logging import get_logger, trace_span, log_stage, current_request_id
 from .signing import select_and_sign, SigningError
-from core_models.ontology import CAUSAL_EDGE_TYPES
+from core_models.ontology import CAUSAL_EDGE_TYPES, canonical_edge_type
 try:
     # Prefer the selector's authoritative policy identifier
     from gateway.selector import SELECTOR_POLICY_ID as _SELECTOR_POLICY_ID  # type: ignore
@@ -16,10 +17,7 @@ except ImportError:
 
 from core_utils import jsonx
 from core_config import get_settings
-from core_models.ontology import assert_truncation_action
-
 import importlib.metadata as _md
-from core_logging import get_logger, trace_span, log_stage, current_request_id
 from core_models_gen.models import (
     WhyDecisionAnchor,
     WhyDecisionAnswer,
@@ -28,9 +26,11 @@ from core_models_gen.models import (
     CompletenessFlags,
 )
 from gateway.orientation import classify_edge_orientation, assert_ready_for_orientation
-from core_models.meta_inputs import MetaInputs
+from core_models_gen.models_meta_inputs import MetaInputs
 from gateway import selector as _selector
-from .templater import finalise_short_answer, deterministic_short_answer
+from .templater import build_answer_blocks, apply_template
+from .template_registry import select_template
+from core_utils.domain import make_anchor
 from core_models.meta_builder import build_meta
 from core_metrics import counter as metric_counter, histogram as metric_histogram
 from core_cache import keys as cache_keys
@@ -65,7 +65,7 @@ def _build_exec_summary_envelope(
     ev_obj: Any,
     mem_meta: Dict[str, Any],
     request_id: str,
-) -> Tuple[Dict[str, Any], str]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     _t0 = time.perf_counter()
     """
     Schema-first projection:
@@ -82,13 +82,26 @@ def _build_exec_summary_envelope(
         ev  = (ev_obj.model_dump(mode="python", exclude_none=True)
                if hasattr(ev_obj, "model_dump")
                else dict(ev_obj or {}))
-    except Exception:
+    except (AttributeError, TypeError, ValueError, KeyError, RuntimeError, OSError):
         ev  = dict(src.pop("evidence", {}) or {})
     # Build minimal public shape
+    # Anchor: prefer full object when complete; else canonical string id
+    _raw_anchor = (src.get("anchor") or ev.get("anchor") or {})
+    _anchor_id  = (
+        (getattr(getattr(ev_obj, "anchor", None), "id", None))
+        or (_raw_anchor.get("id") if isinstance(_raw_anchor, dict) else (_raw_anchor if isinstance(_raw_anchor, str) else ""))
+        or ""
+    )
+    _required = ("id","type","title","domain","timestamp")
+    _anchor_pub = (
+        _raw_anchor
+        if (isinstance(_raw_anchor, dict) and all(k in _raw_anchor and _raw_anchor[k] for k in _required))
+        else str(_anchor_id)
+    )
     public: Dict[str, Any] = {
-        "anchor": (src.get("anchor") or ev.get("anchor") or {}),
+        "anchor": _anchor_pub,
         "graph":  (src.get("graph")  or ev.get("graph")  or {"edges": []}),
-        "answer": src.get("answer") or {"short_answer": "", "cited_ids": []},
+        "answer": src.get("answer") or {"blocks": {"lead": ""}},
         "completeness_flags": src.get("completeness_flags") or {"has_preceding": False, "has_succeeding": False},
     }
     # Strip UI-only extras not present in the anchor schema
@@ -127,7 +140,8 @@ def _build_exec_summary_envelope(
         graph_fp=str((meta.get("fingerprints") or {}).get("graph_fp") or ""),
     )
     # PR-5: real signing (centralised). Sign the canonical public response and
-    # mirror signature.covered to meta.bundle_fp. Only graph_fp is allowed under meta.fingerprints.
+    # mirror signature.covered to meta.bundle_fp.
+    # IMPORTANT: Only graph_fp is allowed under meta.fingerprints; NEVER include bundle_fp there.
     signature = select_and_sign(public, request_id=request_id)
     public.setdefault("meta", {})["bundle_fp"] = signature["covered"]
     # Defensive: ensure fingerprints has only graph_fp (no bundle_fp inside)
@@ -139,11 +153,12 @@ def _build_exec_summary_envelope(
     log_stage(logger, "builder", "bundle_signed", request_id=request_id,
               algo=signature.get("alg"),
               key_id=signature.get("key_id"))
+    # (bundle_fp mirrored to meta by _build_exec_summary_envelope)  :contentReference[oaicite:5]{index=5}
     try:
         metric_histogram("gateway_stage_bundle_seconds", time.perf_counter() - _t0, step="envelope_and_sign")
-    except (RuntimeError, ValueError, TypeError):
-        pass
-    return {"schema_version": "v3", "response": public, "signature": signature}, signature["covered"]
+    except (RuntimeError, ValueError, TypeError, OSError) as _merr:
+        log_stage(logger, "builder", "metrics_emit_failed", error=str(_merr))
+    return {"schema_version": "v3", "response": public}, signature, signature["covered"]
 
 def _counts(ids_list, ev) -> dict:
     """Return simple counts for audit: number of ids and in-pool edges."""
@@ -171,34 +186,10 @@ def _counts(ids_list, ev) -> dict:
             continue
     return {"ids": len(idset), "edges": edge_count}
 
-def _build_minimal_answer(ev: WhyDecisionEvidence) -> WhyDecisionAnswer:
-    """Deterministic, non-LLM short answer with cited ids."""
-    try:
-        cited = _compute_cited_ids(ev)
-    except (RuntimeError, ValueError, TypeError, AttributeError, KeyError):
-        cited = list(getattr(ev, "allowed_ids", []) or [])
-    # Build a stub first, then deterministically finalise; on failure, hard-fallback.
-    ans = WhyDecisionAnswer(short_answer="STUB ANSWER", cited_ids=cited)
-    try:
-        ans, _ = finalise_short_answer(ans, ev)
-        return ans
-    except (RuntimeError, ValueError, TypeError, KeyError, AttributeError) as e:
-        # Strategic log + deterministic fallback => never surface a stub
-        log_stage(logger, "templater", "finalise_failed",
-                  error=type(e).__name__, message=str(e),
-                  request_id=(current_request_id() or "unknown"))
-        try:
-            txt, planned = deterministic_short_answer(ev)
-            ans.short_answer = txt
-            ans.cited_ids = planned
-        except (RuntimeError, ValueError, TypeError, KeyError, AttributeError) as ee:
-            log_stage(logger, "templater", "fallback_failed",
-                      error=type(ee).__name__, request_id=(current_request_id() or "unknown"))
-        return ans
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 def _compute_cited_ids(ev: WhyDecisionEvidence) -> list[str]:
     """Compute deterministic cited_ids for the given evidence.
     Ordering: [anchor] + [top 3 events (selector)] + [first succeeding decision].
@@ -240,12 +231,19 @@ def _compute_cited_ids(ev: WhyDecisionEvidence) -> list[str]:
             _edges = []
     except (AttributeError, TypeError, ValueError):
         _edges = []
+    # Edge type canonicalizer used by both branches
+    def _et(edge):
+        try:
+            return canonical_edge_type((edge or {}).get("type"))
+        except ValueError:
+            return None
+
     if (anchor_type or "") == "EVENT":
         # For EVENT anchors: cite decisions this event LED_TO (outbound)
         out_of_anchor = [
             (e.get("to") or e.get("to_id"), (e.get("timestamp") or ""))
             for e in _edges
-            if str((e or {}).get("type") or "").upper() == "LED_TO" and e.get("from") == anchor_id
+            if _et(e) == "LED_TO" and e.get("from") == anchor_id
         ]
         # Order: newest first by timestamp, then id asc
         out_of_anchor.sort(key=lambda t: (t[1], str(t[0] or "")), reverse=True)
@@ -256,7 +254,7 @@ def _compute_cited_ids(ev: WhyDecisionEvidence) -> list[str]:
         into_anchor = {
             (e.get("from") or e.get("from_id"))
             for e in _edges
-            if str((e or {}).get("type") or "").upper() == "LED_TO" and e.get("to") == anchor_id
+            if _et(e) == "LED_TO" and e.get("to") == anchor_id
         }
         events: list[dict] = [evd for evd in derive_events_from_edges(ev) if evd.get("id") in into_anchor]
         try:
@@ -288,14 +286,21 @@ def _compute_cited_ids(ev: WhyDecisionEvidence) -> list[str]:
         next_id = None
         # Prefer oriented succeeding CAUSAL edges (post-orientation).
         for e in edges:
-            et = str((e or {}).get("type") or "").upper()
+            try:
+                et = canonical_edge_type((e or {}).get("type"))
+            except ValueError:
+                continue
             if et == "CAUSAL" and (e.get("orientation") == "succeeding") and \
                (e.get("from") == anchor_id or e.get("to") == anchor_id):
                 next_id = e.get("to"); break
         # Fallback: un-oriented direct CAUSAL out of anchor (strictly same-domain).
         if not next_id:
             for e in edges:
-                if str((e or {}).get("type") or "").upper() == "CAUSAL" and e.get("from") == anchor_id:
+                try:
+                    et = canonical_edge_type((e or {}).get("type"))
+                except ValueError:
+                    continue
+                if et == "CAUSAL" and e.get("from") == anchor_id:
                     next_id = e.get("to"); break
         if next_id and next_id in allowed and next_id not in support:
             support.append(next_id)
@@ -303,152 +308,6 @@ def _compute_cited_ids(ev: WhyDecisionEvidence) -> list[str]:
         # Optional pointer — safe to proceed without it
         pass
     return support
-
-# ---------------------------------------------------------------------------
-async def _enrich_for_short_answer(ev: WhyDecisionEvidence, policy_headers: dict | None = None) -> None:
-    """
-    BOUNDED enrich for prose only (≤4 IDs): Top-3 preceding events + first succeeding decision.
-    - Calls Memory /api/enrich/batch with the SAME policy headers and snapshot_etag precondition.
-    - Attaches lightweight items to ev.events; does NOT mutate edges or widen scope.
-    Baseline: Gateway MAY do this for short-answer titles; wire stays edges-only. 
-    """
-    try:
-        from core_config import get_settings as _get_settings
-        from core_http.client import get_http_client
-        s = _get_settings()
-        mem_url = getattr(s, "memory_api_url", None)
-        if not mem_url:
-            return
-        allowed = list(getattr(ev, "allowed_ids", []) or [])
-        # Enrich exactly the set we plan to cite (minus the anchor)
-        try:
-            planned = _compute_cited_ids(ev)
-        except Exception:
-            planned = []
-        anchor_id = getattr(getattr(ev, "anchor", None), "id", None)
-        ids = [i for i in planned if i and i != anchor_id and i in allowed][:4]
-        if not ids:
-            return
-
-        # --- Canonical negative-cache key (evidence:{etag}|{allowed_ids_fp}|{policy_fp}) ---
-        try:
-            meta = dict(getattr(ev, "meta", {}) or {})
-            allowed_ids_fp = str(meta.get("allowed_ids_fp") or "")
-            policy_fp = str(meta.get("policy_fp") or (meta.get("fingerprints") or {}).get("policy_fingerprint") or "")
-            etag = str(getattr(ev, "snapshot_etag", "") or "")
-            ev_cache_key = cache_keys.evidence(etag, allowed_ids_fp, policy_fp)
-        except (AttributeError, TypeError, ValueError):
-            ev_cache_key = None
-
-        # Short-circuit on recent 412 marker
-        if ev_cache_key:
-            try:
-                rc = get_redis_pool()
-                if rc is not None:
-                    mark = await rc.get(ev_cache_key)
-                    if isinstance(mark, (bytes, str)) and str(mark).startswith('{"_neg412":'):
-                        log_stage(
-                            logger, "enrich", "neg_cache_412_hit",
-                            cache_key=ev_cache_key, request_id=(current_request_id() or "unknown")
-                        )
-                        return
-            except (TypeError, AttributeError, RuntimeError):
-                # Redis unavailable or non-awaitable test double – ignore
-                pass
-
-        # Call Memory batch-enrich (policy- and snapshot-bound)
-        headers = dict(policy_headers or {})
-        etag_hdr = getattr(ev, "snapshot_etag", None)
-        if etag_hdr:
-            headers["X-Snapshot-Etag"] = etag_hdr
-        client = get_http_client(timeout_ms=3000)
-        payload = {"anchor_id": anchor_id, "snapshot_etag": etag_hdr, "ids": ids}
-        r = await client.post(f"{mem_url}/api/enrich/batch", json=payload, headers=headers)
-        if hasattr(r, "raise_for_status"):
-            try:
-                r.raise_for_status()
-            except Exception as exc:
-                # Handle 412 specifically; otherwise keep enrich optional and return
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status == 412 and ev_cache_key:
-                    try:
-                        rc = get_redis_pool()
-                        if rc is not None:
-                            await rc.setex(ev_cache_key, int(TTL_EVIDENCE_CACHE_SEC), jsonx.dumps({"_neg412": True}))
-                        log_stage(
-                            logger, "enrich", "neg_cache_412_store",
-                            cache_key=ev_cache_key, ttl=int(TTL_EVIDENCE_CACHE_SEC),
-                            request_id=(current_request_id() or "unknown")
-                        )
-                    except (TypeError, AttributeError, RuntimeError):
-                        pass
-                return
-        data = r.json() if hasattr(r, "json") else {}
-        items = (data or {}).get("items") or {}
-        # Attach minimal enriched items to evidence.events for templater consumption
-        cur = list(getattr(ev, "events", []) or [])
-        by_id = {d.get("id"): d for d in cur if isinstance(d, dict)}
-        for iid in ids:
-            node = items.get(iid) or {}
-            if not isinstance(node, dict): 
-                continue
-            mapped = {
-                "id": node.get("id") or iid,
-                "type": node.get("type") or node.get("entity_type") or "EVENT",
-                "title": (node.get("title") or "")[:256],
-                "description": (node.get("description") or "")[:512],
-                "timestamp": node.get("timestamp") or "",
-            }
-            if mapped["id"] in by_id:
-                by_id[mapped["id"]].update({k: v for k, v in mapped.items() if v})
-            else:
-                cur.append(mapped)
-        ev.__dict__["events"] = cur
-        log_stage(logger, "enrich", "batch_applied",
-                  count=len(ids), request_id=(current_request_id() or "unknown"))
-    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as _e:
-        # Enrich is optional; mark and continue with edges-only rendering
-        try:
-            setattr(ev, "_enrich_failed", True)
-        except (AttributeError, RuntimeError):
-            pass
-        log_stage(logger, "enrich", "batch_failed",
-                  error=type(_e).__name__, request_id=(current_request_id() or "unknown"))
-
-# ---------------------------------------------------------------------------
-# Evidence pre-processing helpers (non-normalising)
-# ---------------------------------------------------------------------------
-def _dedup_and_normalise_events(ev: WhyDecisionEvidence) -> None:
-    """Deduplicate events **by id only**, preserving original fields.
-    No slugging, no timestamp coercion, no amount parsing (ingest owns that)."""
-    try:
-        events = list(ev.events or [])
-    except Exception:
-        return
-    def _key(e: dict) -> tuple[str, str]:
-        try: return ((e or {}).get("timestamp") or "", (e or {}).get("id") or "")
-        except Exception: return ("","")
-    seen: set[str] = set(); deduped: list[dict] = []
-    for e in sorted([x for x in events if isinstance(x, dict)], key=_key):
-        _id = str(e.get("id") or "").strip()
-        if not _id or _id in seen:
-            continue
-        seen.add(_id); deduped.append(e)
-    try:
-        ev.events = deduped
-    except Exception:
-        pass
-    try:
-        from .logging_helpers import stage as log_stage
-        log_stage("evidence", "dedup_applied", removed=max(0, len(events) - len(deduped)), kept=len(deduped))
-        # Metrics: count duplicate inputs rejected (events)
-        try:
-            metric_counter("gateway_duplicate_inputs_rejected_total", max(0, len(events) - len(deduped)), kind="event")
-        except Exception:
-            pass
-    except Exception:
-        pass
-
 try:
     _GATEWAY_VERSION = _md.version("gateway")
 except _md.PackageNotFoundError:
@@ -485,7 +344,7 @@ def _apply_orientation(ev_obj, *, anchor_id: str) -> tuple[int, int]:
     alias_sources = {
         e.get("from") for e in edges
         if isinstance(e, dict)
-        and str(e.get("type") or "").upper() == "ALIAS_OF"
+        and (lambda _t: (_t == "ALIAS_OF"))(canonical_edge_type(e.get("type")))
         and (e.get("to") == anchor_id)
     }
     out = []
@@ -494,10 +353,13 @@ def _apply_orientation(ev_obj, *, anchor_id: str) -> tuple[int, int]:
     for e in edges:
         if not isinstance(e, dict):
             continue
-        et = str(e.get("type") or "").upper()
+        try:
+            et = canonical_edge_type(e.get("type"))
+        except ValueError:
+            out.append(e); continue  # unknown → neutral
         if et == "ALIAS_OF":
             e.pop("orientation", None)  # neutral
-        elif et in ("LED_TO", "CAUSAL"):
+        elif et in CAUSAL_EDGE_TYPES:
             hint = "succeeding" if (e.get("from") in alias_sources and e.get("to") != anchor_id) else None
             orient = classify_edge_orientation(anchor_id, e, hint)
             if orient:
@@ -541,13 +403,15 @@ async def store_evidence_cache(ev: WhyDecisionEvidence) -> None:
         int(TTL_EVIDENCE_CACHE_SEC),
         jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)),
     )
-    log_stage(
-        logger, "cache", "store",
-        layer="evidence", cache_key=k, ttl=int(TTL_EVIDENCE_CACHE_SEC),
-    )
+    try:
+        _rid = (current_request_id() or "unknown")
+    except (AttributeError, TypeError, ValueError, KeyError, RuntimeError, OSError):
+        _rid = "unknown"
+    log_stage(logger, "cache", "store",
+              layer="evidence", cache_key=k, ttl=int(TTL_EVIDENCE_CACHE_SEC),
+              request_id=_rid)
 
 # ───────────────────── main entry-point ─────────────────────────
-@trace_span("builder", logger=logger)
 async def build_why_decision_response(
     req: "AskIn",                          # forward-declared (defined in app.py)
     evidence_builder,                      # EvidenceBuilder instance (singleton passed from app.py)
@@ -556,18 +420,19 @@ async def build_why_decision_response(
     fresh: bool = False,                   # bypass caches when gathering evidence
     policy_headers: dict | None = None,    # pass policy headers through to Memory API
     stage_times: dict | None = None,       # STAGE 5: accumulate per-stage latencies (ms)
-) -> Tuple[WhyDecisionResponse, Dict[str, bytes], str]:
+    gateway_plan: dict | None = None) -> Tuple[WhyDecisionResponse, Dict[str, bytes], str]:
     """
     Assemble Why-Decision response and audit artifacts.
     Returns (response, artifacts_dict, request_id).
     """
     t0      = time.perf_counter()
-    # Prefer inbound request_id from the active context; fall back to req field; else generate.
-    try:
-        bound_rid = current_request_id()
-    except Exception:
-        bound_rid = None
-    req_id  = getattr(req, "request_id", None) or bound_rid or uuid.uuid4().hex
+    # Prefer explicit request_id from the AskIn. Do NOT reuse a stale/global id.
+    explicit = getattr(req, "request_id", None)
+    if explicit:
+        req_id = explicit.strip()
+    else:
+        # match the 16-hex convention used by MinIO paths
+        req_id = uuid.uuid4().hex[:16]
     stage_times = dict(stage_times or {})
     artifacts: Dict[str, bytes] = {}
     settings = get_settings()
@@ -592,13 +457,10 @@ async def build_why_decision_response(
 
     artifacts["evidence_pre.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)).encode()
 
-    # Persist deterministic plan inputs; include selector policy id for audits
-    plan_dict = {
-        "node_id": ev.anchor.id,
-        "k": 1,
-        "selector_policy_id": _SELECTOR_POLICY_ID,
-    }
-    artifacts["plan.json"] = jsonx.dumps(plan_dict).encode()
+    # Persist deterministic gateway plan (strongly typed by schema)
+    if gateway_plan is None:
+        raise ValueError("gateway_plan not provided")
+    artifacts["gateway.plan.json"] = jsonx.dumps(gateway_plan).encode()
 
     # Persist canonicalised, pre-gate evidence (post-dedupe, pre-trim)
     artifacts["evidence_canonical.json"] = jsonx.dumps(ev.model_dump(mode="python", exclude_none=True)).encode()
@@ -626,7 +488,7 @@ async def build_why_decision_response(
                 log_stage(logger, "schema", "policy_registry_cache_hit", request_id=req_id)
         else:
             log_stage(logger, "schema", "policy_registry_warm_skipped", request_id=req_id)
-    except Exception:
+    except (ImportError, AttributeError, RuntimeError, ValueError):
         # Do not reference registry_url here – it may not be set on exceptions.
         _m = getattr(ev, "meta", None)
         # Avoid dict-like access on Pydantic models (BaseModel has no .get)
@@ -659,22 +521,32 @@ async def build_why_decision_response(
     _payload_ids = list(_prompt_ids)
     gw_version = _GATEWAY_VERSION
     # Trace IDs (best-effort)
+    # Best-effort OTEL context; avoid broad exceptions and add observable fallback.
     try:
         from opentelemetry import trace as _trace  # type: ignore
-        _sp = _trace.get_current_span()
-        _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
-        _trace_id = f"{_ctx.trace_id:032x}" if _ctx and getattr(_ctx, "trace_id", 0) else None
-        _span_id  = f"{_ctx.span_id:016x}" if _ctx and getattr(_ctx, "span_id", 0) else None
-    except Exception:
+    except ImportError:
         _trace_id, _span_id = None, None
+    else:
+        try:
+            _sp = _trace.get_current_span()
+            _ctx = _sp.get_span_context() if _sp else None  # type: ignore[attr-defined]
+            _trace_id = f"{_ctx.trace_id:032x}" if _ctx and getattr(_ctx, "trace_id", 0) else None
+            _span_id  = f"{_ctx.span_id:016x}" if _ctx and getattr(_ctx, "span_id", 0) else None
+        except (AttributeError, ValueError, TypeError) as exc:
+            _trace_id, _span_id = None, None
+            log_stage(logger, "builder", "otel_context_missing",
+                      request_id=(current_request_id() or "unknown"),
+                      error=str(exc))
     _anchor_id = getattr(getattr(ev, "anchor", None), "id", None) or "unknown"
     # Selector audit
     try:
         ranked = _selector.rank_events(ev.anchor, derive_events_from_edges(ev))
         ranked_event_ids = [d.get("id") for d in ranked if isinstance(d, dict)]
         sel_scores = []
-    except Exception:
+    except (AttributeError, TypeError, ValueError, RuntimeError) as _sel_err:
         ranked_event_ids, sel_scores = [], []
+        log_stage(logger, "builder", "selector_rank_failed",
+                  request_id=(current_request_id() or "unknown"), error=str(_sel_err))
     # Budget audit
     cleaned_metrics = {"prompt_truncation": False, "prompt_excluded_ids": []}
     # Use a prompt-only graph if the orchestrator attached one; otherwise fall back to the full graph.
@@ -703,10 +575,11 @@ async def build_why_decision_response(
             ev.graph = GraphEdgesModel(edges=_edges_after)
             try:
                 log_stage(logger, "builder", "graph_clamped_to_pool",
-                      edges_before=len(_edges), edges_after=len(_edges_after))
-            except Exception:
-                pass
-    except Exception as e:
+                          edges_before=len(_edges), edges_after=len(_edges_after))
+            except (RuntimeError, ValueError, TypeError, KeyError) as _lg_err:
+                log_stage(logger, "builder", "graph_clamp_log_failed",
+                          request_id=(current_request_id() or "unknown"), error=str(_lg_err))
+    except (AttributeError, TypeError, ValueError, KeyError, RuntimeError, OSError) as e:
         # Non-fatal: log with context and continue (Baseline: no silent errors).
         log_stage(logger, "builder", "pool_clamp_failed",
                   request_id=req_id, error=str(e),
@@ -724,7 +597,7 @@ async def build_why_decision_response(
                   request_id=req_id, error=str(e),
                   anchor_id=_ctx_anchor_id, bundle_fp=_ctx_bundle_fp)
         raise
-    except Exception as e:
+    except (AttributeError, TypeError, ValueError, KeyError, RuntimeError, OSError) as e:
         log_stage(logger, "orientation", "apply_exception",
                   request_id=req_id, error=type(e).__name__,
                   anchor_id=_ctx_anchor_id, bundle_fp=_ctx_bundle_fp)
@@ -733,7 +606,7 @@ async def build_why_decision_response(
     # v3: events not attached to evidence; ranking kept internal for meta if needed.
 
 # Build new meta inputs
-    _ts_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _ts_utc = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     # --- policy meta (target.md §11) -----------------------------------------
     # Policy identifiers (override-able via env for easy rollouts)
     _policy_id   = os.getenv("WHY_POLICY_ID", "why_v1")
@@ -773,18 +646,20 @@ async def build_why_decision_response(
         for _k, _v in (stage_times or {}).items():
             _name = _canonical_map.get(_k, _k)
             _stage_latencies_canonical[_name] = int(_v)
-    except Exception:
+    except (TypeError, ValueError, AttributeError) as _lt_err:
+        log_stage(logger, "builder", "latency_canonicalize_failed", error=str(_lt_err))
         _stage_latencies_canonical = dict(stage_times or {})
     # Ensure total is present alongside per-stage values
     try:
         _stage_latencies_canonical["total"] = int((time.perf_counter() - t0) * 1000)
-    except Exception:
-        pass
+    except (OverflowError, TypeError, ValueError) as _lt2_err:
+        log_stage(logger, "builder", "latency_total_failed", error=str(_lt2_err))
     # Request-level timeout budget (best-effort)
     try:
         from core_config.constants import TIMEOUT_LLM_MS, TIMEOUT_ENRICH_MS, TIMEOUT_SEARCH_MS, TIMEOUT_EXPAND_MS, TIMEOUT_VALIDATE_MS
         _timeout_ms = max(TIMEOUT_LLM_MS, TIMEOUT_ENRICH_MS, TIMEOUT_SEARCH_MS, TIMEOUT_EXPAND_MS, TIMEOUT_VALIDATE_MS)
-    except Exception:
+    except (ImportError, AttributeError, ValueError) as _tc_err:
+        log_stage(logger, "builder", "timeout_constants_unavailable", error=str(_tc_err))
         _timeout_ms = 0
     runtime_dict = {
         "latency_ms_total": int((time.perf_counter() - t0) * 1000),
@@ -803,10 +678,10 @@ async def build_why_decision_response(
         request={
             "intent": req.intent,
             "anchor_id": _anchor_id,
-            "request_id": req_id,
+            "id": req_id,         # <-- schema requires 'id'
             "trace_id": _trace_id,
             "span_id": _span_id,
-            "ts_utc": _ts_utc,
+            "ts_utc": _ts_utc,    # <-- now seconds precision
         },
         policy={
             "policy_id": _policy_id, "prompt_id": _prompt_id,
@@ -876,27 +751,28 @@ async def build_why_decision_response(
     # ---- M3: enrich meta with policy_trace + downloads (dict-level, no model changes) ----
     try:
         policy_trace_val = getattr(ev, "_policy_trace", {}) or {}
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         policy_trace_val = {}
     # Compute download gating based on actor role; directors/execs may access full bundles.
     try:
         actor_role = (getattr(meta_obj, "actor", {}) or {}).get("role")
-    except Exception:
+    except (AttributeError, TypeError, ValueError) as _ar_err:
+        log_stage(logger, "builder", "actor_role_read_failed", error=str(_ar_err))
         actor_role = None
-    allow_full = str(actor_role).lower() in ("director", "exec")
+    allow_full = str(actor_role).lower() in ("ceo",)
     downloads_manifest = {
         "artifacts": [
             {
                 "name": "bundle_view",
                 "allowed": True,
                 "reason": None,
-                "href": f"/v2/bundles/{req_id}/download?name=bundle_view"
+                "href": f"/v3/bundles/{req_id}/download?name=bundle_view"
             },
             {
                 "name": "bundle_full",
                 "allowed": bool(allow_full),
                 "reason": None if allow_full else "acl:sensitivity_exceeded",
-                "href": f"/v2/bundles/{req_id}/download?name=bundle_full"
+                "href": f"/v3/bundles/{req_id}/download?name=bundle_full"
             },
         ]
     }
@@ -917,14 +793,14 @@ async def build_why_decision_response(
                 if not _pfp:
                     fps = getattr(_mm, "fingerprints", {}) or {}
                     _pfp = fps.get("policy_fingerprint")
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 _pfp = None
         # Propagate only if present; do not derive a new fingerprint locally.
         if _pfp:
             meta_dict["policy_fp"] = _pfp
             meta_dict.setdefault("fingerprints", {})["policy_fingerprint"] = _pfp
             log_stage(logger, "builder", "policy_fingerprint", action="propagate", fp=_pfp)
-    except Exception:
+    except (RuntimeError, ValueError, TypeError, AttributeError):
         pass
     meta_dict["policy_trace"] = policy_trace_val
     meta_dict["downloads"] = downloads_manifest
@@ -951,29 +827,30 @@ async def build_why_decision_response(
     except (AttributeError, RuntimeError, ValueError, TypeError):
         pass
 
-    bundle_url = f"/v2/bundles/{req_id}"
+    bundle_url = f"/v3/bundles/{req_id}"
     # Will be computed after final response serialization; initialize for early references.
     bundle_fp_final: str | None = None
-    try:
-        if not getattr(meta_obj, "resolver_path", None):
-            setattr(meta_obj, "resolver_path", "direct")
-    except Exception:
+    # Prefer dict-style assignment; only fall back to attribute when not a mapping.
+    if isinstance(meta_obj, dict):
+        meta_obj.setdefault("resolver_path", "direct")
+    else:
         try:
-            meta_obj["resolver_path"] = "direct"  # type: ignore[index]
-        except Exception:
-            pass
+            if not getattr(meta_obj, "resolver_path", None):
+                setattr(meta_obj, "resolver_path", "direct")
+        except Exception as _rp_err:
+            log_stage(logger, "builder", "resolver_path_dict_failed", error=str(_rp_err))
 
     # Strategic: single audit log of pool/prompt/payload cardinalities
     log_stage(logger, "meta", "pool_prompt_payload",
               request_id=req_id,
-              pool=len(meta_inputs.evidence_sets.pool_ids),
-              prompt=len(meta_inputs.evidence_sets.prompt_included_ids),
-              payload=len(meta_inputs.evidence_sets.payload_included_ids))
+              pool=len(_pool_ids or []),
+              prompt=len((_prompt_ids or [])),
+              payload=len((_payload_ids or [])))
 
     # Return response with enriched meta (dict)
     try:
         stage_times['render_response'] = int((time.perf_counter() - _t_render) * 1000)
-    except Exception:
+    except (OverflowError, TypeError, ValueError):
         pass
     # Compute completeness flags from oriented graph edges (no transitions in public bundle)
     try:
@@ -988,16 +865,16 @@ async def build_why_decision_response(
                 edges = [e for e in (g_obj.get("edges") or []) if isinstance(e, dict)]
             else:
                 edges = []
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         edges = []
     try:
         has_pre = any(str((e or {}).get("orientation") or "").lower() == "preceding" for e in edges)
         has_suc = any(str((e or {}).get("orientation") or "").lower() == "succeeding" for e in edges)
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         has_pre, has_suc = False, False
     try:
         _event_count = len(derive_events_from_edges(ev))
-    except Exception:
+    except (TypeError, ValueError, AttributeError):
         _event_count = 0
     flags = CompletenessFlags(
         has_preceding=bool(has_pre),
@@ -1007,17 +884,34 @@ async def build_why_decision_response(
     log_stage(logger, "builder", "completeness_flags_type",
               given=f"{flags.__class__.__module__}.{flags.__class__.__name__}",
               request_id=req_id)
-    # Optional bounded enrich for short-answer titles (Top-3 + Next). Wire remains edges-only.
+    # 1) Compute full deterministic blocks from evidence
+    blocks = build_answer_blocks(ev)
+    # 2) Resolve template (org-aware) and apply it; fail-closed on invalid inputs
     try:
-        await _enrich_for_short_answer(ev, policy_headers=policy_headers)
-    except Exception:
-        # Safe to continue; templater will fall back gracefully.
-        pass
-    # Build the public short answer from the full evidence; templater handles rendering.
-    ans = _build_minimal_answer(ev)
+        template_id = str(getattr(req, "template_id", "") or "").strip() or None
+        org_id = str(getattr(req, "org", "") or "").strip() or None
+        tmpl, reg_fp = select_template(template_id, org_id)
+    except (KeyError, FileNotFoundError, ValueError) as exc:
+        from fastapi import HTTPException
+        _ctx = ""
+        if isinstance(exc, (KeyError, FileNotFoundError)):
+            _ctx = f":template={template_id or 'default'}@org={org_id or 'default'}"
+        raise HTTPException(status_code=400, detail=f"template_error:{type(exc).__name__}{_ctx}")
+    t_blocks = apply_template(blocks, tmpl)
+    # 3) Compute deterministic citations within allowed_ids (unchanged policy)
+    cited = _compute_cited_ids(ev)
+    ans = WhyDecisionAnswer(blocks=t_blocks, cited_ids=cited)
 
     # Forward-looking shape: WhyDecisionResponse requires top-level anchor/graph.
     # Keep extra fields (e.g., intent, bundle_url) harmlessly via extra="allow".
+    # Surface the chosen template and registry fingerprint in meta (public, signed at envelope)
+    try:
+        meta_dict["answer_template_id"] = str(tmpl.get("id"))
+        meta_dict["template_registry_fp"] = str(reg_fp)
+    except (AttributeError, KeyError, TypeError, ValueError) as _tmpl_err:
+        # Do not fabricate fields if meta_dict shape changes; upstream validator will catch missing keys if required.
+        log_stage(logger, "builder", "template_meta_propagate_failed", error=str(_tmpl_err))
+
     resp = WhyDecisionResponse(
         anchor=getattr(ev, "anchor", None) or WhyDecisionAnchor(),
         graph=getattr(ev, "graph", None) or GraphEdgesModel(edges=[]),
@@ -1054,7 +948,7 @@ async def build_why_decision_response(
             has_policy_fp=bool(_mem_meta.get("policy_fp")),
             has_snapshot_etag=bool(_mem_meta.get("snapshot_etag")),
             graph_fp=str(_mm_fps.get("graph_fp") or ""))
-    envelope, bundle_fp_final = _build_exec_summary_envelope(
+    envelope, signature, bundle_fp_final = _build_exec_summary_envelope(
         response_obj=resp.model_dump(mode="python", by_alias=True, exclude_none=True),
         ts_utc=str(meta_dict.get("request", {}).get("ts_utc") or _ts_utc),
         ev_obj=ev,
@@ -1074,6 +968,7 @@ async def build_why_decision_response(
             pass
     _ctx_bundle_fp = bundle_fp_final or _ctx_bundle_fp
     artifacts["response.json"] = jsonx.dumps(envelope).encode("utf-8")
+    artifacts["receipt.json"]  = jsonx.dumps(signature).encode("utf-8")
     # Optional: persist the bundle to Redis using the canonical key (now that bundle_fp is known).
     try:
         redis_client = get_redis_pool()
@@ -1086,7 +981,7 @@ async def build_why_decision_response(
             await rc.setex(cache_keys.bundle(bundle_fp_final), int(TTL_BUNDLE_CACHE_SEC), serialized)
             log_stage(logger, "bundle", "redis_cached",
                       bundle_fp=bundle_fp_final, bytes=len(serialized))
-    except Exception as _exc:
+    except (AttributeError, TypeError, ValueError, KeyError, RuntimeError, OSError) as _exc:
         log_stage(logger, "bundle", "redis_cache_skip",
                   reason=type(_exc).__name__, anchor_id=_ctx_anchor_id, bundle_fp=(bundle_fp_final or _ctx_bundle_fp))
     # Build compact trace (unsigned). Emission is unconditional (View bundle requires it).
@@ -1128,13 +1023,11 @@ async def build_why_decision_response(
             "selector_policy_id": _SELECTOR_POLICY_ID,
             "orientation_counts": orientation_counts,
             "events_ranked_top3": list(ranked_event_ids or [])[:3],
-            "cited_ids_count": int(len(getattr(resp.answer, "cited_ids", []) or [])),
-            "cited_ids": list(getattr(resp.answer, "cited_ids", []) or []),
-            "templater": {"mode": "deterministic", "template_version": "v3-key-events"},
+            "templater": {"mode": "deterministic", "template_version": "v3-blocks"},
             "bundle_fp": bundle_fp_final,
         },
         "response_preview": {
-            "short_answer": str(getattr(resp.answer, "short_answer", "") or ""),
+            "blocks": getattr(resp.answer, "blocks", {}),
             "completeness_flags": {
                 "has_preceding": bool(getattr(resp.completeness_flags, "has_preceding", False)),
                 "has_succeeding": bool(getattr(resp.completeness_flags, "has_succeeding", False)),
@@ -1150,14 +1043,49 @@ async def build_why_decision_response(
         "validator": {},  # filled by run_validator() below
     }
     artifacts["trace.json"] = jsonx.dumps(trace_view).encode("utf-8")
+    # Compute bundle.manifest.json deterministically over current artifacts BEFORE validation
+    import mimetypes
+    items = []
+    for name in sorted(artifacts.keys()):
+        blob = artifacts[name]
+        h = sha256_hex(blob)
+        ctype = mimetypes.guess_type(name, strict=False)[0] or "application/json"
+        items.append({"name": name, "sha256": h, "bytes": len(blob), "content_type": ctype})
+    artifacts["bundle.manifest.json"] = jsonx.dumps({"artifacts": items}).encode("utf-8")
+    # Sanity checks
+    assert "bundle.manifest.json" in artifacts, "builder: missing bundle.manifest.json before validation"
+
     # Stage-7 validator report (delegates to core validator) and fail-closed.
     from .validator import view_artifacts_allowed
     from .validator import run_validator as _run_validator
     _allowed = view_artifacts_allowed()
-    # Include the base trace.json so the "view" bundle meets the schema's required artifacts.
     _artifacts_for_view = {k: v for k, v in artifacts.items() if k in _allowed}
+    # Recompute a bundle.manifest.json strictly for the view subset.
+    # IMPORTANT: exclude the manifest itself when computing the manifest to avoid
+    # self-hash/size mismatches (the subset currently contains the full-bundle manifest).
+    _artifacts_for_view.pop("bundle.manifest.json", None)
+    _items_view = []
+    for _name in sorted(_artifacts_for_view.keys()):
+        _blob = _artifacts_for_view[_name]
+        _sha  = sha256_hex(_blob)
+        _ctype = mimetypes.guess_type(_name, strict=False)[0] or "application/json"
+        _items_view.append({"name": _name, "sha256": _sha, "bytes": len(_blob), "content_type": _ctype})
+    _artifacts_for_view["bundle.manifest.json"] = jsonx.dumps({"artifacts": _items_view}).encode("utf-8")
+    # Defensive: the view manifest must not list itself (prevents non-convergent fixed points).
+    _mn = [it.get("name") for it in (jsonx.loads(_artifacts_for_view["bundle.manifest.json"]).get("artifacts") or [])]
+    assert "bundle.manifest.json" not in _mn, "view manifest must not list itself"
+    # Sanity: validator input must include a manifest that matches its own subset.
+    assert "bundle.manifest.json" in _artifacts_for_view, "validator input missing bundle.manifest.json"
+    # Helpful audit log of exactly what the validator sees.
+    log_stage(
+        logger, "validator", "input_inventory",
+        request_id=req_id,
+        full_count=len(artifacts or {}),
+        view_count=len(_artifacts_for_view or {}),
+        view_names=sorted(_artifacts_for_view.keys()),
+    )
     _val_report = _run_validator(
-        envelope,   # validate the **enveloped** response (contains meta.bundle_fp)
+        envelope,   # validate the response (bundle_fp still lives in meta)
         _artifacts_for_view,
         request_id=req_id,
     )
@@ -1175,22 +1103,26 @@ async def build_why_decision_response(
     # Baseline metric: count validator errors (kept, but emitted in a single place).
     try:
         metric_counter("validator_errors", float(len(_val_report.get("errors", []))), request_id=req_id)
-    except Exception:
-        pass
+    except (RuntimeError, ValueError, TypeError) as _vc_err:
+        log_stage(logger, "metrics", "validator_errors_emit_failed", error=str(_vc_err), request_id=req_id)
     if not bool(_val_report.get("pass")):
         try:
+            _mismatch = next((e for e in (_val_report.get("errors") or []) if e.get("code") == "manifest_mismatch"), None)
+            _manifest_issues = ((_mismatch or {}).get("issues"))
             log_stage(logger, "validator", "bundle_failed",
                       request_id=req_id,
                       anchor_id=_ctx_anchor_id,
                       bundle_fp=(bundle_fp_final or "unknown"),
-                      errors=[e.get("code") for e in (_val_report.get("errors") or [])][:10])
-        except Exception:
-            pass
+                      errors=[e.get("code") for e in (_val_report.get("errors") or [])][:10],
+                      manifest_issues=_manifest_issues)
+        except (KeyError, TypeError, ValueError) as _vf_log_err:
+            log_stage(logger, "validator", "bundle_failed_log_skipped", error=str(_vf_log_err))
         from fastapi import HTTPException
         raise HTTPException(
             status_code=500,
             detail={"error": "bundle_validation_failed", "errors": (_val_report.get("errors") or [])[:5]},
         )
+
     # Optionally persist artifacts to MinIO without blocking the request path.
     try:
         # Lazy-import to avoid hard runtime dep in tests/local.
@@ -1199,7 +1131,9 @@ async def build_why_decision_response(
         # Snapshot the dict to avoid concurrent mutations while uploading
         _snapshot = dict(artifacts)
         _asyncio.create_task(_minio_save(req_id, _snapshot))
-    except Exception:
-        # MinIO not configured / import failed — ignore silently.
-        pass
+    except (ImportError, RuntimeError, OSError) as _minio_err:
+        # MinIO not configured or background scheduling failed — log and continue.
+        log_stage(logger, "builder", "artifact_upload_skipped",
+                  request_id=(current_request_id() or "unknown"),
+                  error=str(_minio_err))
     return resp, artifacts, req_id

@@ -1,23 +1,16 @@
 from __future__ import annotations
 from typing import Any, Dict, List
 import os
-import pathlib
-import re
 from core_utils import jsonx
 from core_logging import get_logger, trace_span, log_stage
 from core_config import get_settings
 from core_utils.domain import storage_key_to_anchor
 from core_http.client import fetch_json
+from core_http.headers import RESPONSE_SNAPSHOT_ETAG
 import httpx
 
 logger = get_logger("gateway.resolver.fallback_search")
 settings = get_settings()
-
-
-def _normalize_anchor_id(candidate: str) -> str:
-    """Canonicalize IDs to '<domain>#<id>' using core mapping."""
-    s = str(candidate or "")
-    return s if "#" in s else storage_key_to_anchor(s)
 
 # ── Primary search with graceful fallback ──────────────────────────────
 async def search_bm25(
@@ -43,7 +36,7 @@ async def search_bm25(
                 request_id=request_id,
                 return_headers=True,
             )
-            etag = (headers or {}).get("x-snapshot-etag") or snapshot_etag
+            etag = (headers or {}).get(RESPONSE_SNAPSHOT_ETAG) or snapshot_etag
             log_stage(logger, "resolver", "bm25_http_status", status_code=200, request_id=request_id)
             matches = (doc or {}).get("matches", []) if isinstance(doc, dict) else []
             log_stage(
@@ -81,7 +74,7 @@ async def search_bm25(
     _normd = []
     for m in (matches or []):
         _id_raw = m.get("id")
-        _id_norm = _normalize_anchor_id(_id_raw) if isinstance(_id_raw, str) else _id_raw
+        _id_norm = storage_key_to_anchor(_id_raw) if isinstance(_id_raw, str) else _id_raw
         if isinstance(_id_raw, str) and isinstance(_id_norm, str) and _id_raw != _id_norm:
             log_stage(logger, "resolver", "id_normalized", request_id=request_id, before=_id_raw, after=_id_norm)
         if isinstance(_id_norm, str):
@@ -144,6 +137,3 @@ async def search_bm25(
             # keep silent in dev path to avoid interfering with 404/409 selection
             matches = matches or []
     return matches
-
-# Back-compat alias
-fallback_search = search_bm25

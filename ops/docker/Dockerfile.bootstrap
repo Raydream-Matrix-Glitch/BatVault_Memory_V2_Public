@@ -1,32 +1,36 @@
-FROM python:3.11-slim
-
-# --- system & python deps ---
-RUN apt-get update \
- && apt-get install -y --no-install-recommends curl libffi-dev python3-dev libgmp-dev \
- && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir python-arango httpx==0.27.0 python-dateutil==2.9.0.post0
-
-# --- project code ---
+FROM python:3.12-slim AS bootstrap
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 WORKDIR /app
-# 1) shared packages so `core_config` resolves
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential python3-dev libffi-dev libgmp-dev git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY packages ./packages
-# 2) install only what bootstrap needs (editable = no wheel build)
-RUN pip install \
-      -e packages/core_config \
-      -e packages/core_logging \
-      -e packages/core_metrics \
-      -e packages/core_storage \
-      -e packages/core_utils
+COPY ops ./ops
 
-# 3) copy the bootstrap script last (keeps cache hits high)
-COPY ops/bootstrap.py ./ops/bootstrap.py
+RUN python -m pip install --upgrade \
+      "pip>=24.1" "setuptools>=68" "wheel>=0.41" \
+      "hatchling>=1.25" "poetry-core>=1.9"
 
+RUN pip install --no-cache-dir \
+      "python-arango>=7.9.1" \
+      "redis>=5.0.3" \
+      "minio>=7.2.7" \
+      "httpx>=0.27.0"
 
-COPY sitecustomize.py ./sitecustomize.py
+RUN pip install --no-build-isolation \
+      -e ./packages/core_config \
+      -e ./packages/core_logging \
+      -e ./packages/core_metrics \
+      -e ./packages/core_observability \
+      -e ./packages/core_cache \
+      -e ./packages/core_utils \
+      -e ./packages/core_storage \
+      -e ./packages/core_models
 
-# Ensure root is on sys.path so sitecustomize.py runs and injects all */src paths.
-# We only need /app here; sitecustomize will append packages/*/src and services/*/src
-# deterministically (and before site-packages) for the current container filesystem.
-ENV PYTHONPATH="/app"
-
-CMD ["python", "ops/bootstrap.py"]
+CMD ["python", "-c", "print('bootstrap OK')"]

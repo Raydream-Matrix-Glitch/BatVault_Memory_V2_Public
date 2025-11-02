@@ -19,10 +19,23 @@ class MemoryMetaModel(BaseModel):
     policy_fp:     Optional[str] = None
     snapshot_etag: Optional[str] = None
 
+class AnswerOwner(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    name: str
+    role: Optional[str] = None
+
+class AnswerBlocks(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    lead: str
+    description: Optional[str] = None
+    key_events: Optional[list[str]] = None
+    next: Optional[str] = None
+    owner: Optional[AnswerOwner] = None
+    decision_id: Optional[str] = None
+
 class WhyDecisionAnswer(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
-    short_answer: Optional[str] = None
-    cited_ids:    list[str] | None = None
+    blocks: AnswerBlocks
 
 class CompletenessFlags(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)

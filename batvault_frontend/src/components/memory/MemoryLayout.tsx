@@ -12,13 +12,11 @@ export default function MemoryLayout({ children }: { children: React.ReactNode }
     () => ({ currentStep: "NavMenu", nextStep: () => {} }),
     []
   );
-
   return (
     <AnimationStepProvider value={dummyCtx}>
       <VaultLayout backgroundVariant="radial" disableFooter>
         {/* Shared radial glow + subtle vignette (same universe as Origins/Collective) */}
         <div className="memory-bg memory-bg__radial memory-bg__vignette" />
-
         {/* Neural tree silhouette (uses assets/memoryBg.svg) */}
         <img
           src={memoryBg}
@@ -26,10 +24,8 @@ export default function MemoryLayout({ children }: { children: React.ReactNode }
           className="memory-bg neural-tree select-none"
           aria-hidden="true"
         />
-
         {/* Global nav */}
         <NavMenu />
-
         {/* Page content */}
         {children}
       </VaultLayout>

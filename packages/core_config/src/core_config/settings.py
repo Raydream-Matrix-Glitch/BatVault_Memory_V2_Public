@@ -5,7 +5,6 @@ from core_config.constants import (
     TIMEOUT_SEARCH_MS,
     TIMEOUT_EXPAND_MS,
     TIMEOUT_ENRICH_MS,
-    TTL_EVIDENCE_CACHE_SEC,
 )
 
 class Settings(BaseSettings):
@@ -38,13 +37,7 @@ class Settings(BaseSettings):
     def arango_password(self) -> str:  # noqa: D401
         """Return the configured root password (alias)."""
         return self.arango_root_password
-    
-    @property
-    def embedding_dimension(self) -> int:   # noqa: N802
-        """Alias kept for legacy code paths that used
-        `settings.embedding_dimension`."""
-        return self.embedding_dim
-    
+      
     arango_vector_index_enabled: bool = Field(default=True, alias="ARANGO_VECTOR_INDEX_ENABLED")
     embedding_dim: int = Field(default=768, alias="EMBEDDING_DIM")
     vector_metric: str = Field(default="cosine", alias="VECTOR_METRIC")
@@ -61,8 +54,6 @@ class Settings(BaseSettings):
             return ["low", "medium", "high"]
 
     # Prompt & selector sizing (spec §M4)
-    max_prompt_bytes: int = Field(default=8192, alias="MAX_PROMPT_BYTES")
-    selector_truncation_threshold: int = Field(default=6144, alias="SELECTOR_TRUNCATION_THRESHOLD")
     min_evidence_items: int = Field(default=1, alias="MIN_EVIDENCE_ITEMS")
     enable_selector_model: bool = Field(default=False, alias="ENABLE_SELECTOR_MODEL")
 
@@ -118,8 +109,6 @@ class Settings(BaseSettings):
     # Evidence heuristics
     enable_day_summary_dedup: bool = Field(default=False, alias="ENABLE_DAY_SUMMARY_DEDUP")
     # Answer shaping
-    answer_char_cap: int = Field(default=420, alias="ANSWER_CHAR_CAP")
-    answer_sentence_cap: int = Field(default=3, alias="ANSWER_SENTENCE_CAP")
     because_event_count: int = Field(default=3, alias="BECAUSE_EVENT_COUNT")
 
     # Canonical answer budgets (prefer these; legacy kept for back-compat)
@@ -178,22 +167,6 @@ class Settings(BaseSettings):
         except Exception:
             # Best-effort; leave defaults as-is on failure.
             pass
-
-    # ── Back-compat shims (TTL envs removed; constants only) ─────────────
-    @property
-    def cache_ttl_evidence_sec(self) -> int:  # noqa: D401
-        """DEPRECATED: use core_config.constants.TTL_EVIDENCE_CACHE_SEC; env ignored."""
-        return int(TTL_EVIDENCE_CACHE_SEC)
-
-    @property
-    def cache_ttl_expand_sec(self) -> int:  # noqa: D401
-        """DEPRECATED: expand TTL no longer env-driven; fixed constant for compat."""
-        return 60
-
-    @property
-    def cache_ttl_resolve_sec(self) -> int:  # noqa: D401
-        """DEPRECATED: resolve TTL no longer env-driven; fixed constant for compat."""
-        return 300
 
 def get_settings() -> "Settings":
     return Settings()  # type: ignore

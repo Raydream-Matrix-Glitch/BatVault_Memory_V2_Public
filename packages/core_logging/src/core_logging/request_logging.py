@@ -8,6 +8,9 @@ from core_logging import (
 )
 from core_utils.ids import generate_request_id
 import core_metrics
+from core_http.headers import (
+    RESPONSE_SNAPSHOT_ETAG, BV_POLICY_FP, BV_ALLOWED_IDS_FP, BV_GRAPH_FP
+)
 
 _DEFAULT_SUPPRESS: Tuple[str, ...] = ("/health", "/healthz", "/ready", "/readyz", "/metrics")
 
@@ -102,11 +105,11 @@ def attach_request_logging(
                 _lower = {str(k).lower(): v for k, v in _hdrs.items()}
                 log_stage(
                     logger, "summary", "response_headers",
-                    snapshot_etag=_lower.get("x-snapshot-etag") or _lower.get("x-bv-snapshot-etag"),
-                    policy_fp=_lower.get("x-bv-policy-fingerprint"),
-                    allowed_ids_fp=_lower.get("x-bv-allowed-ids-fp"),
-                    graph_fp=_lower.get("x-bv-graph-fp"),
-                    bundle_fp=_lower.get("x-bundle-fp") or _lower.get("x-bv-bundle-fp"),
+                    snapshot_etag=_lower.get(RESPONSE_SNAPSHOT_ETAG),
+                    policy_fp=_lower.get(BV_POLICY_FP.lower()),
+                    allowed_ids_fp=_lower.get(BV_ALLOWED_IDS_FP.lower()),
+                    graph_fp=_lower.get(BV_GRAPH_FP.lower()),
+                    bundle_fp=_lower.get("x-bundle-fp"),
                     request_id=req_id,
                     )
             # Compact rollups

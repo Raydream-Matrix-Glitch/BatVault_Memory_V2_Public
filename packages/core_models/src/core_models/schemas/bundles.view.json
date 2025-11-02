@@ -6,7 +6,9 @@
   "additionalProperties": false,
   "properties": {
     "response.json": { "$ref": "./bundles.exec_summary.json" },
-    "trace.json":    { "$ref": "./bundles.trace.json" }
+    "trace.json":    { "$ref": "./bundles.trace.json" },
+    "receipt.json":  { "$ref": "./receipt.json" },
+    "bundle.manifest.json": { "$ref": "./bundle.manifest.json" }
   },
-  "required": ["response.json", "trace.json"]
+  "required": ["response.json", "trace.json", "receipt.json", "bundle.manifest.json"]
 }

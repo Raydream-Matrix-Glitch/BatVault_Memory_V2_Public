@@ -30,7 +30,9 @@ def _inject_headers(headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     if rid:
         base.setdefault("x-request-id", rid)
     if headers:
-        base.update(headers)
+        # Harden: never allow caller to override tracing headers
+        sanitized = {k: v for k, v in headers.items() if k.lower() not in ("x-trace-id","traceparent","tracestate")}
+        base.update(sanitized)
     return base
 
 def _jsonable(x: Any) -> Any:
@@ -208,7 +210,7 @@ def get_sync_http_client(timeout_ms: Optional[int] = None) -> httpx.Client:
     global _shared_client_sync
     base_sec = (timeout_ms / 1000.0) if timeout_ms is not None else timeout_for_stage("enrich")
     if _shared_client_sync is None or _shared_client_sync.is_closed:
-        _shared_client_sync = httpx.Client(timeout=httpx.Timeout(connect=base_sec, read=base_sec, write=base_sec))
+        _shared_client_sync = httpx.Client(timeout=httpx.Timeout(timeout=base_sec))
     return _shared_client_sync
 
 def fetch_json_sync(

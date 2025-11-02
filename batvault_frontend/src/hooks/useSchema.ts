@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { SchemaFields, SchemaRelation } from "../types/memory";
+import { gateway, commonHeaders } from "../sdk/client";
 
 // Module-level caches to avoid refetching schema repeatedly. These are
 // intentionally unexported so that components can share the same data across
@@ -30,18 +31,6 @@ export function useSchema() {
       try {
         setLoading(true);
         setError(null);
-        // Determine the base path for schema endpoints. Prefer VITE_API_BASE
-        // from env variables; otherwise fall back to the window origin. In
-        // test/JSDOM environments where window is undefined, default to
-        // relative paths by using the empty string. Trim any trailing slash.
-        const base = (() => {
-          const envBase = (import.meta as any).env?.VITE_API_BASE as string | undefined;
-          if (envBase) return envBase.replace(/\/$/, "");
-          if (typeof window !== "undefined" && window.location) {
-            return window.location.origin.replace(/\/$/, "");
-          }
-          return "";
-        })();
         // Acquire bearer token from localStorage if present
         let token: string | undefined;
         try {
@@ -53,17 +42,18 @@ export function useSchema() {
           Accept: "application/json",
         };
         if (token) headers["Authorization"] = `Bearer ${token}`;
+        const sdkHeaders = commonHeaders(headers);
         const [fieldsRes, relsRes] = await Promise.all([
-          fetch(`${base}/v2/schema/fields`, { headers, signal: abort.signal }),
-          fetch(`${base}/v2/schema/rels`, { headers, signal: abort.signal }),
+          gateway.GET("/v2/schema/fields", { headers: sdkHeaders, signal: abort.signal }),
+          gateway.GET("/v2/schema/rels",   { headers: sdkHeaders, signal: abort.signal }),
         ]);
-        if (!fieldsRes.ok || !relsRes.ok) {
-          throw new Error(
-            `Failed to fetch schema: ${fieldsRes.status}/${relsRes.status}`
-          );
+        if (!fieldsRes.response?.ok || !relsRes.response?.ok) {
+          const fs = fieldsRes.response?.status ?? "NA";
+          const rs = relsRes.response?.status ?? "NA";
+          throw new Error(`Failed to fetch schema: ${fs}/${rs}`);
         }
-        const fieldsJson = await fieldsRes.json();
-        const relsJson = await relsRes.json();
+        const fieldsJson = fieldsRes.data as any;
+        const relsJson   = relsRes.data as any;
         cachedFields = fieldsJson.fields as SchemaFields;
         cachedRelations = relsJson.relations as SchemaRelation[];
         cacheError = null;

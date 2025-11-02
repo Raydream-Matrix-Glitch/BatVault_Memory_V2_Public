@@ -1,10 +1,11 @@
 from __future__ import annotations
-import asyncio, hashlib, inspect
+import asyncio, inspect
 from typing import List, Tuple
 from core_config import get_settings
 from core_cache.redis_client import get_redis_pool
 from core_utils import jsonx
 from core_logging import get_logger, log_stage, current_request_id
+from core_utils.fingerprints import sha256_hex
 
 logger = get_logger("gateway.resolver.reranker")
 
@@ -51,7 +52,7 @@ async def rerank(query: str, candidates: list[dict]) -> list[tuple[dict, float]]
 
     # Cache key: model + query + ordered ids (shortened hash)
     ids = ",".join(str(c.get("id") or "") for c in items)
-    h = hashlib.sha256((query + "|" + ids).encode("utf-8")).hexdigest()[:24]
+    h = sha256_hex((query + "|" + ids).encode("utf-8"))[:24]
     key = f"rr:cx:v1:{h}"
     rc = get_redis_pool()
     if rc is not None:

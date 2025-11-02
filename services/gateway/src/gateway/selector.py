@@ -10,7 +10,6 @@ from core_utils.tokens import estimate_text_tokens
 from core_metrics import histogram as metric_histogram
 
 logger = get_logger("gateway.selector")
-logger.propagate = False
 
 # Public, stable policy identifier used in audits & meta.selection_metrics.ranking_policy.
 # Order semantics: similarity DESC → timestamp DESC (ISO) → id ASC

@@ -1,6 +1,15 @@
 groups:
   - name: batvault.slo.recording
     rules:
+      # Graph FP mismatch rate (5m). Near zero is the healthy baseline.
+      - record: slo:graph_fp_mismatch_rate:5m
+        expr: |
+          sum(rate(gateway_graph_fp_mismatch_total[5m]))
+          /
+          clamp_min(
+            sum(rate(gateway_graph_fp_mismatch_total[5m])) + sum(rate(gateway_graph_fp_verified_total[5m])),
+            1
+          )
       # P95 latency percentiles across multiple windows (5m, 30m, 1h, 6h).
       - record: slo:p95_ttfb_seconds:5m
         expr: |
@@ -120,6 +129,15 @@ groups:
         expr: rate(ingest_http_5xx_total[6h]) / rate(ingest_http_requests_total[6h])
   - name: batvault.slo.alerts
     rules:
+      # Alert if mismatch rate rises above 0.5% for 15m.
+      - alert: GraphFPMismatchRateHigh
+        expr: slo:graph_fp_mismatch_rate:5m > 0.005
+        for: 15m
+        labels:
+          severity: warn
+        annotations:
+          summary: "Graph FP mismatch rate elevated"
+          description: "Mismatch rate >0.5% over 15m; investigate builder verification vs memory graph_fp."
       # Latency SLO burn alerts: short (5m/30m) and long (1h/6h) windows.
       - alert: HighP95LatencyShort
         expr: slo:p95_ttfb_seconds:5m > 3 and slo:p95_ttfb_seconds:30m > 3

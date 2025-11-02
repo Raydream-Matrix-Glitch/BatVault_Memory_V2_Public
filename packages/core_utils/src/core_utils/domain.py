@@ -1,6 +1,10 @@
 """
 Domain normalisation helpers for BatVault.
 
+JSON Schema IDs:
+  - https://batvault.dev/schemas/domain.json (domain string)
+  - https://batvault.dev/schemas/anchor.json (anchor '<domain>#<id>')
+
 Single source of truth for domain + anchor parsing/validation.
 This module defines a single function ``normalise_domain`` which takes an
 arbitrary input string and returns a canonical slash‑scoped, lower‑kebab
@@ -11,8 +15,12 @@ domain.  The canonical form adheres to the following rules:
 * Duplicate dashes are collapsed; leading and trailing dashes on each segment are removed.
 * Domains consist of one or more segments separated by ``/``.  Each segment must match
   the pattern ``^[a-z0-9]+(?:-[a-z0-9]+)*$``.
-* Normalisation rejects empty segments (e.g. ``"/foo"`` or "foo//bar") and any segment
+* Normalisation rejects empty segments (e.g. ``"/foo"`` or ``"foo//bar"``) and any segment
   containing invalid characters.
+
+Anchor rules (canonical; enforced by core_models.ontology):
+* ID **must start with an alphanumeric** and be **at least 3 characters** long.
+* Allowed ID chars after the first: ``[a-z0-9._:-]``.
 
 If the input cannot be normalised into a valid domain, a ``ValueError`` is raised.
 Callers may catch this to return a structured error or reject the write as per the ingest specification.
@@ -22,6 +30,12 @@ from __future__ import annotations
 import re
 import unicodedata
 from typing import Union, Tuple
+from core_models.ontology import (
+    ID_RE, DOMAIN_RE, ANCHOR_RE,
+    parse_anchor as _parse_anchor,
+    is_valid_anchor as _is_valid_anchor,
+    make_anchor as _make_anchor,
+)
 
 
 _SEGMENT_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -68,33 +82,21 @@ def normalise_domain(domain: Union[str, bytes]) -> str:
         normalised_parts.append(seg)
     return "/".join(normalised_parts)
 
-# Anchor helpers (normative in v3):
-# Anchor shape: "<domain>#<id>" where domain is slash-scoped lower-kebab
-# (segments matching _SEGMENT_RE) and id matches [a-z0-9._:-]+.  Baseline §0.  :contentReference[oaicite:3]{index=3}
-#
-_SEGMENT_PATTERN = r"(?:[a-z0-9]+(?:-[a-z0-9]+)*)"
-_DOMAIN_PATTERN = rf"{_SEGMENT_PATTERN}(?:/{_SEGMENT_PATTERN})*"
-_ANCHOR_RE = re.compile(rf"^({_DOMAIN_PATTERN})#([a-z0-9._:-]+)$")
-
 def is_valid_anchor(anchor: str) -> bool:
-    """Return True iff *anchor* matches '<domain>#<id>' (lowercase)."""
-    return bool(_ANCHOR_RE.match(anchor or ""))
+    """Thin wrapper around canonical validator in core_models.ontology."""
+    return _is_valid_anchor(anchor)
 
 def is_anchor(anchor: str) -> bool:
     """Alias preferred by services."""
     return is_valid_anchor(anchor)
 
 def parse_anchor(anchor: str) -> Tuple[str, str]:
-    """
-    Parse '<domain>#<id>' into (domain, id) or raise ValueError with an
-    actionable message (fail-closed; no silent coercions).  :contentReference[oaicite:4]{index=4}
-    """
-    m = _ANCHOR_RE.match(anchor or "")
-    if not m:
-        raise ValueError(
-            f"invalid anchor format: '{anchor}' — expected '<domain>#<id>' (lowercase)"
-        )
-    return m.group(1), m.group(2)
+    """Delegate to the canonical parser in core_models.ontology."""
+    return _parse_anchor(anchor)
+
+def make_anchor(domain: str, node_id: str) -> str:
+    """Delegate to the canonical constructor in core_models.ontology."""
+    return _make_anchor(domain, node_id)
 
 def anchor_to_storage_key(anchor: str) -> str:
     """
@@ -122,5 +124,12 @@ def storage_key_to_anchor(key: str) -> str:
         return key
     return key[:us] + "#" + key[us+1:]
 
-__all__ = ["normalise_domain", "is_valid_anchor", "is_anchor", "parse_anchor",
-           "anchor_to_storage_key", "storage_key_to_anchor"]
+__all__ = [
+    # domain
+    "normalise_domain",
+    # canonical anchor API/regexes (re-exported single source of truth)
+    "ID_RE", "DOMAIN_RE", "ANCHOR_RE",
+    "is_valid_anchor", "is_anchor", "parse_anchor", "make_anchor",
+    # wire<->storage helpers
+    "anchor_to_storage_key", "storage_key_to_anchor",
+]

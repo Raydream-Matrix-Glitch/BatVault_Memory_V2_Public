@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import { enrichBatch, canonicalizeAllowedIds } from "../utils/memory";
+import { currentRequestId } from "../traceGlobals";
 import type { EnrichedNode } from "../types/memory";
 import { normalizeErrorMessage } from "../utils/errors";
 import { logEvent } from "../utils/logger";
@@ -36,7 +37,12 @@ export function useEnrichedCatalog() {
     }
     setState({ loading: true, error: null, itemsById: null });
     try {
-      const res = await enrichBatch(anchorId, snapshotEtag, ids);
+      const res = await enrichBatch({
+        snapshotEtag,
+        body: { anchor_id: anchorId, ids },
+        requestId: currentRequestId(),
+        reuseLastIdempotencyKey: true
+      });
       const byId = res.items || {};
       cacheRef.current.set(cacheKey, { byId, ts: Date.now() });
       setState({ loading: false, error: null, itemsById: byId });

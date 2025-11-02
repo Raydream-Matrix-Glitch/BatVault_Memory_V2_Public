@@ -2,8 +2,7 @@ import React, { useEffect, useState } from "react";
 import Input from "./ui/Input";
 import Button from "./ui/Button";
 import { logEvent } from "../../utils/logger";
-
-import { Role, ROLES, DEFAULT_ROLE } from "../../utils/roles";
+import { ROLES, DEFAULT_ROLE, type Role } from "../../utils/roles";
 
 export interface QueryPanelProps {
   /** Called when the user submits a decision reference (anchor) to trace */
@@ -23,7 +22,12 @@ export default function QueryPanel(props: QueryPanelProps) {
     const w = window as any;
     w.BV_ACTIVE_ROLE = role;
     w.BV_USER_ID = w.BV_USER_ID || "demo-user";
-    w.BV_POLICY_VERSION = w.BV_POLICY_VERSION || "v3-demo";
+    w.BV_POLICY_VERSION = w.BV_POLICY_VERSION || "v3";
+    // Align sensitivity ceiling with role unless overridden
+    if (!w.BV_SENSITIVITY_CEILING) {
+      const map: Record<string,string> = { analyst: "low", manager: "medium", ceo: "high" };
+      w.BV_SENSITIVITY_CEILING = map[String(role).toLowerCase()] || "low";
+    }
     // Do NOT force a fake policy key. If ops inject one at runtime, keep it.
     if (!w.BV_POLICY_KEY && (import.meta as any).env?.VITE_POLICY_KEY) {
       w.BV_POLICY_KEY = (import.meta as any).env.VITE_POLICY_KEY;

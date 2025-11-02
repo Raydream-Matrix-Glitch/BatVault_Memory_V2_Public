@@ -1,11 +1,8 @@
 from __future__ import annotations
-from typing import Dict, Any, Iterable, List, Tuple
-from core_utils.domain import parse_anchor
+from typing import Dict, Any, Iterable, List, Tuple, get_args
+from core_models.ontology import parse_anchor
 from core_utils.ids import slugify_tag
-
-
-NODE_TYPES = {"DECISION", "EVENT"}
-EDGE_TYPES = {"LED_TO", "CAUSAL", "ALIAS_OF"}
+from core_models.ontology import EDGE_TYPES, NodeType
 
 def _upper_token(value: str) -> str:
     return (value or "").upper()
@@ -20,9 +17,9 @@ def normalize_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for n in nodes:
         n2 = dict(n)
         n2["type"] = _upper_token(n.get("type"))
-        if n2["type"] not in NODE_TYPES:
+        if n2["type"] not in get_args(NodeType):
             raise ValueError(f"unknown node type: {n.get('type')!r} "
-                             f"(accepted: {sorted(NODE_TYPES)})")
+                             f"(accepted: {sorted(get_args(NodeType))})")
         # domain/id must already be canonical (lowercase); we do not auto-fix
         domain = n.get("domain")
         nid = n.get("id")

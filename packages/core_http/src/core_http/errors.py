@@ -7,6 +7,31 @@ from core_logging import get_logger, log_stage
 from core_utils.ids import compute_request_id, generate_request_id
 from core_utils import jsonx
 from core_logging.error_codes import ErrorCode  # reuse codes; do not duplicate
+from fastapi import HTTPException as FastAPIHTTPException
+
+def raise_http_error(
+    status_code: int,
+    code: ErrorCode,
+    message: str,
+    request_id: str,
+    *,
+    details: object | None = None,
+) -> FastAPIHTTPException:
+    """
+    Construct a FastAPI HTTPException with the canonical error envelope.
+    attach_standard_error_handlers() will pass this JSON through unchanged.
+    """
+    payload = {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+        },
+        "request_id": request_id,
+    }
+    if details is not None:
+        payload["error"]["details"] = jsonx.sanitize(details)
+    return FastAPIHTTPException(status_code=status_code, detail=payload)
 
 def attach_standard_error_handlers(app: FastAPI, *, service: str) -> None:
     """
@@ -48,7 +73,7 @@ def attach_standard_error_handlers(app: FastAPI, *, service: str) -> None:
             status_code=422,
             content={
                 "error": {
-                    "code": ErrorCode.VALIDATION_FAILED,
+                    "code": ErrorCode.validation_failed,
                     "message": "Request validation failed",
                     "details": {"errors": jsonx.sanitize(exc.errors())},
                     "request_id": req_id,
@@ -92,7 +117,7 @@ def attach_standard_error_handlers(app: FastAPI, *, service: str) -> None:
             status_code=500,
             content={
                 "error": {
-                    "code": ErrorCode.INTERNAL,
+                    "code": ErrorCode.internal,
                     "message": "Unexpected error",
                     "details": jsonx.sanitize({"type": exc.__class__.__name__, "message": str(exc)}),
                     "request_id": req_id,

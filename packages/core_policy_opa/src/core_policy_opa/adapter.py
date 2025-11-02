@@ -3,12 +3,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import time
 from urllib.parse import urlsplit
-import hashlib
 import httpx
 from core_config import get_settings
 from core_utils.jsonx import dumps as canonical_dumps
 from core_logging import get_logger, log_stage, record_error, current_request_id
 from core_observability.otel import inject_trace_context
+from core_utils.identity import build_opa_input
 
 logger = get_logger("core_policy_opa")
 
@@ -18,6 +18,7 @@ class OPADecision:
     extra_visible: List[str]
     denied_status: Optional[int]
     policy_fp: str
+    explain: Optional[Dict[str, Any]] = None
     engine: str = "opa"
 
 def _opa_enabled() -> bool:
@@ -30,30 +31,13 @@ def _build_url() -> str:
     path = (s.opa_decision_path or "/v1/data/batvault/decision").lstrip("/")
     return f"{base}/{path}"
 
-def _derive_policy_fp(decision: Dict[str, Any]) -> str:
-    # Prefer engine-provided fingerprint; else bundle SHA; else canonical decision hash.
-    s = get_settings()
-    fp = (
-        str(decision.get("policy_fingerprint") or "")
-        or str(getattr(s, "opa_bundle_sha", "") or "")
-    )
-    if fp:
-        if not fp.startswith("sha256:"):
-            return "sha256:" + fp  # normalize
-        return fp
-    payload = {
-        "allowed_ids": decision.get("allowed_ids", []),
-        "extra_visible": decision.get("extra_visible", []),
-        "ruleset": decision.get("ruleset"),
-    }
-    return "sha256:" + hashlib.sha256(canonical_dumps(payload).encode("utf-8")).hexdigest()
-
 def opa_decide_if_enabled(
     *,
     anchor_id: str,
     edges: List[Dict[str, Any]],
     headers: Dict[str, str],
     snapshot_etag: str,
+    intents: Optional[List[str]] = None,
 ) -> Optional[OPADecision]:
     """
     Call OPA when configured, else return None (explicit fallback).
@@ -66,12 +50,13 @@ def opa_decide_if_enabled(
         return None
 
     url = _build_url()
-    input_obj = {
-        "anchor_id": anchor_id,
-        "edges": edges,
-        "headers": headers,
-        "snapshot_etag": snapshot_etag,
-    }
+    input_obj = build_opa_input(
+        anchor_id=anchor_id,
+        edges=edges,
+        headers=headers,
+        snapshot_etag=snapshot_etag,
+        intents=intents,
+    )
     # Sync client (Memory path is sync at this point); bounded timeout from settings.
     s = get_settings()
     timeout = max(0.1, float(getattr(s, "opa_timeout_ms", 1000)) / 1000.0)
@@ -91,16 +76,20 @@ def opa_decide_if_enabled(
             traceparent=_tp_redacted, request_id=rid
         )
         t0 = time.perf_counter()
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(url, json={"input": input_obj}, headers=req_headers)
+        from core_http.client import fetch_json_sync
+        body = fetch_json_sync(
+            "POST", url,
+            headers=req_headers,
+            json={"input": input_obj},
+            timeout_ms=int(timeout*1000),
+        )
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        resp.raise_for_status()
         log_stage(
             logger, "http.client", "http.client.response", op="opa",
             http={
                 "method": "POST",
                 "target": urlsplit(url).path or "/",
-                "status_code": resp.status_code,
+                "status_code": 200,
             },
             latency_ms=int(dt_ms), request_id=rid
         )
@@ -114,20 +103,10 @@ def opa_decide_if_enabled(
             context={"error": str(exc), "url": url, "timeout_s": timeout},
         )
         return None
-
-    try:
-        body = resp.json()
-    except ValueError as exc:
-        record_error(
-            "OPA.ERROR",
-            where="memory_api#opa_decide",
-            message="OPA response parse error",
-            logger=logger,
-            context={"error": str(exc)},
-        )
-        return None
+    
     result = (body.get("result", body) or {}) if isinstance(body, dict) else {}
     raw_ids = list(result.get("allowed_ids") or [])
+    explain = result.get("explain") if isinstance(result, dict) else None
     # Deterministic dedupe; keep order stable then lex-sort
     seen, ordered = set(), []
     for x in raw_ids:
@@ -136,7 +115,10 @@ def opa_decide_if_enabled(
     allowed_ids   = sorted(ordered)
     extra_visible = list(result.get("extra_visible") or [])
     denied_status = result.get("denied_status")
-    policy_fp     = _derive_policy_fp(result)
+    policy_fp     = str(result.get("policy_fp") or "")
+    if not policy_fp:
+        record_error("OPA.ERROR", where="memory_api#opa_decide", message="missing policy_fp in OPA decision", logger=logger)
+        return OPADecision(allowed_ids=[], extra_visible=[], denied_status=403, policy_fp="sha256:invalid", explain=explain)
     # Emit a single normalized decision line; no duplicate raw logger calls.
     rid = current_request_id()
     if allowed_ids:
@@ -163,4 +145,5 @@ def opa_decide_if_enabled(
         extra_visible=extra_visible,
         denied_status=denied_status,
         policy_fp=policy_fp,
+        explain=explain,
     )

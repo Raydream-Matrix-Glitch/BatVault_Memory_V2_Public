@@ -1,30 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
-import { useSSE } from "./useSSE";
-import { publishTraceIds, queryEndpoint, isAnchor } from "../traceGlobals";
-import { buildPolicyHeaders } from "../utils/policy";
-
-/** Heuristic: extract a computed fingerprint from an error string (JSON payload embedded). */
-function parsePolicyMismatchFingerprint(errText: string): string | null {
-  if (!errText) return null;
-  // Try to locate a JSON object in the string
-  const idx = errText.indexOf("{");
-  if (idx >= 0) {
-    const tail = errText.slice(idx);
-    try {
-      const obj = JSON.parse(tail);
-      // common shapes: { error:"policy_key_mismatch", computed:"sha256:..." } or with meta.computed
-      const code = String(obj.error || obj.code || obj.detail || "").toLowerCase();
-      if (code.includes("policy_key_mismatch")) {
-        return obj.computed || obj?.meta?.computed || obj?.policy?.computed || null;
-      }
-    } catch {
-      // ignore JSON parse errors; fall through to regex
-    }
-  }
-  // Fallback regex: look for sha256:... pattern
-  const m = /sha256:[0-9a-f]{64}/i.exec(errText);
-  return m ? m[0] : null;
-}
+import { useCallback, useMemo, useEffect } from "react";
+import { useQueryDecision } from "../sdk/react/useQueryDecision";
+import { isAnchor } from "../traceGlobals";
 
 /** Convert streamed event payloads into displayable tokens (strings). */
 function toToken(ev: any): string {
@@ -32,87 +8,105 @@ function toToken(ev: any): string {
   if (typeof ev?.token === "string") return ev.token;
   if (typeof ev?.delta === "string") return ev.delta;
   if (Array.isArray(ev?.tokens)) return ev.tokens.join("");
-  try {
-    return JSON.stringify(ev);
-  } catch {
-    return String(ev);
-  }
+  try { return JSON.stringify(ev); } catch { return String(ev); }
 }
 
 export function useMemoryAPI() {
-  const { start, cancel, events, isStreaming, error, finalData } = useSSE<any>();
+  // Centralized streaming (idempotency, snapshot preconditions, policy-mismatch retry)
+  const { state, queryDecision: _query, abort } = useQueryDecision({
+    reconnectOnPolicyMismatch: true,
+  });
 
-  // Keep the last request so we can retry once if the backend hands us a new fingerprint.
-  const lastReqRef = useRef<{ endpoint: string; body: Record<string, unknown> } | null>(null);
-  const retriedForReqId = useRef<string | null>(null);
+  const tokens = useMemo(() => (state.tokens || []).map(toToken), [state.tokens]);
 
-  const tokens = useMemo(() => (events || []).map(toToken), [events]);
+  // v3: Gateway may wrap the payload as { response: {...}, schema_version: "v3" }
+  // Older builds returned fields at top-level. Normalize here so all UI reads the same shape.
+  const finalNormalized = useMemo(() => {
+    const f: any = state.final;
+    if (!f) return null;
+    const base = (f.response && typeof f.response === "object")
+      ? f.response
+      : (f.bundle && f.bundle.response)
+        ? f.bundle.response // bundle verify view
+        : f;
 
-  const queryDecision = useCallback(async (input: string) => {
-    const endpoint = queryEndpoint();
-    const text = (input || "").trim();
-    // Anchored vs. unanchored is decided by the canonical schema.
-    const body = isAnchor(text)
-      ? { question: "Why this decision?", anchor: text }
-      : { question: text };
-    lastReqRef.current = { endpoint, body };
-    retriedForReqId.current = null; // reset retry guard for this request
-    await start(endpoint, body, buildPolicyHeaders());
-  }, [start]);
+    // Merge fingerprint/correlation headers into meta iff missing in body
+    try {
+      const headers: any = (state as any)?.headers;
+      const getHeader = (k: string): string | undefined => {
+        if (!headers) return undefined;
+        // Support both Fetch Headers and plain objects
+        if (typeof headers.get === "function") {
+          return headers.get(k) || headers.get(k.toLowerCase()) || undefined;
+        }
+        const low = k.toLowerCase();
+        for (const [hk, hv] of Object.entries(headers)) {
+          if (String(hk).toLowerCase() === low) return String(hv);
+        }
+        return undefined;
+      };
 
-  // Publish trace IDs for the drawer/debugger when the final bundle arrives
-  useEffect(() => {
-    if (!finalData?.meta) return;
-    publishTraceIds({
-      request_id: finalData?.meta?.request_id,
-      snapshot_etag: finalData?.meta?.snapshot_etag,
-      policy_fp: finalData?.meta?.policy_fp,
-      allowed_ids_fp: finalData?.meta?.allowed_ids_fp,
-      graph_fp: finalData?.meta?.fingerprints?.graph_fp,
-      bundle_fp: finalData?.meta?.bundle_fp,
-    });
-  }, [finalData]);
-
-  // Auto-adopt the backend's policy fingerprint exactly once per request ID.
-  useEffect(() => {
-    if (!error) return;
-    const last = lastReqRef.current;
-    if (!last) return;
-    const retryKey = JSON.stringify(last);
-    if (retriedForReqId.current === retryKey) return;
-
-    const fp = parsePolicyMismatchFingerprint(String(error));
-    if (fp) {
-      (window as any).BV_POLICY_KEY = fp; // cache at runtime only
-      retriedForReqId.current = retryKey;
-      // retry quickly with the learned fingerprint
-      start(last.endpoint, last.body, buildPolicyHeaders());
+      const meta = { ...(base?.meta || {}) };
+      const candidates: Record<string, string | undefined> = {
+        request_id:       getHeader("x-request-id"),
+        snapshot_etag:    getHeader("x-snapshot-etag") || getHeader("x-response-snapshot-etag"),
+        policy_fp:        getHeader("x-bv-policy-fingerprint"),
+        allowed_ids_fp:   getHeader("x-bv-allowed-ids-fp"),
+        graph_fp:         getHeader("x-bv-graph-fp"),
+        schema_fp:        getHeader("x-bv-schema-fp"),
+        bundle_fp:        getHeader("x-bv-bundle-fp"),
+      };
+      for (const [k, v] of Object.entries(candidates)) {
+        if (v && (meta[k] === undefined || meta[k] === null || meta[k] === "")) {
+          (meta as any)[k] = v;
+        }
+      }
+      return { ...base, meta };
+    } catch {
+      return base;
     }
-  }, [error, start]);
+  }, [state.final]);
 
-  // Publish trace IDs for the drawers once final bundle arrives.
+  // Adopt server policy_fp from the final JSON (headers are already adopted in useQueryDecision)
   useEffect(() => {
-    if (!finalData?.meta) return;
-    publishTraceIds({
-      request_id: finalData?.meta?.request_id,
-      snapshot_etag: finalData?.meta?.snapshot_etag,
-      policy_fp: finalData?.meta?.policy_fp,
-      allowed_ids_fp: finalData?.meta?.allowed_ids_fp,
-      graph_fp: finalData?.meta?.fingerprints?.graph_fp,
-      bundle_fp: finalData?.meta?.bundle_fp,
-    });
-  }, [finalData]);
+    try {
+      const meta = (finalNormalized as any)?.meta || null;
+      const pfp = meta?.policy_fp;
+      if (pfp && (window as any).BV_POLICY_KEY !== pfp) {
+        (window as any).BV_POLICY_KEY = pfp;
+      }
+    } catch { /* ignore */ }
+  }, [finalNormalized]);
 
-  // Reserved for later enrichment path; returned to keep API stable.
-  const topic: { query: string; hits: string[] } | null = null;
+  // Also adopt server policy_fp from the final payload (works for non-stream JSON as well)
+  useEffect(() => {
+    try {
+      const meta = (state?.final as any)?.meta || (state?.final as any)?.response?.meta || null;
+      const pfp = meta?.policy_fp;
+      if (pfp && (window as any).BV_POLICY_KEY !== pfp) {
+        (window as any).BV_POLICY_KEY = pfp;
+      }
+    } catch { /* ignore */ }
+  }, [state?.final]);
 
+  const queryDecision = useCallback(
+    async (input: string) => {
+      const text = (input || "").trim();
+      const body = isAnchor(text)
+        ? { question: "Why this decision?", anchor: text }
+        : { question: text };
+      await _query(body);
+    },
+    [_query]
+  );
+
+  const finalPayload = (state?.final as any)?.response ?? (state?.final as any);
   return {
     queryDecision,
-    isStreaming,
-    error,
-    finalData,
-    cancel,
+    isStreaming: state.isStreaming,
+    error: state.error,
+    finalData: finalNormalized as any,
+    cancel: abort,
     tokens,
-    topic,
   };
 }

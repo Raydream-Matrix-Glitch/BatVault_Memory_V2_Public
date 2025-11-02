@@ -1,14 +1,34 @@
 from __future__ import annotations
 
 from typing import List, Dict, Tuple, Set
-from collections import deque
 from core_storage import ArangoStore
 from core_logging import get_logger, log_stage, trace_span
-from core_models.ontology import edge_id, make_anchor
-from core_utils.domain import parse_anchor
+from core_models.ontology import edge_id, make_anchor, CAUSAL_EDGE_TYPES, ALIAS_EDGE_TYPES, canonical_edge_type
+from core_models.ontology import parse_anchor
 from core_validator import validate_node, validate_edge
 
 logger = get_logger("ingest.upsert")
+
+def compute_expected_edges(nodes: List[dict], edges: List[dict], *, snapshot_etag: str | None = None) -> List[dict]:
+    """
+    Pure/deterministic: mirror the alias-build + policy/enforcement + id recompute
+    so CLI can plan pruning without writing or relaxing schemas.
+    """
+    alias_edges, _ = _build_alias_edges(nodes)
+    nodes_by_anchor = _index_nodes(nodes, snapshot_etag=snapshot_etag)
+    planned: List[dict] = []
+    for e in list(edges) + alias_edges:
+        kind, frm, to = e.get("type"), e.get("from"), e.get("to")
+        if not (kind and frm and to):
+            raise ValueError("edge missing required fields")
+        _enforce_edge_domain_policy(e, nodes_by_anchor)
+        _validate_edge_endpoints_exist(e, nodes_by_anchor)
+        planned.append(_recompute_edge_id(dict(e)))
+    log_stage(
+        logger, "ingest", "prune_plan_edges",
+        snapshot_etag=snapshot_etag, planned=len(planned)
+    )
+    return planned
 
 def _validate_edge_endpoints_exist(edge: dict, nodes_by_anchor: Dict[str, dict]) -> None:
     """
@@ -34,13 +54,13 @@ def _enforce_edge_domain_policy(e: dict, nodes_by_anchor: Dict[str, dict]) -> No
     """LED_TO/CAUSAL must be same-domain; ALIAS_OF may cross domain.
     For ALIAS_OF, if edge.domain is present it MUST equal the alias event's domain (the 'from' node).
     """
-    t = e.get("type")
-    if t in ("LED_TO","CAUSAL"):
+    t = canonical_edge_type(e.get("type"))
+    if t in CAUSAL_EDGE_TYPES:
         frm, to = e.get("from"), e.get("to")
         nf, nt = nodes_by_anchor.get(frm), nodes_by_anchor.get(to)
         if nf and nt and nf.get("domain") != nt.get("domain"):
             raise ValueError(f"edge {t} must connect same-domain nodes: {frm} -> {to}")
-    elif t == "ALIAS_OF":
+    elif t in ALIAS_EDGE_TYPES:
         dom = e.get("domain")
         if dom:
             ev = nodes_by_anchor.get(e.get("from") or "") or {}
@@ -125,13 +145,13 @@ def _inherit_sensitivity(
     # Map each EVENT anchor → connected DECISION anchors (both causal and alias)
     decisions_by_event: Dict[str, Set[str]] = {}
     for e in edges or []:
-        t, frm, to = (e or {}).get("type"), (e or {}).get("from"), (e or {}).get("to")
-        if t in ("LED_TO", "CAUSAL"):
+        t, frm, to = canonical_edge_type((e or {}).get("type")), (e or {}).get("from"), (e or {}).get("to")
+        if t in CAUSAL_EDGE_TYPES:
             if (by_anchor.get(frm, {}).get("type") == "EVENT") and (by_anchor.get(to, {}).get("type") == "DECISION"):
                 decisions_by_event.setdefault(frm, set()).add(to)
             if (by_anchor.get(to, {}).get("type") == "EVENT") and (by_anchor.get(frm, {}).get("type") == "DECISION"):
                 decisions_by_event.setdefault(to, set()).add(frm)
-        elif t == "ALIAS_OF":
+        elif t in ALIAS_EDGE_TYPES:
             # alias EVENT (from) → home DECISION (to)
             decisions_by_event.setdefault(frm, set()).add(to)
     # Policy ordering (typed settings first; env fallback). Higher index == more restrictive.
@@ -218,7 +238,9 @@ def upsert_pipeline(store: ArangoStore, nodes: List[dict], edges: List[dict], *,
     node_errors: List[Dict[str,str]] = []
     valid_nodes: List[dict] = []
     for n in updated_nodes:
-        ok, errs = validate_node(n)
+        # core_validator v3 expects validate_node(kind, payload); kind matches schema filename
+        _kind = (n.get("type") or "").lower()  # "decision" | "event"
+        ok, errs = validate_node(_kind, n)
         if ok:
             valid_nodes.append(n)
         else:
@@ -226,7 +248,10 @@ def upsert_pipeline(store: ArangoStore, nodes: List[dict], edges: List[dict], *,
     edge_errors: List[Dict[str,str]] = []
     valid_edges: List[dict] = []
     for e in all_edges:
-        ok, errs = validate_edge(e)
+        # v3 contract: validate *wire* shape (no 'id'); we still persist the stored shape.
+        e_wire = {k: v for k, v in e.items() if k != "id"}
+        ok, errs = validate_edge(e_wire)
+        log_stage(logger, "ingest", "edge_validation_shape", shape="wire", has_id=("id" in e))
         if ok:
             valid_edges.append(e)
         else:
@@ -264,4 +289,56 @@ def upsert_pipeline(store: ArangoStore, nodes: List[dict], edges: List[dict], *,
                   + [e.get("doc_id") for e in (summ_edges.get("errors") or [])[:5]],
         sensitivity_inherited=applied,
     )
-    return {"nodes": summ_nodes, "edges": summ_edges, "alias_rejected": alias_rejected, "sensitivity_applied": applied}
+
+    # 5.5) Safety: only allow pruning if the upsert succeeded without write errors/rejections.
+    _node_errs = len(summ_nodes.get("errors") or [])
+    _edge_errs = len(summ_edges.get("errors") or [])
+    _node_rej  = int(summ_nodes.get("rejected") or 0)
+    _edge_rej  = int(summ_edges.get("rejected") or 0)
+    if (_node_errs or _edge_errs or _node_rej or _edge_rej):
+        log_stage(
+            logger, "ingest", "upsert_incomplete",
+            snapshot_etag=snapshot_etag,
+            node_errors=_node_errs, edge_errors=_edge_errs,
+            nodes_rejected=_node_rej, edges_rejected=_edge_rej,
+        )
+        # Fail-closed: do not prune or persist a snapshot on incomplete writes.
+        raise RuntimeError("upsert_incomplete: aborting prune & snapshot persist")
+
+    # 6) Snapshot discipline: prune deterministically, then persist the SoT etag to meta.
+    if snapshot_etag:
+        incoming_anchors = [make_anchor(n["domain"], n["id"]) for n in valid_nodes]
+        incoming_edge_ids = [e["id"] for e in valid_edges]
+        log_stage(
+            logger, "ingest", "prune_start",
+            snapshot_etag=snapshot_etag, anchors=len(incoming_anchors), edges=len(incoming_edge_ids),
+        )
+        store.prune_to_current_snapshot(incoming_anchors, incoming_edge_ids)
+        log_stage(
+            logger, "ingest", "prune_done",
+            snapshot_etag=snapshot_etag, anchors=len(incoming_anchors), edges=len(incoming_edge_ids),
+        )
+        store.set_snapshot_etag(snapshot_etag)
+        log_stage(logger, "ingest", "snapshot_persisted", snapshot_etag=snapshot_etag)
+
+    # 7) Seed/ingest one-line summary (snapshot-bound, deterministic fields)
+    log_stage(
+        logger, "ingest", "seed_memory",
+        snapshot_etag=snapshot_etag,
+        nodes_in=len(valid_nodes),
+        nodes_written=summ_nodes.get("written", 0),
+        nodes_rejected=summ_nodes.get("rejected", 0),
+        edges_in=len(valid_edges),
+        edges_written=summ_edges.get("written", 0),
+        edges_rejected=summ_edges.get("rejected", 0),
+        alias_rejected=len(alias_rejected),
+        sensitivity_inherited=applied,
+        sample_node_error=(None if not summ_nodes.get("errors") else (summ_nodes["errors"][0] if summ_nodes["errors"] else None)),
+        sample_edge_error=(None if not summ_edges.get("errors") else (summ_edges["errors"][0] if summ_edges["errors"] else None)),
+    )
+    return {
+        "nodes": summ_nodes,
+        "edges": summ_edges,
+        "alias_rejected": alias_rejected,
+        "sensitivity_applied": applied,
+    }

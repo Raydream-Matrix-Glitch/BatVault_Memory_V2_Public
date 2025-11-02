@@ -14,17 +14,9 @@
       "type": "string",
       "enum": ["LED_TO", "CAUSAL", "ALIAS_OF"]
     },
-    "from": { "type": "string",
-      "pattern": "^([a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*)#[a-z0-9._:-]+$"
-    },
-    "to":   { "type": "string",
-      "pattern": "^([a-z0-9]+(?:-[a-z0-9]+)*(?:/[a-z0-9]+(?:-[a-z0-9]+)*)*)#[a-z0-9._:-]+$"
-    },
-    "domain": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128
-    },
+    "from": { "$ref": "./anchor.json" },
+    "to": { "$ref": "./anchor.json" },
+    "domain": { "$ref": "./domain.json" },
     "timestamp": {
       "type": "string",
       "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"

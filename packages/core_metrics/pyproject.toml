@@ -5,9 +5,14 @@ version = "0.1.0"
 description = "Lightweight metrics helpers wrapping OpenTelemetry"
 requires-python = ">=3.11"
 dependencies = [
+  "fastapi>=0.112.0",
   "opentelemetry-api>=1.24",
-  "opentelemetry-sdk>=1.24",
   "prometheus-client>=0.19.0",
+]
+
+[project.optional-dependencies]
+otel = [
+  "opentelemetry-sdk>=1.24",
 ]
 
 [build-system]

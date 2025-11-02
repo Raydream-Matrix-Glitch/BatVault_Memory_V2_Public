@@ -1,6 +1,6 @@
 import base64, hashlib, orjson, re, unicodedata, uuid
 from typing import Any, Optional, Union, Dict
-import hashlib as _hashlib
+from core_utils.fingerprints import sha256_hex
 from urllib.parse import parse_qsl
 try:
     from core_logging import get_logger, log_stage, current_request_id  # type: ignore
@@ -14,8 +14,40 @@ def compute_request_id(
     body: Union[bytes, bytearray, memoryview, str, Any],
 ) -> str:
     """
-    Deterministic 16-hex request id for a given path+query+body.
-    Used for idempotency and audit drawer replay.
+    Deterministic 16-hex request id from (path, query, body).
+    Used for idempotency and replay correlation.
+
+    Canonicalisation rules
+    ----------------------
+    Query:
+      • Accepts dict-like, raw query string, list/tuple of pairs, or bytes.
+      • Repeated keys are preserved (do **not** collapse to last value).
+      • Canonical form is a **sorted** list of (key, value) pairs rendered as
+        "k=v" joined by "&". Blank values are kept.
+      • Raw strings beginning with "{" or "[" are parsed as JSON and re-dumped
+        with sorted keys. The exact string "{}" is treated as empty.
+      • Bytes are decoded as UTF-8 (replace) and then treated like strings; if
+        they look like k=v query they are parsed with `keep_blank_values=True`.
+
+    Body:
+      • Accepts dict-like, string, bytes/bytearray/memoryview, or other objects.
+      • JSON-like inputs (string/bytes starting with "{" or "[") are parsed and
+        re-dumped using sorted keys (deterministic). The exact string "{}" is
+        treated as empty.
+      • Non-JSON bytes are base64-encoded and **prefixed with "b64:"** to avoid
+        collisions with plain text that happens to be valid base64.
+      • Other objects are serialised via `orjson.dumps(..., OPT_SORT_KEYS)`; if
+        that fails (e.g. TypeError), `str(obj)` is used.
+
+    Equivalence:
+      • `{}` (empty JSON) ≡ empty string for both query and body so `None` and
+        `{}` hash identically where desired.
+
+    Notes:
+      • Avoid `dict(request.query_params)`: it collapses duplicates. Pass the
+        raw query string or `.multi_items()` to preserve repeats.
+      • The output is stable across processes and only the **first 16 hex** of
+        SHA-256 is used for readability.
     """
     # ---- query canonicalisation with multi-value support -------------------
     def _canon_qs_from_items(items) -> str:
@@ -104,7 +136,7 @@ def compute_request_id(
                 size=len(bs), reason="non_json_or_decode_error",
                 request_id=(current_request_id() or "startup"),
             )
-        return base64.b64encode(bs).decode()
+        return "b64:" + base64.b64encode(bs).decode()
 
     if body is None:
         b = ""
@@ -161,8 +193,10 @@ def slugify_tag(s: str) -> str:
         raise ValueError(f"invalid tag: {s!r}")
     return s
 
+def stable_hex_id(value: str, length: int = 8) -> str:
+    """Deterministic N-char hex id from the input value (sha1)."""
+    return sha256_hex(value)[:length]
+
 def stable_short_id(value: str) -> str:
     """Deterministic 8-char hex id from the input value (sha1)."""
-    if value is None:
-        value = ""
-    return _hashlib.sha1(str(value).encode()).hexdigest()[:8]
+    return stable_hex_id(value, length=8)

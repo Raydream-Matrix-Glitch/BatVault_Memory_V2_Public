@@ -150,5 +150,29 @@
       ],
       "options": { "legend": { "displayMode": "list" }, "exemplars": true }
     }
+    ,
+    {
+      "type": "timeseries",
+      "title": "Graph FP Mismatch Rate (%)",
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(gateway_graph_fp_mismatch_total[5m])) / clamp_min(sum(rate(gateway_graph_fp_mismatch_total[5m])) + sum(rate(gateway_graph_fp_verified_total[5m])), 1)",
+          "legendFormat": "mismatch % (5m)"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list" }, "exemplars": true }
+    },
+    {
+      "type": "timeseries",
+      "title": "Graph FP Events (/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "targets": [
+        { "expr": "sum(rate(gateway_graph_fp_verified_total[5m]))",  "legendFormat": "verified /s" },
+        { "expr": "sum(rate(gateway_graph_fp_mismatch_total[5m]))", "legendFormat": "mismatch /s" }
+      ],
+      "options": { "legend": { "displayMode": "table" }, "exemplars": true }
+    }
   ]
 }

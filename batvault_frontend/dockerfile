@@ -1,21 +1,47 @@
-# Build stage
+# syntax=docker/dockerfile:1.7
+
+########## Builder ##########
 FROM node:20-alpine AS builder
 WORKDIR /app
-COPY package.json package-lock.json ./
-## Ensure dev deps (vite) are installed even if NODE_ENV=production is injected
-RUN --mount=type=cache,target=/root/.npm npm ci --include=dev
-COPY . .
-## Defensive: some tarballs/SCMs lose +x on .bin symlinks → "vite: Permission denied"
-RUN chmod -R +x node_modules/.bin || true && chmod +x node_modules/vite/bin/vite.js || true
-## Structured build log (keeps with our JSON-first, auditable logs)
-RUN node -e 'const vite=require("./node_modules/vite/package.json");const pkg=require("./package.json");console.log(JSON.stringify({event:"frontend_build_env",node:process.version,npm:process.env.npm_config_user_agent||"",vite:vite.version,app:pkg.name,timestamp:new Date().toISOString()}))'
-## Call vite via node to bypass any leftover exec-bit/shell edge cases
-RUN node node_modules/vite/bin/vite.js build
 
-# Serve stage
-FROM nginx:stable-alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
-COPY ./nginx.conf /etc/nginx/conf.d/default.conf
+# (Optional) Vite build-time vars – Compose can pass these as build args
+ARG VITE_GATEWAY_BASE
+ARG VITE_MEMORY_BASE
+ENV VITE_GATEWAY_BASE=${VITE_GATEWAY_BASE}
+ENV VITE_MEMORY_BASE=${VITE_MEMORY_BASE}
+
+# Install deps for the frontend workspace (fast via cache mount)
+COPY batvault_frontend/package*.json ./batvault_frontend/
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefix ./batvault_frontend --include=dev
+
+# Bring in monorepo packages, build helper scripts, and app sources
+COPY packages ./packages
+COPY scripts  ./scripts
+COPY batvault_frontend ./batvault_frontend
+
+# Build from inside the frontend app (Vite expects index.html here)
+WORKDIR /app/batvault_frontend
+
+# Fail fast if required inputs are missing (helps avoid cryptic Vite errors)
+RUN test -f index.html
+RUN test -f ./scripts/gen_jsonschema_types.mjs
+RUN test -f ../scripts/gen_anchor_regex.mjs
+
+# Run the actual build (runs your prebuild scripts as defined in package.json)
+RUN npm run build
+
+
+########## Runtime ##########
+FROM nginx:stable-alpine AS runtime
+
+# Ship built assets
+COPY --from=builder /app/batvault_frontend/dist   /usr/share/nginx/html
+# Also ship static public assets (keys, favicon, robots, etc.)
+COPY --from=builder /app/batvault_frontend/public /usr/share/nginx/html
+
+# Nginx site config
+COPY --from=builder /app/batvault_frontend/nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off; error_log stderr warn;"]

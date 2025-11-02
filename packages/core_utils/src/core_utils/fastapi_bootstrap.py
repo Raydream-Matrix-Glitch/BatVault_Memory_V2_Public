@@ -14,6 +14,11 @@ Environment knobs (all optional):
 from __future__ import annotations
 import os, re
 from typing import Iterable, Optional
+try:
+    # starlette is already a direct dependency of FastAPI; no extra libs.
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware  # type: ignore
+except Exception:
+    ProxyHeadersMiddleware = None  # type: ignore
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 
@@ -76,6 +81,11 @@ def setup_service(
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    # Honor reverse-proxy headers (scheme/host/port) when enabled
+    if os.getenv("PROXY_HEADERS", "1").lower() in ("1", "true", "yes") and ProxyHeadersMiddleware:
+        # Trusted hosts are typically enforced by the frontend ingress; we accept all here.
+        app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     # Optional rate limiting
     rl = _parse_rate_limit(os.getenv(rate_limit_env))

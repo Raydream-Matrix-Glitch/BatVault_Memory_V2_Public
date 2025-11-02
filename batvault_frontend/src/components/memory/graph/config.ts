@@ -1,13 +1,19 @@
 // Centralized Cytoscape visual language for Memory graphs.
 // Extracted from GraphView.tsx to allow single-point control. :contentReference[oaicite:0]{index=0}
 
-// Shared color tokens
-export const DECISION_BORDER = "#ef4444";
-export const EVENT_BORDER    = "#39FF14";
+// Shared color tokens (muted palette to match design reference)
+export const DECISION_BORDER = "#fca5a5"; // red-300
+export const EVENT_BORDER    = "#86efac"; // green-300
 export const EDGE_COLOR      = "#94a3b8";
-export const EDGE_HOVER      = "#e2e8f0";
-export const EDGE_SELECTED   = "#e5e7eb";
-export const TEXT_OUTLINE    = "rgba(0,0,0,0.35)";
+export const EDGE_HOVER      = "#cbd5e1";
+export const EDGE_SELECTED   = "#cbd5e1";
+export const TEXT_OUTLINE    = "rgba(0,0,0,0.30)";
+
+// Relationship palette
+export const EDGE_CAUSAL     = "#93c5fd"; // blue-300
+export const EDGE_LED_TO     = "#e5e7eb"; // light gray
+export const EDGE_ALIAS_OF   = "#a78bfa"; // violet
+export const EDGE_CROSS      = "#fbbf24"; // amber-300
 
 export const GRAPH_STYLESHEET = [
   // Nodes — decision
@@ -15,8 +21,8 @@ export const GRAPH_STYLESHEET = [
     selector: "node[kind = 'decision']",
     style: {
       shape: "round-rectangle",
-      "background-opacity": 0,
-      "background-color": "transparent",
+      "background-opacity": 0.08,
+      "background-color": DECISION_BORDER,
       "border-width": 2,
       "border-color": DECISION_BORDER,
       label: "data(label)",
@@ -37,8 +43,8 @@ export const GRAPH_STYLESHEET = [
     selector: "node[kind = 'event']",
     style: {
       shape: "ellipse",
-      "background-opacity": 0,
-      "background-color": "transparent",
+      "background-opacity": 0.08,
+      "background-color": EVENT_BORDER,
       "border-width": 2,
       "border-color": EVENT_BORDER,
       label: "data(label)",
@@ -64,22 +70,47 @@ export const GRAPH_STYLESHEET = [
       "control-point-step-size": 40,
     },
   },
-  
+
+  // Per-relationship coloring
+  { selector: 'edge[label = "CAUSAL"]',
+    style: { "line-color": EDGE_CAUSAL, "target-arrow-color": EDGE_CAUSAL, "line-style": "solid" } },
+  { selector: 'edge[label = "LED_TO"]',
+    style: { "line-color": EDGE_LED_TO, "target-arrow-color": EDGE_LED_TO, "line-style": "solid" } },
+  { selector: 'edge[label = "ALIAS_OF"]',
+    style: { "line-color": EDGE_ALIAS_OF, "target-arrow-color": EDGE_ALIAS_OF, "line-style": "dotted" } },
+  // Cross-domain override (order matters: put this after type rules)
+  { selector: 'edge[cross = "true"]',
+    style: { "line-color": EDGE_CROSS, "target-arrow-color": EDGE_CROSS, width: 3 } },  
+
   // Nodes — domain (compound parent)
   {
     selector: "node[kind = 'domain']",
     style: {
       shape: "round-rectangle",
-      "background-opacity": 0.18,
-      "background-color": "data(domainColor)",
+      "background-opacity": 0.12,                 // translucent fill
+      "background-color": "data(domainColor)",    // color set per domain in GraphView
       "border-width": 1,
       "border-color": "data(domainColor)",
+      label: "data(label)",
+      "color": "#ffffff",
+      "font-size": 12,
+      "text-outline-color": "rgba(0,0,0,0.45)",
+      "text-outline-width": 2,
       "text-valign": "top",
       "text-halign": "left",
-      "font-size": 10,
-      "text-outline-width": 0,
+      "text-margin-x": 8,
+      "text-margin-y": 6,
       "padding": 24,
-      label: "data(label)",
+    },
+  },
+
+  // Emphasize the anchor
+  {
+    selector: "node[is_anchor = 'true']",
+    style: {
+      "background-blacken": -0.2,
+      "border-width": 3,
+      "text-outline-width": 2,
     },
   },
 
@@ -120,9 +151,11 @@ export const GRAPH_LAYOUT = {
   padding: 24,
   randomize: false,
   nodeDimensionsIncludeLabels: true,
-  idealEdgeLength: 160,
-  nodeRepulsion: 8000,
-  edgeElasticity: 0.2,
-  gravity: 0.25,
+  // More “spread out” defaults; the instance can still override these.
+  quality: "proof",
+  idealEdgeLength: 200,
+  nodeRepulsion: 12000,
+  edgeElasticity: 0.18,
+  gravity: 0.22,
   tile: true,
 };

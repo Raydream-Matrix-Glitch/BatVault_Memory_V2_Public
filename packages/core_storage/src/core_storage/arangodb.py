@@ -1,14 +1,16 @@
-import hashlib
 import socket
 from urllib.parse import urlparse
 import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
-
 import httpx  # retained for types; calls go through core_http
-from core_http import fetch_json_sync
-from core_models.ontology import NodeType, EdgeType
+try:
+    # Prefer the driver’s base exception when available to avoid blanket catches
+    from arango.exceptions import ArangoError  # type: ignore
+except Exception:  # pragma: no cover – driver may not be installed in all envs
+    class ArangoError(Exception):  # type: ignore
+        pass
 # Import OTEL context injector so all outgoing HTTP calls carry the current trace.
 try:
     from core_observability import inject_trace_context  # type: ignore
@@ -16,14 +18,20 @@ except Exception:
     inject_trace_context = None  # type: ignore
 from core_config import get_settings
 from core_logging import get_logger, log_stage, trace_span, current_request_id
-from core_config.constants import timeout_for_stage
+from core_config.constants import timeout_for_stage, TTL_EVIDENCE_CACHE_SEC
 import core_metrics
 from core_utils import jsonx
-from core_utils.domain import anchor_to_storage_key
+from core_utils.domain import make_anchor, anchor_to_storage_key
+from core_utils.fingerprints import canonical_json, sha256_hex
+from core_models.ontology import (
+    DOMAIN_RE,
+    ID_RE,
+    ANCHOR_RE,
+    EDGE_ID_RE,
+)
 
 
 logger = get_logger("core_storage")
-
 
 class ArangoStore:
     """Storage adapter for Batvault memory graph on ArangoDB.
@@ -114,18 +122,6 @@ class ArangoStore:
                 return
             logger.error("ArangoDB %s:%s unreachable – abort (non-DEV)", host, port)
             raise RuntimeError(f"ArangoDB {host}:{port} unreachable (non-DEV)")
-
-        # DNS resolves *and* port accepts connections – continue with normal
-        # driver initialisation.
-        try:
-            socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            if self._is_dev():
-                logger.warning("ArangoDB host '%s' not resolvable – stub-mode (DEV)", host)
-                self.db = self.graph = None
-                return
-            logger.error("ArangoDB host '%s' not resolvable – abort (non-DEV)", host)
-            raise RuntimeError(f"ArangoDB host '{host}' not resolvable (non-DEV)")
         try:
             from arango import ArangoClient
 
@@ -486,7 +482,8 @@ class ArangoStore:
         metric = str(getattr(cfg, "vector_metric", "cosine")).lower()
         ok_dim = dim > 0
         ok_metric = metric in {"cosine", "l2"}
-        fp = hashlib.sha1(f"{dim}|{metric}".encode()).hexdigest()[:12]
+        # Stable config fingerprint for audit logs
+        fp = sha256_hex(f"{dim}|{metric}")[:12]
         if not silent:
             log_stage(
             get_logger("memory_api"),
@@ -534,14 +531,20 @@ class ArangoStore:
                 "preceding_ids","adjacency","summary","snippet","rationale","option","reason","tags"
             }
             doc = {k: v for k, v in (d or {}).items() if k not in LEGACY_BLOCKLIST}
-            # On-wire ID is the ANCHOR "<domain>#<id>"; storage _key maps '#'→'_'
-            dom, nid = doc.get("domain"), doc.get("id")
-            if not dom or not nid:
-                raise ValueError(f"node missing domain/id for anchor key: {doc}")
-            anchor = f"{dom}#{nid}"
-            doc["_key"] = self._safe_key(anchor_to_storage_key(anchor))
-            if snapshot_etag:
-                doc["snapshot_etag"] = snapshot_etag
+            # _key MUST be the plain storage identifier (e.g., "d-eng-010"), not an anchor.
+            nid = doc.get("id")
+            if not isinstance(nid, str) or not nid:
+                raise ValueError(f"node missing storage id for _key: {doc}")
+            # Enforce required 'domain' on nodes (edges never carry domain; see below).
+            dom = doc.get("domain")
+            if not isinstance(dom, str) or not dom:
+                raise ValueError(f"node missing required 'domain': id={nid!r}")
+            if not DOMAIN_RE.match(dom):
+                raise ValueError(f"invalid domain format: {dom!r} for id={nid!r}")
+            # Optional: tighten id format to canonical regex to avoid garbage writes.
+            if not ID_RE.match(nid):
+                raise ValueError(f"invalid node id format: {nid!r}")
+            doc["_key"] = self._safe_key(nid)
             return doc
 
         batch_no = 0
@@ -556,7 +559,7 @@ class ArangoStore:
                     summary["written"] += int(created + updated)
                     summary["deduped"] += int(updated)
                     break
-                except Exception as exc:
+                except (ArangoError, httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                     attempt += 1
                     if attempt > max_retries:
                         log_stage(get_logger("storage"), "storage", "upsert_nodes_batch_failed",
@@ -567,7 +570,7 @@ class ArangoStore:
                             try:
                                 self.db.collection("nodes").insert(d, overwrite=True)
                                 n_ok += 1
-                            except Exception as doc_exc:
+                            except (ArangoError, httpx.HTTPError, OSError, RuntimeError, ValueError) as doc_exc:
                                 summary["rejected"] += 1
                                 summary["errors"].append({"doc_id": d.get("id"), "reason": str(doc_exc)})
                         summary["written"] += n_ok
@@ -600,20 +603,31 @@ class ArangoStore:
             Minimal transformation only:
             - preserve all incoming fields (validator/ingest are authoritative)
             - add Arango internals: _key, _from, _to
-            - add optional snapshot_etag
             """
             d = dict(e or {})
             _id, _f, _t = d.get("id"), d.get("from"), d.get("to")
-            if not _id or not _f or not _t or "#" not in _f or "#" not in _t:
+            if not _id or not _f or not _t:
                 raise ValueError(f"invalid edge (id/from/to) or anchor format: {d!r}")
+            # Validate anchors strictly (edges are NOT anchors; only endpoints are).
+            if not ANCHOR_RE.match(_f) or not ANCHOR_RE.match(_t):
+                raise ValueError(f"invalid anchor(s) on edge: from={_f!r} to={_t!r} id={_id!r}")
+            # Optional: enforce canonical edge id to avoid collisions/drift.
+            if not EDGE_ID_RE.match(str(_id)):
+                raise ValueError("invalid edge id format: {!r}".format(_id))
+
+            # Edges do not carry a 'domain'. If present, drop it (deterministic, logged).
+            if "domain" in d:
+                dropped = d.pop("domain", None)
+                log_stage(
+                    logger, "storage", "edge_domain_ignored",
+                    edge_id=_id, dropped=bool(dropped)
+                )
             d["_key"]  = self._safe_key(str(_id))
             d["_from"] = f"nodes/{self._safe_key(anchor_to_storage_key(_f))}"
             d["_to"]   = f"nodes/{self._safe_key(anchor_to_storage_key(_t))}"
             # Do not persist legacy from/to copies; Arango stores only _from/_to.
             for k in ("from","to"):
                 d.pop(k, None)
-            if snapshot_etag:
-                d["snapshot_etag"] = snapshot_etag
             return d
 
         batch_no = 0
@@ -628,7 +642,7 @@ class ArangoStore:
                     summary["written"] += int(created + updated)
                     summary["deduped"] += int(updated)
                     break
-                except Exception as exc:
+                except (ArangoError, httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                     attempt += 1
                     if attempt > max_retries:
                         log_stage(get_logger("storage"), "storage", "upsert_edges_batch_failed",
@@ -638,7 +652,7 @@ class ArangoStore:
                             try:
                                 self.db.collection("edges").insert(d, overwrite=True)
                                 n_ok += 1
-                            except Exception as doc_exc:
+                            except (ArangoError, httpx.HTTPError, OSError, RuntimeError, ValueError) as doc_exc:
                                 summary["rejected"] += 1
                                 summary["errors"].append({"doc_id": d.get("id"), "reason": str(doc_exc)})
                         summary["written"] += n_ok
@@ -654,7 +668,8 @@ class ArangoStore:
         try:
             self.ensure_core_indexes()
             self._core_indexes_ok = True
-        except Exception:
+        except (ArangoError, httpx.HTTPError, OSError, RuntimeError, ValueError):
+            # non-fatal; indexes may already exist or be created concurrently
             pass
 
     def ensure_core_indexes(self) -> None:
@@ -695,7 +710,7 @@ class ArangoStore:
         cleaned = self._ILLEGAL_CHARS.sub("_", raw)
         if len(cleaned.encode()) <= 254:
             return cleaned
-        digest = hashlib.sha1(cleaned.encode()).hexdigest()[:8]
+        digest = sha256_hex(cleaned)[:8]
         return f"{cleaned[:245]}_{digest}"
 
     def _cache_key(self, *parts: str) -> str:
@@ -795,54 +810,56 @@ class ArangoStore:
         doc = self.db.collection(self.meta_col).get("snapshot")
         return doc.get("etag") if doc else None
 
-    def prune_stale(self, snapshot_etag: str) -> Tuple[int, int]:
-        # Ensure a live connection (ArangoStore may have been created with lazy=True)
+    def prune_to_current_snapshot(self, anchors: List[str], edge_ids: List[str], *, request_id: str | None = None) -> Tuple[int, int, int]:
+        """
+        Remove any stored node/edge NOT present in the new snapshot.
+        Also strip legacy per-doc `snapshot_etag` fields (one-time cleanup).
+        Returns (nodes_removed, edges_removed, fields_cleaned).
+        """
         self._connect()
         if self.db is None or not hasattr(self.db, "aql"):
-            return 0, 0
-        nodes_removed = int(
-            next(
-                self.db.aql.execute(
-                    """
-                    RETURN LENGTH(
-                      FOR d IN nodes
-                        FILTER !HAS(d,'snapshot_etag') || d.snapshot_etag != @etag
-                        RETURN 1
-                    )""",
-                    bind_vars={"etag": snapshot_etag},
-                )
-            )
-        )
+            return 0, 0, 0
+        # 1) Prune nodes not in incoming anchors
+        aql_nodes_count = """
+          RETURN LENGTH(
+            FOR d IN nodes
+              FILTER CONCAT(d.domain, "#", d.id) NOT IN @anchors
+              RETURN 1
+          )
+        """
+        nodes_removed = int(next(self.db.aql.execute(aql_nodes_count, bind_vars={"anchors": anchors})))
         self.db.aql.execute(
             """
             FOR d IN nodes
-              FILTER !HAS(d,'snapshot_etag') || d.snapshot_etag != @etag
+              FILTER CONCAT(d.domain, "#", d.id) NOT IN @anchors
               REMOVE d IN nodes
             """,
-            bind_vars={"etag": snapshot_etag},
+            bind_vars={"anchors": anchors},
         )
-        edges_removed = int(
-            next(
-                self.db.aql.execute(
-                    """
-                    RETURN LENGTH(
-                      FOR e IN edges
-                        FILTER !HAS(e,'snapshot_etag') || e.snapshot_etag != @etag
-                        RETURN 1
-                    )""",
-                    bind_vars={"etag": snapshot_etag},
-                )
-            )
-        )
+        # 2) Prune edges not in incoming edge IDs
+        aql_edges_count = """
+          RETURN LENGTH(
+            FOR e IN edges
+              FILTER e.id NOT IN @edge_ids
+              RETURN 1
+          )
+        """
+        edges_removed = int(next(self.db.aql.execute(aql_edges_count, bind_vars={"edge_ids": edge_ids})))
         self.db.aql.execute(
             """
             FOR e IN edges
-              FILTER !HAS(e,'snapshot_etag') || e.snapshot_etag != @etag
+              FILTER e.id NOT IN @edge_ids
               REMOVE e IN edges
             """,
-            bind_vars={"etag": snapshot_etag},
+            bind_vars={"edge_ids": edge_ids},
         )
-        return nodes_removed, edges_removed
+        # 3) No legacy field cleanup here; reserved fields are masked at read time.
+        log_stage(
+            get_logger('storage'), "ingest", "prune_completed",
+            nodes_removed=int(nodes_removed), edges_removed=int(edges_removed),
+            fields_cleaned=0, request_id=(request_id or "unknown"),
+        )
+        return int(nodes_removed), int(edges_removed), 0
 
     # ------------------------------------------------------------
     # Enrichment helpers
@@ -871,7 +888,7 @@ class ArangoStore:
                 return None
         try:
             return self.db.collection("nodes").get(node_id)
-        except Exception:
+        except (ArangoError, AttributeError, KeyError, TypeError):
             # On any lookup error (e.g. missing document), behave as
             # though the node does not exist.  This prevents upstream
             # callers from crashing when a node is not found.
@@ -882,27 +899,19 @@ class ArangoStore:
         # Enrich only canonical decisions
         if not n or n.get("type") != "DECISION":
             return None
-        from core_utils.domain import storage_key_to_anchor
-        anchor_id = None
-        _k = n.get("_key")
-        if isinstance(_k, str) and _k:
-            try:
-                anchor_id = storage_key_to_anchor(_k)
-            except Exception:
-                anchor_id = None
-        if not anchor_id:
-            dom = n.get("domain")
-            nid = n.get("id")
-            if dom and nid:
-                anchor_id = f"{dom}#{nid}"
+        # Emit storage id + domain separately; avoid anchors in top-level fields.
+        storage_id = n.get("_key") or n.get("id")
+        domain = n.get("domain")
+        if not isinstance(storage_id, str) or not storage_id:
+            return None
         out: Dict[str, Any] = {
-            "id": anchor_id,
+            "id": storage_id,
             "type": "DECISION",
             "title": n.get("title"),
             "description": n.get("description"),
             "timestamp": n.get("timestamp"),
             "decision_maker": n.get("decision_maker"),
-            "domain": n.get("domain"),
+            "domain": domain,
         }
 
         # Merge any existing x-extra and other non-canonical keys
@@ -917,12 +926,22 @@ class ArangoStore:
             if k in _exclude:
                 continue
             extra[k] = v
+        # Optionally include a convenience anchor (x-extra only).
+        # Do not guess or derive — only build when both parts are present.
+        if isinstance(domain, str) and domain and isinstance(storage_id, str) and storage_id:
+            try:
+                extra.setdefault("anchor", make_anchor(domain, storage_id))
+            except (ValueError, TypeError) as exc:
+                log_stage(
+                    get_logger("storage"),
+                    "read",
+                    "anchor_build_failed",
+                    node_type="DECISION",
+                    error=str(exc),
+                    request_id=(current_request_id() or "unknown"),
+                )
         if extra:
             out["x-extra"] = extra
-            try:
-                log_stage(logger, "enrich", "x_extra_preserved", node_type="decision", node_id=node_id, extra_count=len(extra))
-            except Exception:
-                pass
         return out
 
     def get_enriched_event(self, node_id: str) -> Optional[Dict[str, Any]]:
@@ -930,26 +949,18 @@ class ArangoStore:
         # Enrich only canonical events
         if not n or n.get("type") != "EVENT":
             return None
-        from core_utils.domain import storage_key_to_anchor
-        anchor_id = None
-        _k = n.get("_key")
-        if isinstance(_k, str) and _k:
-            try:
-                anchor_id = storage_key_to_anchor(_k)
-            except Exception:
-                anchor_id = None
-        if not anchor_id:
-            dom = n.get("domain")
-            nid = n.get("id")
-            if dom and nid:
-                anchor_id = f"{dom}#{nid}"
+        # Emit storage id + domain separately; avoid anchors in top-level fields.
+        storage_id = n.get("_key") or n.get("id")
+        domain = n.get("domain")
+        if not isinstance(storage_id, str) or not storage_id:
+            return None
         out: Dict[str, Any] = {
-            "id": anchor_id,
+            "id": storage_id,
             "type": "EVENT",
             "title": n.get("title"),
             "description": n.get("description"),
             "timestamp": n.get("timestamp"),
-            "domain": n.get("domain"),
+            "domain": domain,
         }
 
         extra: Dict[str, Any] = {}
@@ -963,12 +974,21 @@ class ArangoStore:
             if k in _exclude:
                 continue
             extra[k] = v
+        # Optionally include a convenience anchor for callers that want it.
+        # No derivation — only construct when both parts are present.
+        if isinstance(domain, str) and domain and isinstance(storage_id, str) and storage_id:
+            try:
+                extra.setdefault("anchor", make_anchor(domain, storage_id))
+            except (ValueError, TypeError) as exc:
+                log_stage(get_logger("storage"), "read", "anchor_build_failed",
+                          error=str(exc), node_type="EVENT",
+                          request_id=(current_request_id() or "unknown"))
+        elif not domain:
+            log_stage(get_logger("storage"), "read", "domain_missing_on_node",
+                      node_type="EVENT", storage_id=storage_id,
+                      request_id=(current_request_id() or "unknown"))
         if extra:
             out["x-extra"] = extra
-            try:
-                log_stage(logger, "enrich", "x_extra_preserved", node_type="event", node_id=node_id, extra_count=len(extra))
-            except Exception:
-                pass
         return out
 
     def get_enriched_node(self, storage_key: str) -> Optional[Dict[str, Any]]:
@@ -1001,7 +1021,6 @@ class ArangoStore:
     def _redis(self):
         try:
             import redis  # type: ignore
-
             return redis.Redis.from_url(get_settings().redis_url)
         except Exception:
             return None
@@ -1058,7 +1077,7 @@ class ArangoStore:
                 "node_id": anchor_id,
                 "anchor": anchor_id,
                 "graph": {"edges": []},
-                "meta": {},
+                "meta": {"snapshot_etag": (self.get_snapshot_etag() or "")},
             }
         k = 1  # fixed
         cache_key = self._cache_key("expand", anchor_id, f"k{k}")
@@ -1124,11 +1143,12 @@ class ArangoStore:
             edges.append(edge)
         result = {
             "node_id": anchor_id,
-            "anchor": anchor_doc,
+            # Do not surface the full anchor document here; the API layer will fetch & mask.
+            "anchor": anchor_id,
             "graph": {"edges": edges},
-            "meta": {},
+            "meta": {"snapshot_etag": (self.get_snapshot_etag() or "")},
         }
-        self._cache_set(cache_key, result, get_settings().cache_ttl_expand_sec)
+        self._cache_set(cache_key, result, int(TTL_EVIDENCE_CACHE_SEC))
         return result
 
     # ------------------------------------------------------------
@@ -1202,7 +1222,8 @@ class ArangoStore:
                     use_vector = True
                 except Exception:
                     use_vector = False
-        _fp = hashlib.sha1(f"{q}|{int(bool(use_vector))}".encode()).hexdigest()[:12]
+        # Fingerprint the (q, use_vector) tuple via canonical JSON → sha256
+        _fp = sha256_hex(canonical_json({"q": q, "use_vector": bool(use_vector)}))[:12]
         key = self._cache_key("resolve", f"h{_fp}", f"l{limit}")
         cached = self._cache_get(key)
         if cached:
@@ -1255,7 +1276,7 @@ class ArangoStore:
                     if hasattr(self.db, "aql"):
                         self.db.aql.latest_query = aql  # type: ignore[attr-defined]
                     resp = {"query": q, "matches": results, "vector_used": True}
-                    self._cache_set(key, resp, get_settings().cache_ttl_resolve_sec)
+                    self._cache_set(key, resp, int(TTL_EVIDENCE_CACHE_SEC))
                     return resp
                 except Exception:
                     pass
@@ -1286,7 +1307,7 @@ class ArangoStore:
                     if hasattr(self.db, "aql"):
                         self.db.aql.latest_query = aql  # type: ignore[attr-defined]
                     resp = {"query": q, "matches": results, "vector_used": True}
-                    self._cache_set(key, resp, get_settings().cache_ttl_resolve_sec)
+                    self._cache_set(key, resp, int(TTL_EVIDENCE_CACHE_SEC))
                     return resp
                 except Exception:
                     pass
@@ -1358,7 +1379,7 @@ class ArangoStore:
                 cursor = self.db.aql.execute(aql, bind_vars={"q": q, "limit": limit})
             results = list(cursor)
         resp = {"query": q, "matches": results, "vector_used": False}
-        self._cache_set(key, resp, get_settings().cache_ttl_resolve_sec)
+        self._cache_set(key, resp, int(TTL_EVIDENCE_CACHE_SEC))
         return resp
     
     # ──────────────────────────────────────────────────────────────────────────
@@ -1444,7 +1465,7 @@ class ArangoStore:
                 from: anchor._key,
                 to: v._key,
                 timestamp: e.timestamp,
-                domain: (etype == 'ALIAS_OF' ? e.domain : null)
+                domain: (etype == 'ALIAS_OF' ? v.domain : null)
               }}
           )
         )
@@ -1458,7 +1479,7 @@ class ArangoStore:
                 from: v._key,
                 to: anchor._key,
                 timestamp: e.timestamp,
-                domain: (etype == 'ALIAS_OF' ? e.domain : null)
+                domain: (etype == 'ALIAS_OF' ? v.domain : null)
               }}
           )
         )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import time
 from typing import Any, Dict, Tuple, Optional
-
+from core_http.headers import ETAG, RESPONSE_SNAPSHOT_ETAG
 from core_config import get_settings
 from core_config.constants import TTL_SCHEMA_CACHE_SEC
 from core_http.client import fetch_json
@@ -25,7 +25,7 @@ def _extract_etag(headers: Optional[dict], body: Optional[dict]) -> str:
     """Best-effort extraction of a version marker.
 
     Preference order:
-    1) HTTP headers: 'ETag' (case-insensitive), then 'x-snapshot-etag'/'snapshot_etag'
+    1) HTTP headers: ETag (case-insensitive), then x-snapshot-etag
     2) Body fields: meta.snapshot_etag, snapshot_etag, etag
     Returns empty string if nothing is found.
     """
@@ -35,11 +35,10 @@ def _extract_etag(headers: Optional[dict], body: Optional[dict]) -> str:
         except Exception:
             items = []
         lower = {str(k).lower(): _as_str(v) for k, v in items}
-        if lower.get("etag"):
-            return lower["etag"]
-        for k in ("x-snapshot-etag", "snapshot_etag"):
-            if lower.get(k):
-                return lower[k]
+        if lower.get(ETAG.lower()):
+            return lower[ETAG.lower()]
+        if lower.get(RESPONSE_SNAPSHOT_ETAG):
+            return lower[RESPONSE_SNAPSHOT_ETAG]
     if isinstance(body, dict):
         meta = body.get("meta") or {}
         if meta.get("snapshot_etag"):

@@ -10,7 +10,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "anchor": { "oneOf": [ { "$ref": "./decision.json" }, { "$ref": "./event.json" } ] },
+        "anchor": {
+          "oneOf": [
+            { "$ref": "./anchor.json" },
+            { "$ref": "./decision.json" },
+            { "$ref": "./event.json" }
+          ]
+        },
         "graph": {
           "type": "object",
           "additionalProperties": false,
@@ -46,10 +52,16 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "short_answer": { "type": "string" },
-            "cited_ids": { "type": "array", "items": { "type": "string" } }
+            "blocks": { "$ref": "./answer.blocks.json" },
+            "short_answer": { "type": "string", "minLength": 1 },
+            "cited_ids": {
+              "type": "array",
+              "items": { "$ref": "./anchor.json" },
+              "minItems": 1,
+              "uniqueItems": true
+            }
           },
-          "required": ["short_answer", "cited_ids"]
+          "required": ["blocks"]
         },
         "completeness_flags": {
           "type": "object",
@@ -63,19 +75,7 @@
         }
       },
       "required": ["anchor", "graph", "meta", "answer", "completeness_flags"]
-    },
-    "signature": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "alg":       { "type": "string", "enum": ["ed25519"] },
-        "key_id":    { "type": "string", "minLength": 1 },
-        "sig":       { "type": "string", "minLength": 1 },
-        "covered":   { "type": "string", "minLength": 1 },
-        "signed_at": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$" }
-      },
-      "required": ["alg","key_id","sig","covered","signed_at"]
     }
   },
-  "required": ["schema_version", "response", "signature"]
+  "required": ["schema_version", "response"]
 }

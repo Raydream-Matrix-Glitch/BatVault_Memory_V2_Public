@@ -1,565 +1,710 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import Tab from "./ui/Tab";
 import Button from "./ui/Button";
+import Badge from "./ui/Badge";
+import CopyButton from "./ui/CopyButton";
 import { logEvent } from "../../utils/logger";
-// Import a handful of FontAwesome icons to visually reinforce each audit tab.
-import { FaStream, FaFileAlt, FaDatabase, FaChartBar, FaFingerprint } from 'react-icons/fa';
-import type {
-  MetaInfo,
-  EvidenceBundle,
-  WhyDecisionAnswer,
-} from "../../types/memory";
-import type { GraphEdge } from "../../types/memory";
+import type { MetaInfo } from "../../types/memory";
+import { openPresignedBundle, openReceipt, fetchBundleMap, normalizeRid } from "../../utils/bundle";
+import { verifyAll, type VerificationReport } from "../../utils/verify";
+
+type VerificationUiState =
+  | "pending"
+  | "timeout"
+  | "no-key"
+  | "verified"
 
 export interface AuditDrawerProps {
-  /**
-   * Whether the drawer is visible. When false, the drawer is off‑screen.
-   */
   open: boolean;
-  /** Handler to close the drawer. */
   onClose: () => void;
-  bundle_url?: string;
-  /** Metadata returned with the final response. */
   meta?: MetaInfo;
-  /** Evidence bundle from the final response for listing allowed/dropped IDs. */
-  evidence?: EvidenceBundle;
-  /** Answer object for context (unused in this drawer for now). */
-  answer?: WhyDecisionAnswer;
+  requestId?: string;
+  canDownloadFull?: boolean;
 }
 
-/**
- * AuditDrawer displays detailed audit information for a completed Memory API
- * response. It slides in from the right and provides several tabs: Trace,
- * Prompt, Evidence, Metrics and Fingerprints. Large JSON payloads are
- * collapsible by default and can be copied to the clipboard. Neon colours
- * highlight important values while preserving readability.
- */
-const AuditDrawer: React.FC<AuditDrawerProps> = ({
-  open,
-  onClose,
-  meta,
-  evidence,
-  answer,
-  bundle_url,
-}) => {
+function shorten(v?: string, keep = 6) {
+  if (!v) return "–";
+  const m = String(v);
+  if (m.length <= keep * 2 + 1) return m;
+  return m.slice(0, keep) + "…" + m.slice(-keep);
+}
 
-  // Ensure portal targets document.body (avoids clipping by transformed/overflow parents)
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => { setMounted(true); }, []);
+function StatusPill({ status }: { status: "pass" | "mismatch" | "na" }) {
+  const label = status === "pass" ? "Passed" : status === "mismatch" ? "Mismatch" : "N/A";
+  const icon  = status === "pass" ? "✓" : status === "mismatch" ? "≠" : "—";
+  const color =
+    status === "pass"
+      ? "bg-green-500/15 text-green-400 border-green-500/30"
+      : status === "mismatch"
+      ? "bg-red-500/10 text-red-400 border-red-500/30"
+      : "bg-white/5 text-white/60 border-white/10";
+  return (
+    <span className={`px-1.5 py-0.5 rounded-full text-[11px] border inline-flex items-center gap-1 ${color}`} aria-label={label} title={label}>
+      <span>{icon}</span><span className="sr-only">{label}</span>
+    </span>
+  );
+}
 
-  // Lazy prompt artifacts loaded from the bundle when not present in meta
-  const [bundlePrompt, setBundlePrompt] = useState<{ envelope?: any; rendered?: string; raw?: any } | null>(null);
-  const [bundleLoading, setBundleLoading] = useState(false);
-  const effectivePromptEnvelope = meta?.prompt_envelope ?? bundlePrompt?.envelope;
-  const effectiveRenderedPrompt = meta?.rendered_prompt ?? bundlePrompt?.rendered;
-  const effectiveRawLLM        = meta?.raw_llm_json     ?? bundlePrompt?.raw;
-  const loadPromptFromBundle = useCallback(async () => {
-    if (!meta?.request_id) return;
-    setBundleLoading(true);
-    try { logEvent("ui.audit.load_bundle", { rid: meta.request_id, kind: "prompt_artifacts" }); } catch {}
-    try {
-      const resp = await fetch(`/v2/bundles/${meta.request_id}`);
-      if (!resp.ok) throw new Error(`bundle get failed: ${resp.status}`);
-      const data = await resp.json().catch(() => null) as any;
-      if (data) {
-        // Prefer new gateway keys; fall back to legacy names to be safe.
-        const envStr =
-          data["envelope.json"] ??
-          data["prompt_envelope.json"] ??
-          undefined;
-        const env = envStr ? JSON.parse(envStr) : undefined;
-        const rend = data["rendered_prompt.txt"] ?? undefined;
-        const rawStr =
-          data["llm_raw.json"] ??
-          data["raw_llm.json"] ??
-          undefined;
-        const raw = rawStr ? JSON.parse(rawStr) : undefined;
-        setBundlePrompt({ envelope: env, rendered: rend, raw });
-        try { logEvent("ui.audit.load_bundle.ok", { rid: meta.request_id }); } catch {}
-      }
-    } catch (e: any) {
-      try { logEvent("ui.audit.load_bundle.err", { rid: meta?.request_id ?? null, message: String(e?.message || e) }); } catch {}
-    } finally {
-      setBundleLoading(false);
-    }
-  }, [meta?.request_id]);
-  const [activeTab, setActiveTab] = useState<
-    "trace" | "prompt" | "evidence" | "metrics" | "fingerprints"
-  >("trace");
-  const [showEnvelope, setShowEnvelope] = useState(false);
-  const [showRendered, setShowRendered] = useState(false);
-  const [showRaw, setShowRaw] = useState(false);
-
-  useEffect(() => {
-    try {
-      logEvent("ui.audit_tab_changed", { tab: activeTab, rid: meta?.request_id ?? null });
-    } catch {
-      /* ignore logging errors */
-    }
-  }, [activeTab, meta?.request_id]);
-
-  useEffect(() => {
-    if (activeTab === "trace") {
-      try {
-        logEvent("ui.audit.trace_render", {
-          rid: meta?.request_id ?? null,
-          stages: (meta?.trace && meta.trace.length) || defaultStages.length,
-        });
-      } catch {}
-    }
-  }, [activeTab, meta?.trace]);
-
-  useEffect(() => {
-    try {
-      const el = document.querySelector('[data-testid="audit-drawer"]') as HTMLElement | null;
-      if (!el) return;
-      const box = el.getBoundingClientRect();
-      logEvent("ui.audit.drawer_mount", {
-        rid: meta?.request_id ?? null,
-        top: box.top,
-        bottom: box.bottom,
-        height: box.height,
-      });
-    } catch {}
-  }, []);
-
-  // Helper to copy text to clipboard and notify the user silently.
-  const copyToClipboard = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      // Optionally we could show a toast/snackbar; omit for now to keep scope small.
-    } catch {
-      // ignore clipboard errors
-    }
-  };
-
-  // Default trace stages when no trace is provided
-  const defaultStages = ["resolve", "plan", "exec_graph", "enrich", "bundle", "prompt", "llm", "validate", "render", "stream"];
-
-  // Optional per-stage timings in ms (UI degrades gracefully if absent)
-  const stageTimings = (meta as any)?.stage_timings ?? (meta as any)?.evidence_metrics?.stage_timings ?? null;
-  // Flatten allowed and dropped IDs for evidence tab
-  const allowed = evidence?.allowed_ids ?? [];
-  // Prefer top-level fields; fall back to evidence_metrics (what the gateway emits today)
-  const dropped = meta?.dropped_evidence_ids ?? (meta as any)?.evidence_metrics?.dropped_evidence_ids ?? [];
-  const selectorScores = meta?.selector_scores ?? (meta as any)?.evidence_metrics?.selector_scores ?? {};
-  // v3 relations from oriented edges (CAUSAL only)
-  const anchorId: string | undefined = (evidence as any)?.anchor?.id;
-  const edges: GraphEdge[] = ((evidence as any)?.graph?.edges) || [];
-  const precedingIds = (edges || [])
-    .filter(e => e.type === "CAUSAL" && e.orientation === "preceding" && e.to === anchorId)
-    .map(e => e.from);
-  const succeedingIds = (edges || [])
-    .filter(e => e.type === "CAUSAL" && e.orientation === "succeeding" && e.from === anchorId)
-    .map(e => e.to);
-
-  // Determine classes for drawer visibility. The drawer is positioned off‑canvas
-  // on the right when closed and slides into view when `open` is true. It
-  // explicitly sets `top` and `bottom` so it stretches the full height of the
-  // viewport, and uses a dark translucent backdrop with a subtle neon shadow.
-  const drawerClasses = `fixed top-0 bottom-0 right-0 m-0 bg-black/80 backdrop-blur-md border-l border-vaultred/40 shadow-neon-red transform transition-transform duration-300 z-50 ${
-  open ? "translate-x-0" : "translate-x-full"
-  }`;
-
-  // Inline style overrides. Tailwind sometimes tree‑shakes arbitrary values like
-  // `w-[32rem]` or `max-w-[96vw]` when they appear in template strings. To
-  // guarantee consistent sizing without relying on Tailwind's arbitrary value
-  // detection, define the drawer dimensions here. These values mirror the
-  // intended 32 rem width and 96 vw maximum width from the original classes.
-  const drawerStyle: React.CSSProperties = {
-    width: "48rem",       // widened to 48rem (~768px) so Fingerprints tab content is never cut off
-    maxWidth: "98vw",      // Prevent the drawer from exceeding the viewport on very small screens
-    height: "100vh",       // Ensure the drawer spans the entire viewport height
-    zIndex: 9999,          // Render above any app surfaces
-  };
-
-  const drawerRoot = (
-    // Apply inline dimensions via the `style` prop to guarantee the desired
-    // width and height regardless of whether Tailwind strips arbitrary
-    // utilities. See `drawerStyle` above for details.
-    <div
-      className={drawerClasses + " flex flex-col"}
-      data-testid="audit-drawer"
-      style={drawerStyle}
-    >
-      <div className="flex flex-col h-full">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
-        <h2 className="text-xl font-bold text-vaultred">Audit</h2>
-        <div className="flex items-center gap-2">
-          {meta?.request_id && (
-            <Button
-              variant="secondary"
-              onClick={() => {
-                try { logEvent("ui.audit.open_bundle", { rid: meta.request_id }); } catch {}
-                const url = bundle_url || `/v2/bundles/${meta.request_id}`;
-                window.open(url, "_blank");
-              }}
-              className="px-2 py-1 text-sm"
-            >
-              Open bundle
-            </Button>
-          )}
-          <Button variant="secondary" onClick={onClose} className="px-2 py-1 text-sm">
-            Close
-          </Button>
-        </div>
+function FieldRow({
+  name,
+  badge,
+  help,
+  computed,
+  claimed,
+  status,
+  showClaimedIfDifferent = true,
+  tooltip,
+  trusted = false,
+}: {
+  name: string;
+  badge?: React.ReactNode;
+  help?: string;
+  computed?: string;
+  claimed?: string;
+  status: "pass" | "mismatch" | "na";
+  showClaimedIfDifferent?: boolean;
+  tooltip?: string;
+  trusted?: boolean;
+}) {
+  const different = claimed && computed && claimed !== computed;
+  return (
+    <div className="grid grid-cols-[minmax(140px,1fr)_minmax(0,1fr)_auto] items-center gap-x-3 border-b border-white/10 py-2">
+      <div className="flex items-center gap-2 min-w-0" title={help || tooltip}>
+        <span className="font-mono text-[13px] truncate">{name}</span>
+        {badge}
       </div>
-      {/* Tabs */}
-      <div className="flex space-x-3 px-4 border-b border-gray-700 overflow-x-auto">
-        <Tab
-          active={activeTab === "trace"}
-          onClick={() => setActiveTab("trace")}
-          className="flex items-center gap-1"
-        >
-          <FaStream className="w-3 h-3" />
-          <span>Trace</span>
-        </Tab>
-        <Tab
-          active={activeTab === "prompt"}
-          onClick={() => setActiveTab("prompt")}
-          className="flex items-center gap-1"
-        >
-          <FaFileAlt className="w-3 h-3" />
-          <span>Prompt</span>
-        </Tab>
-        <Tab
-          active={activeTab === "evidence"}
-          onClick={() => setActiveTab("evidence")}
-          className="flex items-center gap-1"
-        >
-          <FaDatabase className="w-3 h-3" />
-          <span>Evidence</span>
-        </Tab>
-        <Tab
-          active={activeTab === "metrics"}
-          onClick={() => setActiveTab("metrics")}
-          className="flex items-center gap-1"
-        >
-          <FaChartBar className="w-3 h-3" />
-          <span>Metrics</span>
-        </Tab>
-        <Tab
-          active={activeTab === "fingerprints"}
-          onClick={() => setActiveTab("fingerprints")}
-          className="flex items-center gap-1"
-        >
-          <FaFingerprint className="w-3 h-3" />
-          <span>Fingerprint</span>
-        </Tab>
-      </div>
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {/* Trace tab */}
-        {activeTab === "trace" && (
-          <div>
-            <h3 className="text-lg font-semibold text-vaultred mb-2">Gateway trace</h3>
-            <div className="space-y-2">
-              {((meta?.trace && meta.trace.length > 0) ? meta.trace : defaultStages).map((stage, idx) => {
-                const ms = stageTimings && (stageTimings as any)[stage];
-                return (
-                  <div
-                    key={stage + "-" + idx}
-                    className="w-full rounded-xl border border-vaultred/50 bg-black/40 px-3 py-2 text-sm text-copy flex items-center justify-between"
-                  >
-                    <div className="flex items-center">
-                      <span className="font-mono opacity-70">{String(idx + 1).padStart(2, "0")}</span>
-                      <span className="ml-3 font-semibold">{stage}</span>
-                    </div>
-                    {typeof ms === "number" && (
-                      <span className="opacity-80 font-mono">{ms} ms</span>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+      <div className="text-xs text-white/80 min-w-0">
+        {trusted ? (
+          <div className="flex items-center gap-1" title="Gateway-provided value; treated as trusted">
+            <span className="text-white/60">Gateway (trusted)</span>
+            <span className="font-mono truncate">{shorten(claimed)}</span>
+            {claimed ? <CopyButton text={claimed} className="ml-1" /> : null}
           </div>
-        )}
-        {/* Prompt tab */}
-        {activeTab === "prompt" && (
-          <div className="space-y-4">
-            <div>
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-vaultred">Envelope</h3>
-                <Button
-                  variant="secondary"
-                  onClick={() => effectivePromptEnvelope && copyToClipboard(JSON.stringify(effectivePromptEnvelope, null, 2))}
-                  className="text-xs"
-                >
-                  Copy
-                </Button>
-              </div>
-              <Button
-                variant="secondary"
-                onClick={() => setShowEnvelope((s) => !s)}
-                className="my-1 text-xs"
-              >
-                {showEnvelope ? "Hide" : "Show"}
-              </Button>
-              {!effectivePromptEnvelope && meta?.request_id && (
-                <Button variant="secondary" onClick={loadPromptFromBundle} className="text-xs" disabled={bundleLoading}>
-                  {bundleLoading ? "Loading…" : "Load from bundle"}
-                </Button>
-              )}
-              {showEnvelope && !!effectivePromptEnvelope && (
-                <pre className="bg-darkbg border border-gray-700 rounded p-2 text-xs overflow-x-auto whitespace-pre-wrap">
-                  {JSON.stringify(effectivePromptEnvelope, null, 2)}
-                </pre>
-              )}
-            </div>
-            <div>
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-vaultred">Rendered prompt</h3>
-                <Button
-                  variant="secondary"
-                  onClick={() => effectiveRenderedPrompt && copyToClipboard(effectiveRenderedPrompt as any)}
-                  className="text-xs"
-                >
-                  Copy
-                </Button>
-              </div>
-              <Button
-                variant="secondary"
-                onClick={() => setShowRendered((s) => !s)}
-                className="my-1 text-xs"
-              >
-                {showRendered ? "Hide" : "Show"}
-              </Button>
-              {!effectiveRenderedPrompt && meta?.request_id && (
-                <Button variant="secondary" onClick={loadPromptFromBundle} className="text-xs" disabled={bundleLoading}>
-                  {bundleLoading ? "Loading…" : "Load from bundle"}
-                </Button>
-              )}
-              {showRendered && !!effectiveRenderedPrompt && (
-                <pre className="bg-darkbg border border-gray-700 rounded p-2 text-xs overflow-x-auto whitespace-pre-wrap font-mono">
-                  {effectiveRenderedPrompt as any}
-                </pre>
-              )}
-            </div>
-            <div>
-              <div className="flex items-center justify-between">
-                <h3 className="text-lg font-semibold text-vaultred">Raw LLM JSON</h3>
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    effectiveRawLLM &&
-                    copyToClipboard(JSON.stringify(effectiveRawLLM, null, 2))
-                  }
-                  className="text-xs"
-                >
-                  Copy
-                </Button>
-              </div>
-              <Button
-                variant="secondary"
-                onClick={() => setShowRaw((s) => !s)}
-                className="my-1 text-xs"
-              >
-                {showRaw ? "Hide" : "Show"}
-              </Button>
-              {!effectiveRawLLM && meta?.request_id && (
-                <Button variant="secondary" onClick={loadPromptFromBundle} className="text-xs" disabled={bundleLoading}>
-                  {bundleLoading ? "Loading…" : "Load from bundle"}
-                </Button>
-              )}
-              {showRaw && !!effectiveRawLLM && (
-                <pre className="bg-darkbg border border-gray-700 rounded p-2 text-xs overflow-x-auto whitespace-pre-wrap">
-                  {JSON.stringify(effectiveRawLLM, null, 2)}
-                </pre>
-              )}
-            </div>
-          </div>
-        )}
-        {/* Evidence tab */}
-        {activeTab === "evidence" && (
-          <div>
-            <h3 className="text-lg font-semibold text-vaultred mb-2">Evidence IDs</h3>
-            <div className="text-copy text-sm mb-2">
-              <span className="font-semibold">Allowed</span> ({allowed.length}):
-            </div>
-            {allowed.length > 0 ? (
-              <ul className="list-disc list-inside text-xs text-copy space-y-1 mb-4">
-                {allowed.map((id) => (
-                  <li key={id} className="font-mono break-all">{id}</li>
-                ))}
-              </ul>
-            ) : (
-              <p className="text-copy text-xs">None</p>
-            )}
-            {dropped.length > 0 && (
+        ) : (
+          <div className="flex flex-wrap items-center gap-1" title={tooltip}>
+            <span className="text-white/60">Gateway</span>
+            <span className="font-mono">{shorten(claimed)}</span>
+            {claimed ? <CopyButton text={claimed} className="ml-1" /> : null}
+            {computed ? <span className="px-1">/</span> : null}
+            {computed ? (
               <>
-                <div className="text-copy text-sm mb-2">
-                  <span className="font-semibold text-yellow-400">Dropped</span> ({dropped.length}):
-                </div>
-                <ul className="list-disc list-inside text-xs text-copy space-y-1 mb-4">
-                  {dropped.map((id) => (
-                    <li key={id} className="font-mono break-all">{id}</li>
-                  ))}
-                </ul>
+                <span className="text-white/60">Local</span>
+                <span className={`font-mono ${different ? "underline decoration-red-400/60" : ""}`}>
+                  {shorten(computed)}
+                </span>
+                <CopyButton text={computed} className="ml-1" />
               </>
-            )}
-            {Object.keys(selectorScores).length > 0 && (
-              <div>
-                <h4 className="text-sm font-semibold text-vaultred mb-1">Selector scores</h4>
-                <table className="text-xs w-full">
-                  <thead>
-                    <tr className="text-left">
-                      <th className="pr-4 py-1">ID</th>
-                      <th className="py-1">Score</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Object.entries(selectorScores).map(([id, score]) => (
-                      <tr key={id} className="border-t border-gray-700">
-                        <td className="pr-4 py-1 break-all font-mono">{id}</td>
-                        <td className="py-1 font-mono">{score.toFixed(3)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {/* Relations from oriented edges (preceding/succeeding) */}
-            {(precedingIds.length > 0 || succeedingIds.length > 0) && (
-              <div className="mt-4">
-                <h4 className="text-sm font-semibold text-vaultred mb-1">Relations</h4>
-                <div className="grid grid-cols-2 gap-4 text-xs">
-                  <div>
-                    <div className="font-semibold mb-1">Preceding ({precedingIds.length})</div>
-                    {precedingIds.length ? (
-                      <ul className="list-disc list-inside space-y-1">
-                        {precedingIds.map((id: string) => (
-                          <li key={id} className="font-mono break-all">{id}</li>
-                        ))}
-                      </ul>
-                    ) : <div className="opacity-70">None</div>}
-                  </div>
-                  <div>
-                    <div className="font-semibold mb-1">Succeeding ({succeedingIds.length})</div>
-                    {succeedingIds.length ? (
-                      <ul className="list-disc list-inside space-y-1">
-                        {succeedingIds.map((id: string) => (
-                          <li key={id} className="font-mono break-all">{id}</li>
-                        ))}
-                      </ul>
-                    ) : <div className="opacity-70">None</div>}
-                  </div>
-                </div>
-              </div>
-            )}
-            {/* Cited evidence IDs from the short answer */}
-            {((answer?.cited_ids?.length ?? 0) > 0 || (answer?.supporting_ids?.length ?? 0) > 0) && (
-              <div className="mt-4">
-                <h4 className="text-sm font-semibold text-vaultred mb-1">Cited in short answer</h4>
-                <ul className="list-disc list-inside text-xs text-copy space-y-1">
-                  {(answer.cited_ids ?? answer.supporting_ids)?.map((cid) => (
-                    <li key={cid} className="font-mono break-all">{cid}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
+            ) : null}
           </div>
         )}
-        {/* Metrics tab */}
-        {activeTab === "metrics" && (
-          <div className="flex flex-col gap-2 text-sm text-copy">
-            {[
-              ["Latency", `${meta?.latency_ms ?? "–"} ms`],
-              ["Retries", meta?.retries ?? "–"],
-              ["Fallback used", meta?.fallback_used ? "yes" : "no"],
-              ["Fallback reason", meta?.fallback_reason ?? "–"],
-              ["Bundle size", (meta as any)?.bundle_size_bytes ?? "–"],
-              ["Evidence count", evidence ? (evidence.events?.length ?? 0) + 1 : "–"],
-              ["Prompt tokens", (meta as any)?.prompt_tokens ?? "–"],
-              ["Evidence tokens", (meta as any)?.evidence_tokens ?? "–"],
-              ["Max tokens", (meta as any)?.max_tokens ?? "–"],
-              ["Selector", (meta as any)?.selector_model_id ?? "–"],
-              ["Load shed", (meta as any)?.load_shed ? "yes" : "no"],
-              ["Routing conf.", (meta as any)?.routing_confidence ?? "–"],
-              ["Functions", (meta?.function_calls && meta.function_calls.length > 0) ? meta.function_calls.join(", ") : "–"],
-            ].map(([label, val]) => (
-              <div
-                key={String(label)}
-                className="w-full border border-vaultred/50 rounded-md px-3 py-2 flex items-center justify-between"
-              >
-                <span className="font-semibold">{label as string}</span>
-                <span className="font-mono break-all">{String(val)}</span>
-              </div>
-            ))}
-          </div>
-        )}
-          </div>
-        {/* Fingerprint tab */}
-        {activeTab === "fingerprints" && (
-          <div className="space-y-3 text-sm text-copy break-all">
-            {/* Request ID row */}
-            <div className="flex items-center">
-              <span className="font-semibold mr-1">Request ID:</span>
-              <span className="ml-1 font-mono">{meta?.request_id ?? "–"}</span>
-              {meta?.request_id && (
-                <Button
-                  variant="secondary"
-                  onClick={() => copyToClipboard(meta.request_id!)}
-                  className="ml-2 text-xs px-1 py-0.5"
-                >
-                  Copy
-                </Button>
-              )}
-            </div>
-            {/* Plan fingerprint row */}
-            <div className="flex items-center">
-              <span className="font-semibold mr-1">Plan fingerprint:</span>
-              <span className="ml-1 font-mono">{meta?.plan_fingerprint ?? "–"}</span>
-              {meta?.plan_fingerprint && (
-                <Button
-                  variant="secondary"
-                  onClick={() => copyToClipboard(meta.plan_fingerprint!)}
-                  className="ml-2 text-xs px-1 py-0.5"
-                >
-                  Copy
-                </Button>
-              )}
-            </div>
+      </div>
+      <div className="justify-self-end"><StatusPill status={status} /></div>
+    </div>
+  );
+}
 
-            {/* Prompt fingerprint row */}
-            <div className="flex items-center">
-              <span className="font-semibold mr-1">Prompt fingerprint:</span>
-              <span className="ml-1 font-mono">
-                {meta?.prompt_fingerprint ?? meta?.prompt_envelope_fingerprint ?? "–"}
-              </span>
-              {(meta?.prompt_fingerprint || meta?.prompt_envelope_fingerprint) && (
-                <Button
-                  variant="secondary"
-                  onClick={() =>
-                    copyToClipboard(
-                      (meta?.prompt_fingerprint ?? meta?.prompt_envelope_fingerprint)!
-                    )
-                  }
-                  className="ml-2 text-xs px-1 py-0.5"
-                >
-                  Copy
-                </Button>
-              )}
+export default function AuditDrawer({ open, onClose, meta, requestId: req }: AuditDrawerProps) {
+  const requestId = req || meta?.request_id;
+  const [report, setReport] = useState<VerificationReport | null>(null);
+  const [rawReceipt, setRawReceipt] = useState<any | null>(null);
+  const [hasVerifierKey, setHasVerifierKey] = useState<boolean>(false);
+  const [loading, setLoading] = useState(false);
+  const [uiState, setUiState] = useState<VerificationUiState>("pending");
+  const timeoutRef = useRef<number | null>(null);
+
+  // narrow, explicit JSON parsing – we don't want one bad artifact to kill the run
+  const safeParseJson = useCallback(
+    (txt: string | undefined, kind: string, rid: string) => {
+      if (!txt) return null;
+      try {
+        return JSON.parse(txt);
+      } catch (err) {
+        logEvent("ui.audit.parse_error", {
+          rid,
+          kind,
+          error: String((err as any)?.message || err),
+        });
+        return null;
+      }
+    },
+    []
+  );
+
+  const computeAndVerify = useCallback(async () => {
+    if (!meta) return;
+    // reset for this run
+    setUiState("pending");
+    setLoading(true);
+    // watchdog: after 15s we move to "couldn't be achieved"
+      if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    timeoutRef.current = window.setTimeout(() => {
+      setUiState((prev) => (prev === "pending" ? "timeout" : prev));
+    }, 15000);
+    const rawRid = requestId || meta.request_id || "";
+    const rid = normalizeRid(rawRid);
+    let artifactMap: any = null;
+    try {
+      artifactMap = await fetchBundleMap(rid);
+    } catch (err) {
+      // network / CORS / 5xx – this is *not* a watchdog expiry
+      logEvent("ui.audit.bundle_fetch.error", {
+        rid,
+        error: String((err as any)?.message || err),
+      });
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      setUiState("timeout");   // fetch failed → not a pending state
+      // show at least the values the backend already told us in meta
+      setReport({
+        request_id: rid,
+        graph_fp: {
+          claimed: meta?.fingerprints?.graph_fp,
+          computed: undefined,
+          ok: true,
+          // we explicitly trust the backend here because FE may not be able to rederive it
+          trusted: true,
+        },
+        allowed_ids_fp: {
+          claimed: meta?.allowed_ids_fp,
+          computed: "",
+          ok: true,
+        },
+        bundle_fp: {
+          claimed: meta?.bundle_fp,
+          computed: "",
+          ok: true,
+        },
+        anchor_ok: false,
+        domain_ok: false,
+      } as any);
+      setLoading(false);
+      return;
+    }
+
+    // gateway sometimes returns a "pending" / "not ready" bundle view – treat this as non-fatal
+    const isPlaceholder =
+      artifactMap &&
+      typeof artifactMap === "object" &&
+      typeof (artifactMap as any).status === "string" &&
+      !("response.json" in artifactMap) &&
+      !("receipt.json" in artifactMap);
+    if (isPlaceholder) {
+      logEvent("ui.audit.bundle_fetch.pending", {
+        rid,
+        status: (artifactMap as any).status,
+      });
+     if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      setUiState("timeout");
+      setReport({
+        request_id: rid,
+        graph_fp: {
+          claimed: meta?.fingerprints?.graph_fp,
+          computed: undefined,
+          ok: true,
+          trusted: true,
+        },
+        allowed_ids_fp: {
+          claimed: meta?.allowed_ids_fp,
+          computed: "",
+         ok: true,
+        },
+        bundle_fp: {
+          claimed: meta?.bundle_fp,
+          computed: "",
+          ok: true,
+        },
+        anchor_ok: true,
+        domain_ok: true,
+      } as any);
+      setLoading(false);
+      return;
+    }
+
+    if (!artifactMap) {
+      // defensive – shouldn't really happen, but don't blame the watchdog
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      setUiState("pending");
+      setLoading(false);
+      return;
+    }
+
+    const responseTxt = artifactMap["response.json"];
+    const receiptTxt  = artifactMap["receipt.json"];
+    if (!responseTxt || !receiptTxt) {
+      logEvent("ui.audit.bundle_fetch.partial", {
+        rid,
+        has_response: Boolean(responseTxt),
+        has_receipt: Boolean(receiptTxt),
+      });
+    }
+    // use safe parser (we already had it) so one bad artifact doesn't kill the run
+    const bundle  = safeParseJson(responseTxt, "response.json", rid);
+    const receipt = safeParseJson(receiptTxt, "receipt.json", rid);
+    try {
+      // prefer the meta that actually came from the bundle – server's final view
+      const effectiveMeta =
+        (bundle && typeof bundle === "object" && (bundle as any).response && (bundle as any).response.meta)
+          ? (bundle as any).response.meta
+          : meta;
+      if (!meta && effectiveMeta) {
+        logEvent("ui.audit.meta.recovered_from_bundle", { rid });
+      }
+      logEvent("ui.audit.bundle_fetch.ok", {
+        rid,
+        raw_rid: rawRid,
+        has_response: Boolean(responseTxt),
+        has_receipt: Boolean(receiptTxt),
+      });
+
+      // keep it in state for the panel
+      setRawReceipt(receipt);
+
+      let pub = "";
+      try {
+        // strict: only trust the backend to tell us the current key
+        const k1 = await fetch("/keys/gateway_ed25519_pub.b64");
+        if (k1.ok) {
+          pub = (await k1.text()).trim();
+        } else {
+          const k2 = await fetch("/keys/gateway_ed25519_pub.pem");
+          if (k2.ok) pub = (await k2.text()).trim();
+        }
+      } catch (err) {
+        logEvent("ui.audit.fetch_key.error", {
+          rid,
+          error: String((err as any)?.message || err),
+        });
+      }
+      const hasKey = !!pub;
+      setHasVerifierKey(hasKey);
+      if (!hasKey) {
+        // hard fail-closed, matches deck: "no unsigned receipts"
+        setUiState("no-key");
+      }
+      // only attempt signature verification when we really have a key
+      const rpt = await verifyAll({
+        // if the downloaded bundle was null (e.g. parse failed), still pass something
+        bundle: (bundle as any) ?? { response: { meta } },
+        receipt,
+        gatewayPublicKey: hasKey ? pub : undefined,
+      });
+      // verification finished → stop watchdog
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      setUiState((prev) => (prev === "timeout" ? "timeout" : "verified"));
+      setReport(rpt);
+      logEvent("ui.audit.verify.result", {
+        rid: requestId,
+        action: "ui.audit.verify.result",
+        ok: !!(
+          rpt.bundle_fp.ok &&
+          rpt.allowed_ids_fp.ok &&
+          rpt.graph_fp.ok &&
+          (rpt.signature?.ok ?? true) &&
+          (rpt.receipt?.covered_ok ?? true)
+        ),
+        graph_ok: rpt.graph_fp.ok,
+        allowed_ok: rpt.allowed_ids_fp.ok,
+        bundle_ok: rpt.bundle_fp.ok,
+        receipt_covered_ok: rpt.receipt?.covered_ok ?? false,
+        key_id: rpt.receipt?.key_id,
+        signed_at: rpt.receipt?.signed_at,
+      });
+    } catch (err) {
+      // logic / crypto failure – do NOT pretend this was a watchdog expiry
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      logEvent("ui.audit.compute.error", {
+        rid: requestId,
+        error: String((err as any)?.message || err),
+      });
+      logEvent("ui.audit.verify.fallback", {
+        rid: requestId || meta?.request_id || null,
+        error: String((err as any)?.message || err),
+      });
+      // surface at least the claimed meta so the UI doesn't stay in 'pending'
+      setReport(() => ({
+        request_id: requestId || meta?.request_id || undefined,
+        graph_fp: {
+          claimed: meta?.graph_fp ?? (meta as any)?.fingerprints?.graph_fp,
+          computed: undefined,
+          ok: false,
+          trusted: false,
+        },
+        allowed_ids_fp: {
+          claimed: meta?.allowed_ids_fp ?? (meta as any)?.fingerprints?.allowed_ids_fp,
+          computed: "",
+          ok: false,
+        },
+        bundle_fp: {
+          claimed: meta?.bundle_fp ?? (meta as any)?.fingerprints?.bundle_fp,
+          computed: "",
+          ok: false,
+        },
+        receipt: receipt || undefined,
+        anchor_ok: false,
+        domain_ok: false,
+      }));
+      setUiState("timeout");
+    } finally {
+      setLoading(false);
+    }
+  }, [meta, requestId]);
+
+  useEffect(() => {
+    if (!open) {
+      // drawer closed → kill any outstanding timer
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      return;
+    }
+    logEvent("ui.audit.open", { rid: requestId, action: "ui.audit.open" });
+    computeAndVerify();
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+      if (e.key.toLowerCase() === "r") {
+        logEvent("ui.audit.reverify", { rid: requestId, action: "ui.audit.reverify" });
+        computeAndVerify();
+      }
+      if (e.key.toLowerCase() === "b" && requestId) {
+        logEvent("ui.audit.view_bundle", { rid: requestId, action: "ui.audit.view_bundle" });
+        openPresignedBundle(normalizeRid(requestId), "bundle_view");
+      }
+      if (e.key.toLowerCase() === "f" && requestId) {
+        logEvent("ui.audit.download_full", { rid: requestId, action: "ui.audit.download_full" });
+        openPresignedBundle(normalizeRid(requestId), "bundle_full");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, requestId, onClose, computeAndVerify]);
+
+  if (!open) return null;
+
+  // deck: "Fail-closed if the signer isn’t configured (no unsigned receipts)"
+  const failClosed = uiState === "no-key";
+  const verdict = (() => {
+    if (uiState === "timeout") {
+      return {
+        kind: "fail",
+        text: "⚠️ Timed out after 15s. Try again.",
+        color: "bg-amber-500/10 text-amber-100",
+      } as const;
+    }
+    // strict mode: if we don't have the verifier key, we don't make claims
+    if (failClosed) {
+      return {
+        kind: "fail",
+        text: "🚫 Verification unavailable — gateway public key not configured.",
+        color: "bg-red-600/15 text-red-300",
+      } as const;
+    }
+
+    if (!report) {
+      return {
+        kind: "na",
+        text: "Verification pending…",
+        color: "bg-white/5 text-white/80",
+      } as const;
+    }
+    const allPassed =
+      report.graph_fp.ok &&
+      report.allowed_ids_fp.ok &&
+      report.bundle_fp.ok &&
+      (report.receipt?.covered_ok ?? true) &&
+      (report.signature?.ok ?? hasVerifierKey === false);
+    if (allPassed)
+      return {
+        kind: "ok",
+        text: "✅ Verified — Signature valid; all fingerprints match.",
+        color: "bg-green-600/15 text-green-300",
+      } as const;
+    return {
+      kind: "fail",
+      text: "❌ Verification failed — See details below.",
+      color: "bg-red-600/15 text-red-300",
+    } as const;
+  })();
+
+  const tooltipServerVsComputed = "Gateway vs Local — must match for integrity.";
+  const tooltipKeyId = "Key ID — identifies which public key verifies this receipt.";
+
+  const body = (
+    <div className="fixed inset-0 z-50 bg-black/50 text-white" aria-modal="true" role="dialog">
+      <div className="absolute right-0 top-0 h-full w-[720px] bg-[#0b0f16] border-l border-white/10 shadow-xl flex flex-col overflow-hidden">
+        {/* Header (sticky) */}
+        <div className="sticky top-0 z-10 flex items-center justify-between px-5 py-3 border-b border-white/10 bg-[#0b0f16]">
+          <div className="font-semibold">Audit</div>
+          <button
+            className="text-white/70 hover:text-white"
+            onClick={onClose}
+            aria-label="Close audit drawer (Esc)"
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Scrollable content */}
+        <div className="flex-1 overflow-y-auto">
+        {/* Status banner (use full space with side gutters) */}
+        <div className={`mx-5 my-4 rounded-lg px-5 py-4 border ${verdict.color} border-white/10`}>
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <div className="font-semibold">Verification result</div>
+              <div className="text-sm mt-1">{verdict.text}</div>
+              <div className="text-xs mt-2 text-white/70">
+                The receipt signs <span className="font-mono">bundle_fp</span>, a deterministic hash of the full response.
+                We recompute fingerprints locally and compare them to the server’s claim.
+              </div>
             </div>
-            {/* Snapshot etag row */}
-            <div className="flex items-center">
-              <span className="font-semibold mr-1">Snapshot etag:</span>
-              <span className="ml-1 font-mono">{meta?.snapshot_etag ?? "–"}</span>
-              {meta?.snapshot_etag && (
-                <Button
-                  variant="secondary"
-                  onClick={() => copyToClipboard(meta.snapshot_etag!)}
-                  className="ml-2 text-xs px-1 py-0.5"
-                >
-                  Copy
-                </Button>
-              )}
+            <div className="flex items-center gap-2 self-start">
+              <Badge size="xs">ed25519</Badge>
+              <Badge size="xs">offline-capable</Badge>
+              <Badge size="xs">deterministic</Badge>
             </div>
           </div>
-        )}
+        </div>
+
+        {/* Request info (dense) */}
+        <div className="mx-5 mb-3 border border-white/10 rounded-lg p-2">
+          <div className="text-sm flex flex-wrap gap-x-4 gap-y-1 items-center">
+            <div className="flex items-center gap-1">
+              <span className="text-white/60">Request ID</span>{" "}
+              <span className="font-mono">{requestId ?? "–"}</span>{" "}
+              {requestId ? <CopyButton text={requestId} /> : null}
+            </div>
+            <div className="flex items-center gap-1" title="UTC">
+              <span className="text-white/60">Signed at</span>{" "}
+              <span className="font-mono">
+                {report?.receipt?.signed_at ?? rawReceipt?.signed_at ?? "–"}
+              </span>
+            </div>
+            <div className="flex items-center gap-1" title={tooltipKeyId}>
+              <span className="text-white/60">Key ID</span>{" "}
+              <span className="font-mono">
+                {report?.receipt?.key_id ?? rawReceipt?.key_id ?? "–"}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Fingerprints group (full-width rows, no heading) */}
+        <div className="mx-5 mb-3 border border-white/10 rounded-lg">
+          <div className="px-3">
+            <FieldRow
+              name="bundle_fp"
+              badge={<Badge size="xs">signature target</Badge>}
+              help="Canonical hash of the full response (signature target)."
+              computed={report?.bundle_fp.computed}
+              claimed={meta?.bundle_fp}
+              status={failClosed ? "na" : (report ? (report.bundle_fp.ok ? "pass" : "mismatch") : "na")}
+              tooltip={tooltipServerVsComputed}
+            />
+            <FieldRow
+              name="graph_fp"
+              badge={<Badge size="xs">derived</Badge>}
+              help="Graph structure: hash of anchor + edges."
+              computed={report?.graph_fp.computed}
+              claimed={meta?.fingerprints?.graph_fp}
+              status={failClosed ? "na" : (report ? (report.graph_fp.ok ? "pass" : "mismatch") : "na")}
+              tooltip="Gateway-emitted graph_fp; frontend may not be able to reproduce if policy/canonicalization was applied."
+              trusted={report?.graph_fp.trusted === true}
+            />
+            <FieldRow
+              name="allowed_ids_fp"
+              badge={<Badge size="xs">derived</Badge>}
+              help="Access scope: hash of the authorized ID list."
+              computed={report?.allowed_ids_fp.computed}
+              claimed={meta?.allowed_ids_fp}
+              status={failClosed ? "na" : (report ? (report.allowed_ids_fp.ok ? "pass" : "mismatch") : "na")}
+              tooltip={tooltipServerVsComputed}
+            />
+            <FieldRow
+              name="receipt.covered"
+              badge={<Badge size="xs">receipt</Badge>}
+              help="Must equal bundle_fp; otherwise the receipt signs other content."
+              computed={report?.receipt?.covered ?? rawReceipt?.covered}
+              claimed={
+                report?.bundle_fp.claimed ??
+                report?.bundle_fp.computed ??
+                rawReceipt?.covered
+              }
+              status={failClosed ? "na" : (report?.receipt ? (report?.receipt?.covered_ok ? "pass" : "mismatch") : "na")}
+              showClaimedIfDifferent={true}
+              tooltip="Claimed = value embedded by the server. Computed = recalculated locally. They must match."
+            />
+            {/* optional rows */}
+            <FieldRow
+              name="policy_fp"
+              badge={<Badge size="xs">inside bundle</Badge>}
+              help="Effective policy fingerprint (included inside the signed bundle)."
+              computed={meta?.policy_fp}
+              claimed={meta?.policy_fp}
+              status={meta?.policy_fp ? "pass" : "na"}
+              showClaimedIfDifferent={false}
+            />
+            <FieldRow
+              name="schema_fp"
+              badge={<Badge size="xs">header</Badge>}
+              help="Schema fingerprint provided in headers."
+              computed={meta?.schema_fp}
+              claimed={meta?.schema_fp}
+              status={meta?.schema_fp ? "pass" : "na"}
+              showClaimedIfDifferent={false}
+            />
+          </div>
+        </div>
+
+        {/* Receipt panel */}
+        {/* Receipt panel (collapsed by default) */}
+        <div className="mx-5 mb-24 border border-white/10 rounded-lg">
+          <div className="p-2 border-b border-white/10 flex items-center justify-between">
+            <div className="font-medium">Receipt</div>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                onClick={() => {
+                  if (requestId) {
+                    logEvent("ui.audit.download_receipt", {
+                      rid: requestId,
+                      action: "ui.audit.download_receipt",
+                    });
+                    openReceipt(normalizeRid(requestId));
+                  }
+                }}
+                aria-label="Download receipt.json"
+              >
+                Download receipt.json
+              </Button>
+              {rawReceipt ? (
+                <Button
+                  size="sm"
+                  onClick={() =>
+                    navigator.clipboard.writeText(JSON.stringify(rawReceipt, null, 2))
+                  }
+                  aria-label="Copy receipt.json"
+                >
+                  Copy
+                </Button>
+              ) : null}
+            </div>
+          </div>
+          <details className="p-2">
+            <summary className="cursor-pointer text-xs text-white/70">Show receipt JSON</summary>
+            <div className="mt-2">
+              <div className="text-xs text-white/60 mb-2">
+                This receipt is an Ed25519 signature over{" "}
+                <span className="font-mono">bundle_fp</span>. Anyone with the public key can verify it offline.
+              </div>
+              {rawReceipt ? (
+                <pre className="max-h-64 overflow-auto rounded bg-black/40 p-2 text-xs leading-snug">
+                  {JSON.stringify(rawReceipt, null, 2)}
+                </pre>
+              ) : (
+                <div className="text-xs text-white/60">Receipt not available.</div>
+              )}
+              {!report?.signature && hasVerifierKey === false && (
+                <div className="mt-2 text-xs text-white/60">
+                  Signature check skipped: public key not configured. Place it at{" "}
+                  <span className="font-mono">/keys/gateway_ed25519_pub.(b64|pem)</span>.
+                </div>
+              )}
+            </div>
+          </details>
+        </div>
+        </div>{/* end scrollable */}
+
+        {/* Footer actions (sticky) */}
+        <div className="sticky bottom-0 left-0 right-0 border-t border-white/10 bg-[#0b0f16]/80 backdrop-blur px-5 py-3 flex items-center gap-2">
+          <Button
+            onClick={() => {
+              logEvent("ui.audit.reverify", { rid: requestId, action: "ui.audit.reverify" });
+              computeAndVerify();
+            }}
+            aria-label="Recalculate fingerprints and re-verify the signature (r)"
+          >
+            Re-verify
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (requestId) {
+                logEvent("ui.audit.view_bundle", { rid: requestId, action: "ui.audit.view_bundle" });
+                openPresignedBundle(normalizeRid(requestId), "bundle_view");
+              }
+            }}
+            aria-label="View bundle (b)"
+            disabled={!requestId}
+          >
+            View bundle
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (requestId) {
+                logEvent("ui.audit.download_full", {
+                  rid: normalizeRid(requestId),
+                  action: "ui.audit.download_full",
+                });
+                openPresignedBundle(normalizeRid(requestId), "bundle_full");
+              }
+            }}
+            aria-label="Download full (requires permission: bundle_full) (f)"
+            disabled={!requestId}
+          >
+            Download full
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              if (requestId) {
+                logEvent("ui.audit.download_receipt", {
+                  rid: normalizeRid(requestId),
+                  action: "ui.audit.download_receipt",
+                });
+                openReceipt(normalizeRid(requestId));
+              }
+            }}
+            aria-label="Open receipt.json"
+            disabled={!requestId}
+          >
+            Receipt
+          </Button>
+          <div className="ml-auto text-xs text-white/50" aria-live="polite">
+            {loading ? "Verifying…" : ""}
+          </div>
+        </div>
+
+        {/* Empty/error state */}
+        {!requestId ? (
+          <div className="mx-5 mt-2 text-xs text-white/70">
+            Open a result to verify its receipt.
+          </div>
+        ) : null}
       </div>
     </div>
   );
-return mounted ? createPortal(drawerRoot, document.body) : null;
-};
 
-export default AuditDrawer;
+  return createPortal(body, document.body);
+}

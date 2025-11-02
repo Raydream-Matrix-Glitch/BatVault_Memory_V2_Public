@@ -1,27 +1,24 @@
 from enum import Enum
 
 class ErrorCode(str, Enum):
-    # Policy / OPA
-    OPA_DENY             = "OPA.DENY"
-    OPA_ERROR            = "OPA.ERROR"
-
-    # Validation / Contracts
-    VALIDATION_FAILED    = "VALIDATION.FAILED"
-    CONTRACT_VIOLATION   = "CONTRACT.VIOLATION"
-
-    # Upstream / Networking
-    UPSTREAM_TIMEOUT     = "UPSTREAM.TIMEOUT"
-    UPSTREAM_ERROR       = "UPSTREAM.ERROR"
-
-    # Storage / Object store
-    BUNDLE_SIGNATURE_MISSING = "BUNDLE.SIGNATURE_MISSING"
-    STORAGE_UNAVAILABLE      = "STORAGE.UNAVAILABLE"
-    STORAGE_TIMEOUT          = "STORAGE.TIMEOUT"
-
-    # Cache
-    CACHE_UNAVAILABLE    = "CACHE.UNAVAILABLE"
-
-    # Internal
-    INTERNAL             = "INTERNAL"
+    """
+    Canonical error codes for the public error envelope.
+    Mirrors https://batvault.dev/schemas/error.json
+    """
+    precondition_failed       = "precondition_failed"
+    policy_denied             = "policy_denied"
+    invalid_edge              = "invalid_edge"
+    validation_failed         = "validation_failed"
+    contract_violation        = "contract_violation"
+    opa_error                 = "opa_error"
+    internal                  = "internal"
+    upstream_timeout          = "upstream_timeout"
+    upstream_error            = "upstream_error"
+    storage_unavailable       = "storage_unavailable"
+    storage_timeout           = "storage_timeout"
+    cache_unavailable         = "cache_unavailable"
+    bundle_signature_missing  = "bundle_signature_missing"
+    bundle_signature_invalid  = "bundle_signature_invalid"
+    bundle_verifier_missing   = "bundle_verifier_missing"
 
 __all__ = ["ErrorCode"]

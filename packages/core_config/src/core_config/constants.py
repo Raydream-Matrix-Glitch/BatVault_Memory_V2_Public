@@ -1,16 +1,6 @@
 import os
-import warnings
 from typing import Optional
 
-
-# Legacy byte caps (kept for backward-compat in logs only)
-# Deprecated: MAX_PROMPT_BYTES and SELECTOR_TRUNCATION_THRESHOLD were formerly used
-# to cap prompt sizes and selector truncation thresholds.  These constants are
-# retained for logs only and should not be referenced by services.  All new
-# services must rely on the token-aware budgets below (CONTROL_CONTEXT_WINDOW
-# and SELECTOR_TRUNCATION_THRESHOLD_TOKENS).  See Baseline §5.2.
-MAX_PROMPT_BYTES = int(os.getenv("MAX_PROMPT_BYTES", "8192"))
-SELECTOR_TRUNCATION_THRESHOLD = int(os.getenv("SELECTOR_TRUNCATION_THRESHOLD", "6144"))
 
 # HTTP retry/backoff controls
 HTTP_RETRY_BASE_MS = int(os.getenv("HTTP_RETRY_BASE_MS", "50"))
@@ -79,7 +69,6 @@ TIMEOUT_VALIDATE_MS = int(os.getenv("TIMEOUT_VALIDATE_MS","300"))
 
 # Embedding dimension and alias for back-compat
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "768"))
-SIM_DIM = EMBEDDING_DIM
 HEALTH_PORT = int(os.getenv("BATVAULT_HEALTH_PORT", "8081"))
 
 _STAGE_TIMEOUTS_MS = {

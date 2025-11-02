@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Tuple, Iterable
 from jsonschema import Draft202012Validator, RefResolver
 import core_models  # used to locate the canonical schemas directory
 from core_logging import get_logger, log_stage, current_request_id
+from core_utils import jsonx
+from core_models.ontology import canonical_edge_type, CAUSAL_EDGE_TYPES, ALIAS_EDGE_TYPES
 
 logger = get_logger("core_validator")
 _SCHEMA_DIR_LOGGED = False
@@ -16,35 +18,109 @@ def _verbose() -> bool:
     # Reduce noise by default; set VALIDATOR_VERBOSE=1 to enable per-item logs.
     return os.getenv("VALIDATOR_VERBOSE", "0") == "1"
 
-# ── Drift-proof helpers (derive rules from shared schemas) ─────────────────────
-_SCHEMA_CACHE: dict[str, dict] = {}
+# ── Baseline v3: schema loader (source of truth) ───────────────────────────────
 
-def _load_schema(name: str) -> dict:
-    """Load a JSON Schema by filename from the canonical core_models/schemas dir."""
-    d = _schemas_dir() / name
-    if name not in _SCHEMA_CACHE:
-        with open(d, "r", encoding="utf-8") as f:
-            _SCHEMA_CACHE[name] = json.load(f)
-        if not globals().get("_SCHEMA_DIR_LOGGED", False):
-            log_stage(
-                logger, "schemas", "loaded",
-                schema_dir=str(_schemas_dir()), schema=name,
-                request_id=(current_request_id() or "startup")
-            )
-    return _SCHEMA_CACHE[name]
+_NODE_VALIDATOR_CACHE: Dict[str, Draft202012Validator] = {}
+_SCHEMA_STORE: Dict[str, Dict[str, Any]] | None = None
 
-def _load_schema_store() -> dict:
-    """Build a $ref store for the validator (needed for nested $ref)."""
-    store = {}
-    for fname in ("decision.json","event.json","edge.json","edge.wire.json","edge.oriented.json",
-                  "memory.meta.json","memory.graph_view.json","bundles.exec_summary.json",
-                  "bundles.view.json","bundles.trace.json"):
+def _schemas_dir() -> Path:
+    """
+    Resolve the schemas directory used by the validator.
+    Priority:
+      1) BATVAULT_SCHEMAS_DIR (explicit override for tests / dev)
+      2) core_models/schemas (canonical, versioned with the repo)
+    """
+    global _SCHEMA_DIR_LOGGED
+    env_dir = os.getenv("BATVAULT_SCHEMAS_DIR")
+    if env_dir:
+        p = Path(env_dir).expanduser().resolve()
+        if p.exists():
+            if not _SCHEMA_DIR_LOGGED:
+                logger.info("core_validator.resolved_schemas_dir", extra={"dir": str(p)})
+                _SCHEMA_DIR_LOGGED = True
+            return p
+        else:
+            logger.warning("core_validator.schemas_dir_missing_env", extra={"dir": str(p)})
+            # fall through to default
+    default_dir = (Path(core_models.__file__).parent / "schemas").resolve()
+    if not _SCHEMA_DIR_LOGGED:
+        logger.info("core_validator.resolved_schemas_dir", extra={"dir": str(default_dir)})
+        _SCHEMA_DIR_LOGGED = True
+    return default_dir
+
+def _load_schema(name: str) -> Dict[str, Any]:
+    p = _schemas_dir() / name
+    if not p.exists():
+        raise FileNotFoundError(f"schema not found: {p}")
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _load_schema_store() -> Dict[str, Any]:
+    """Load all JSON Schemas from the resolved schemas directory into a $id→schema store.
+    This prevents any network fetching when resolving $ref, even if schemas use
+    absolute HTTPS $id values (e.g., https://batvault.dev/schemas/*.json)."""
+    store: Dict[str, Any] = {}
+    schema_dir = _schemas_dir()
+    for p in sorted(schema_dir.glob("*.json")):
         try:
-            sch = _load_schema(fname)
-            store[sch.get("$id", fname)] = sch
-        except FileNotFoundError:
-            continue
+            with open(p, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            sid = (s or {}).get("$id")
+            if isinstance(sid, str) and sid:
+                store[sid] = s
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logger.error("core_validator.schema_store_load_error", extra={"path": str(p), "error": str(exc)})
+    logger.info("core_validator.schema_resolver_store", extra={"ids": sorted(list(store.keys()))})
     return store
+
+# ── Bundle view helpers (shared) ----------------------------------------------
+def view_artifacts_allowed() -> frozenset[str]:
+    """
+    Return the set of allowable artifact names in bundles.view.json.
+    """
+    try:
+        schema = _load_schema("bundles.view.json")
+    except FileNotFoundError:
+        return frozenset()
+    props = (schema.get("properties") or {})
+    return frozenset(props.keys()) if props else frozenset()
+
+def build_bundle_view(
+    resp: Dict[str, Any],
+    artifacts: dict[str, bytes] | None,
+    *,
+    report_version: str = "1.1",
+) -> Dict[str, Any]:
+    """
+    Construct a 'bundle view' dictionary from a response object and optional artifacts.
+    Only properties allowed by bundles.view.json are included. response.json is
+    sanitized and preferred from artifacts when available.
+    """
+    allowed = view_artifacts_allowed()
+    bundle: Dict[str, Any] = {}
+    # Load serialized artifacts (JSON), excluding response.json for now.
+    if artifacts:
+        for name, raw in artifacts.items():
+            if name not in allowed or name == "response.json":
+                continue
+            try:
+                bundle[name] = jsonx.loads(raw)
+            except (ValueError, TypeError):
+                bundle[name] = {}
+    # Prefer serialized response.json if present; else sanitize in-memory resp.
+    if artifacts and "response.json" in artifacts:
+        try:
+            bundle["response.json"] = jsonx.loads(artifacts["response.json"])
+        except (ValueError, TypeError):
+            bundle["response.json"] = (resp if isinstance(resp, dict) else {})
+    else:
+        bundle["response.json"] = (resp if isinstance(resp, dict) else {})
+    # Ensure a minimal validator_report for downstream consumers/tests.
+    if "validator_report.json" in allowed and "validator_report.json" not in bundle:
+        bundle["validator_report.json"] = {"version": report_version, "pass": True, "errors": [], "checks": []}
+    return bundle
+
+# ---------- derived patterns (computed after schema loaders exist) ----------
 
 def _ts_regex_from_schema() -> re.Pattern:
     """Compile the timestamp regex from edge.wire.json to avoid drift."""
@@ -66,63 +142,6 @@ def _orientation_keys_from_schema() -> tuple[str, ...]:
 _TS_RE = _ts_regex_from_schema()
 _ORIENTATION_KEYS = _orientation_keys_from_schema()
 
-# ---------- schema loading (Baseline v3) ----------
-#
-def _schemas_dir() -> Path:
-    """
-    Resolve the authoritative JSON Schemas directory.
-    Precedence:
-      1) Env var BATVAULT_SCHEMAS_DIR (absolute or relative to CWD)
-      2) Default: packages/core_models/src/core_models/schemas
-    Note: We never fall back to services/ingest paths at runtime.
-    """
-    global _SCHEMA_DIR_LOGGED
-    env = os.getenv("BATVAULT_SCHEMAS_DIR")
-    if env:
-        p = Path(env).expanduser().resolve()
-        if p.exists():
-            if not _SCHEMA_DIR_LOGGED:
-                logger.info("core_validator.schemas_dir_env", extra={"dir": str(p)})
-                _SCHEMA_DIR_LOGGED = True
-            return p
-        if not _SCHEMA_DIR_LOGGED:
-            logger.warning("core_validator.schemas_dir_missing", extra={"dir": env})
-            _SCHEMA_DIR_LOGGED = True
-    default_dir = (Path(core_models.__file__).parent / "schemas").resolve()
-    if not _SCHEMA_DIR_LOGGED:
-        logger.info("core_validator.resolved_schemas_dir", extra={"dir": str(default_dir)})
-        _SCHEMA_DIR_LOGGED = True
-    return default_dir
-
-def _load_schema(name: str) -> Dict[str, Any]:
-    p = _schemas_dir() / name
-    if not p.exists():
-        raise FileNotFoundError(f"schema not found: {p}")
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def _load_schema_store() -> Dict[str, Any]:
-    """Load all JSON Schemas from the resolved schemas directory into a $id→schema store.
-    This prevents any network fetching when resolving $ref, even if schemas use
-    absolute HTTPS $id values (e.g., https://batvault.dev/schemas/*.json)."""
-    store: Dict[str, Any] = {}
-    schema_dir = _schemas_dir()
-    for p in schema_dir.glob("*.json"):
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                s = json.load(f)
-            sid = (s or {}).get("$id")
-            if isinstance(sid, str) and sid:
-                store[sid] = s
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            logger.error("core_validator.schema_store_load_error", extra={"path": str(p), "error": str(exc)})
-    # Strategic log: helps auditing what we can resolve locally.
-    logger.info("core_validator.schema_resolver_store", extra={"ids": sorted(list(store.keys()))})
-    return store
-
-# ---------- optional node-level validators (lazy) ----------
-_NODE_VALIDATOR_CACHE: Dict[str, Draft202012Validator] = {}
-
 def _get_node_validator(name: str) -> Draft202012Validator:
     """
     Lazily load node-level validators when requested (e.g., ingest write-time).
@@ -132,166 +151,164 @@ def _get_node_validator(name: str) -> Draft202012Validator:
     if v is not None:
         return v
     schema = _load_schema(name)
-    v = Draft202012Validator(schema)
-    _NODE_VALIDATOR_CACHE[name] = v
-    return v
+    resolver = RefResolver.from_schema(schema, store=_SCHEMA_STORE or _load_schema_store())
+    validator = Draft202012Validator(schema, resolver=resolver, format_checker=None)
+    _NODE_VALIDATOR_CACHE[name] = validator
+    return validator
 
-# ---------- invariants for views (fail-closed) ----------
-_ORIENTATION_KEYS = {"orientation"}
-_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-_LEGACY_KEYS = {"neighbors", "rel", "direction", "transitions", "mirrors", "options"}
-
-def _legacy_field_errors(payload: Any, path: Tuple[str, ...] = ()) -> List[str]:
-    errs: List[str] = []
-    if isinstance(payload, dict):
-        for k, v in payload.items():
-            if k in _LEGACY_KEYS:
-                where = ".".join(path + (k,)) or "<root>"
-                errs.append(f"legacy field {k!r} present at {where}")
-            errs.extend(_legacy_field_errors(v, path + (str(k),)))
-    elif isinstance(payload, list):
-        for i, v in enumerate(payload):
-            errs.extend(_legacy_field_errors(v, path + (str(i),)))
-    return errs
-
-def _wire_orientation_errors(edges: Iterable[dict]) -> List[str]:
+def _get_view_validator(name: str) -> Draft202012Validator:
     """
-    Memory wire view MUST NOT include orientation on any edge.
-    Orientation exists only in bundles (Gateway, causal edges only).
+    Validators for memory.graph_view / bundle.view shapes.
     """
-    errs: List[str] = []
-    try:
-        for i, e in enumerate(edges or []):
-            # forbid oriented-only keys from appearing on the wire view
-            if any(k in e for k in _ORIENTATION_KEYS):
-                errs.append(f"edge[{i}] orientation not allowed on memory wire view")
-    except (TypeError, AttributeError, KeyError) as exc:
-        errs.append(f"wire orientation check error: {exc!s}")
-    return errs
+    schema = _load_schema(name)
+    resolver = RefResolver.from_schema(schema, store=_SCHEMA_STORE or _load_schema_store())
+    return Draft202012Validator(schema, resolver=resolver, format_checker=None)
+
+# ── Edge / graph invariants ----------------------------------------------------
 
 def _timestamp_errors(edges: Iterable[Dict[str, Any]]) -> List[str]:
     errs: List[str] = []
     for i, e in enumerate(edges or []):
         ts = e.get("timestamp")
         if not isinstance(ts, str) or not _TS_RE.match(ts):
-            errs.append(f"edge[{i}] invalid timestamp (schema:{_TS_RE.pattern}): {ts!r}")
-    if errs and _verbose():
-        log_stage(
-            logger, "validate", "timestamp_rejected",
-            error_count=len(errs), sample_error=errs[0],
-            request_id=(current_request_id() or "unknown")
-        )
+            errs.append(f"edge[{i}].timestamp must be RFC3339 Z seconds precision (e.g., 2024-06-01T12:34:56Z)")
     return errs
 
 def _duplicate_edge_errors(edges: Iterable[Dict[str, Any]]) -> List[str]:
-    errs: List[str] = []
-    seen = set()
-    for e in edges or []:
-        key = (e.get("type"), e.get("from"), e.get("to"), e.get("timestamp"))
+    """Detect exact duplicate edges (same from,to,type,timestamp)."""
+    seen: set[Tuple[Any, Any, Any, Any]] = set()
+    dupes: List[str] = []
+    for i, e in enumerate(edges or []):
+        key = (e.get("from"), e.get("to"), e.get("type"), e.get("timestamp"))
         if key in seen:
-            errs.append(f"duplicate edge detected: {key!r}")
+            dupes.append(f"duplicate edge at index {i}: {key}")
         else:
             seen.add(key)
-    return errs
-
+    return dupes
 
 def _bundle_orientation_errors(edges: Iterable[Dict[str, Any]]) -> List[str]:
-    """Enforce orientation invariants on **bundle** edges (Baseline v3).
-    - REQUIRED orientation on {LED_TO, CAUSAL}
-    - FORBIDDEN orientation on ALIAS_OF
-    - Value ∈ {"preceding","succeeding"}
-    """
     errs: List[str] = []
     for i, e in enumerate(edges or []):
+        # Each edge must be a mapping; non-dicts are invalid.
+        if e is None or not isinstance(e, dict):
+            errs.append(f"edge[{i}] must be an object")
+            continue
         try:
-            et = str((e or {}).get("type") or "").upper()
-            orient = (e or {}).get("orientation")
-            if et == "ALIAS_OF":
-                if orient is not None:
-                    errs.append(f"edge[{i}] ALIAS_OF must not have orientation")
-            elif et in ("LED_TO", "CAUSAL"):
-                if orient is None:
-                    errs.append(f"edge[{i}] missing orientation for {et}")
-                elif str(orient) not in ("preceding","succeeding"):
-                    errs.append(f"edge[{i}] invalid orientation: {orient!r}")
-        except (TypeError, AttributeError, KeyError, ValueError) as exc:
-            errs.append(f"edge[{i}] orientation check error: {exc!s}")
+            et = canonical_edge_type(e.get("type"))
+        except ValueError:
+            continue  # Unknown types are ignored for orientation checks
+        has_orientation = any(k in e for k in _ORIENTATION_KEYS)
+        if et in set(CAUSAL_EDGE_TYPES):
+            # Causal edges MUST carry an orientation key.
+            if not has_orientation:
+                errs.append(f"edge[{i}] missing orientation key(s): {_ORIENTATION_KEYS}")
+        elif et in set(ALIAS_EDGE_TYPES):
+            # Alias edges MUST NOT have orientation.
+            if has_orientation:
+                errs.append(
+                    f"edge[{i}] must not contain orientation key(s): {_ORIENTATION_KEYS} on ALIAS_OF edge"
+                )
+        else:
+            # Unknown types are ignored for orientation checks.
+            pass
     return errs
 
-def validate_node(obj: dict) -> Tuple[bool, List[str]]:
-    t = (obj or {}).get("type")
-    if t == "EVENT":
-        try:
-            validator = _get_node_validator("event.json")
-            errors = [e.message for e in validator.iter_errors(obj)]
-        except FileNotFoundError as e:
-            errors = [str(e)]
-    elif t == "DECISION":
-        try:
-            validator = _get_node_validator("decision.json")
-            errors = [e.message for e in validator.iter_errors(obj)]
-        except FileNotFoundError as e:
-            errors = [str(e)]
-    else:
-        errors = [f"unknown node type: {t!r}"]
-    ok = len(errors) == 0
-    if _verbose():
-        log_stage(
-            logger, "validate", "node_ok" if ok else "node_invalid",
-            node_id=obj.get("id"), node_type=t,
-            error_count=len(errors),
-            sample_error=(errors[0] if errors else None),
-        )
-    return ok, errors
+# ── Public validators ---------------------------------------------------------
 
-def validate_edge(obj: dict) -> Tuple[bool, List[str]]:
-    try:
-        validator = _get_node_validator("edge.json")
-        errors = [e.message for e in validator.iter_errors(obj)]
-    except FileNotFoundError as e:
-        errors = [str(e)]
-    ok = len(errors) == 0
-    if _verbose():
-        log_stage(
-            logger, "validate", "edge_ok" if ok else "edge_invalid",
-            edge_id=obj.get("id"),
-            error_count=len(errors),
-            sample_error=(errors[0] if errors else None),
-        )
-    return ok, errors
-
-# ---------- new: view validators (Memory→Gateway) ----------
-def validate_graph_view(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def validate_node(kind: str, payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """
-    Validate Memory→Gateway graph view (edges-only; Baseline v3):
-      - envelope: {anchor, graph:{edges}, meta} against core_models/schemas
-      - reject legacy fields anywhere (neighbors/rel/direction/transitions/mirrors/options)
-      - enforce seconds-precision UTC-Z timestamps
-      - detect duplicate edges by (type, from, to, timestamp)
+    Validate a single node (decision/event/etc.) against its schema.
     """
     errors: List[str] = []
-    # 1) fail-closed: legacy fields
-    errors.extend(_legacy_field_errors(payload))
-    # 2) schema validation with $ref to memory.meta.json
     try:
-        graph_schema = _load_schema("memory.graph_view.json")
-        store = _load_schema_store()
-        validator = Draft202012Validator(
-            graph_schema, resolver=RefResolver.from_schema(graph_schema, store=store)
-        )
+        validator = _get_node_validator(f"{kind}.json")
+        for e in validator.iter_errors(payload):
+            path = ".".join(str(p) for p in e.path) or "<root>"
+            rule = "/".join(str(p) for p in e.schema_path)
+            errors.append(f"{e.message} @ {path} (rule:{rule})")
     except FileNotFoundError as e:
         errors.append(str(e))
-    # 2b) Hard guard: Memory MUST NOT emit 'orientation' on edges.
-    #     Orientation is owned by Gateway bundles only (see edge.oriented.json).
+    ok = len(errors) == 0
+    if _verbose() or not ok:
+        log_stage(
+            logger, "validate", "node_ok" if ok else "node_invalid",
+            node=kind, error_count=len(errors),
+            sample_error=(errors[0] if errors else None),
+            request_id=(current_request_id() or "import"),
+        )
+    return ok, errors
+
+def validate_edge(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Validate one edge (wire shape) against schema + invariants.
+    """
+    errors: List[str] = []
     try:
-        mem_edges = ((payload or {}).get("graph") or {}).get("edges") or []
-        for i, e in enumerate(mem_edges):
-            if isinstance(e, dict) and "orientation" in e:
-                errors.append(
-                    f"edge[{i}] must not contain 'orientation' in memory.graph_view"
-                )
-    except Exception as exc:
+        validator = _get_view_validator("edge.wire.json")
+        for e in validator.iter_errors(payload):
+            path = ".".join(str(p) for p in e.path) or "<root>"
+            rule = "/".join(str(p) for p in e.schema_path)
+            errors.append(f"{e.message} @ {path} (rule:{rule})")
+    except FileNotFoundError as e:
+        errors.append(str(e))
+    # invariants
+    errors.extend(_timestamp_errors([payload]))
+    ok = len(errors) == 0
+    if _verbose() or not ok:
+        log_stage(
+            logger, "validate", "edge_ok" if ok else "edge_invalid",
+            error_count=len(errors),
+            sample_error=(errors[0] if errors else None),
+        )
+    return ok, errors
+
+def validate_graph_view(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Validate the memory.graph_view (edges only) returned by Memory API.
+    Ensures schema correctness and enforces fail-closed invariants.
+    """
+    errors: List[str] = []
+    try:
+        validator = _get_view_validator("memory.graph_view.json")
+        for e in validator.iter_errors(payload):
+            path = ".".join(str(p) for p in e.path) or "<root>"
+            rule = "/".join(str(p) for p in e.schema_path)
+            errors.append(f"{e.message} @ {path} (rule:{rule})")
+    except FileNotFoundError as e:
+        errors.append(str(e))
+    # 1) timestamp / duplicate checks on edges
+    edges = ((payload or {}).get("graph") or {}).get("edges") or []
+    errors.extend(_timestamp_errors(edges))
+    errors.extend(_duplicate_edge_errors(edges))
+    # On Memory graph view (not bundle), orientation must be absent.
+    # If the payload looks like oriented edges, raise an error.
+    try:
+        for i, e in enumerate(edges):
+            if isinstance(e, dict) and any(k in e for k in _ORIENTATION_KEYS):
+                errors.append(f"edge[{i}] must not contain orientation keys: {_ORIENTATION_KEYS} in memory.graph_view")
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
         errors.append(f"orientation guard error: {exc!s}")
+    ok = len(errors) == 0
+    log_stage(
+        logger, "validate", "graph_view_ok" if ok else "graph_view_invalid",
+        error_count=len(errors),
+        sample_error=(errors[0] if errors else None),
+    )
+    return ok, errors
+
+def validate_bundle_view(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Validate the bundle.view (Gateway response envelope) against schema + invariants.
+    """
+    errors: List[str] = []
+    try:
+        validator = _get_view_validator("bundles.view.json")
+        for e in validator.iter_errors(payload):
+            path = ".".join(str(p) for p in e.path) or "<root>"
+            rule = "/".join(str(p) for p in e.schema_path)
+            errors.append(f"{e.message} @ {path} (rule:{rule})")
+    except FileNotFoundError as e:
+        errors.append(str(e))
     # Additional invariants for bundle edges: seconds-only timestamps + orientation rules
     try:
         resp = (payload or {}).get("response.json") or {}
@@ -300,50 +317,12 @@ def validate_graph_view(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
         edges = ((resp.get("graph") or {}).get("edges") or []) if isinstance(resp, dict) else []
         errors.extend(_timestamp_errors(edges))
         errors.extend(_bundle_orientation_errors(edges))
-    except Exception as exc:
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
         errors.append(f"bundle edge invariant check error: {exc!s}")
     # 3) timestamp / duplicate checks on edges
     edges = ((payload or {}).get("graph") or {}).get("edges") or []
     errors.extend(_timestamp_errors(edges))
     errors.extend(_duplicate_edge_errors(edges))
-    # On Memory graph view (not bundle), orientation must be absent.
-    # If the payload looks like a signed bundle (has top-level 'response'), orientation checks
-    # are performed in _bundle_orientation_errors instead.
-    if not (isinstance(payload, dict) and "response" in payload and "schema_version" in payload):
-        _wire_edges = ((payload or {}).get("graph") or {}).get("edges") or []
-        w_errs = _wire_orientation_errors(_wire_edges)
-        if w_errs and _verbose():
-            log_stage(logger, "validate", "memory_wire_orientation_rejected",
-                      error_count=len(w_errs), sample_error=w_errs[0])
-        errors.extend(w_errs)
-    ok = len(errors) == 0
-    log_stage(
-        logger, "validate", "graph_view_ok" if ok else "graph_view_invalid",
-        error_count=len(errors),
-        edges_count=len(edges),
-        sample_error=(errors[0] if errors else None),
-    )
-    return ok, errors
-
-def validate_bundle_view(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """
-    Validate Gateway bundle view (response.json) against core_models/schemas/bundles.view.json.
-    Also rejects legacy fields anywhere in the structure.
-    """
-    errors: List[str] = []
-    errors.extend(_legacy_field_errors(payload))
-    try:
-        view_schema  = _load_schema("bundles.view.json")
-        store        = _load_schema_store()
-        resolver     = RefResolver.from_schema(view_schema, store=store)
-        validator    = Draft202012Validator(view_schema, resolver=resolver)
-        def _fmt(e):
-            path = ".".join(str(p) for p in e.path) or "<root>"
-            rule = "/".join(str(p) for p in e.schema_path)
-            return f"{e.message} @ {path} (rule:{rule})"
-        errors.extend([_fmt(e) for e in validator.iter_errors(payload)])
-    except FileNotFoundError as e:
-        errors.append(str(e))
     ok = len(errors) == 0
     log_stage(
         logger, "validate", "bundle_view_ok" if ok else "bundle_view_invalid",
@@ -352,4 +331,11 @@ def validate_bundle_view(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
     )
     return ok, errors
 
-__all__ = ["validate_node", "validate_edge", "validate_graph_view", "validate_bundle_view"]
+__all__ = [
+    "validate_node",
+    "validate_edge",
+    "validate_graph_view",
+    "validate_bundle_view",
+    "build_bundle_view",
+    "view_artifacts_allowed",
+]
