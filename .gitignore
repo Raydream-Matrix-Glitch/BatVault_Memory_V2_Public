@@ -58,5 +58,6 @@ packages/core_models_gen/
 .tools/
 
 # local scripts you don't want
-scripts/*.sh
-scripts/*.py
+scripts/__pycache__/
+scripts/*.log
+scripts/*.tmp
