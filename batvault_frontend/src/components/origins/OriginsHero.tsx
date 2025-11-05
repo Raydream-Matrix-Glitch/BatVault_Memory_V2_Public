@@ -5,13 +5,14 @@ import AnimationController from "./AnimationController";
 import VaultLayout from "./VaultLayout";
 import useHeroLayout, { ScaleContext } from "./useHeroLayout";
 import CaseStudyContent from "./CaseStudyContent";  
+import { logEvent } from "../../utils/logger";
 
 
 export default function OriginsHero() {
   // compute the responsive scale for the logo & nav
   const responsiveScale = useHeroLayout();
 
-  console.debug("[OriginsHero] rendering with responsiveScale:", responsiveScale);
+  logEvent("ui.origins_render", { responsiveScale });
 
     // ① create a ref for the next page anchor
   const nextPageRef = useRef<HTMLDivElement>(null);

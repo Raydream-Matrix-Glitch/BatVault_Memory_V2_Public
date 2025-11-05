@@ -104,6 +104,7 @@ export default function App() {
               <Suspense fallback={<RouteLoader />}>
                 <Routes>
                   <Route path="/" element={<OriginsRoute />} />
+                  <Route path="/origins" element={<OriginsRoute />} />
                   <Route path="/memory" element={<MemoryRoute />} />
                   <Route path="/collective" element={<LoginPage />} />
                   <Route path="/collective/success" element={<SuccessScreen />} />

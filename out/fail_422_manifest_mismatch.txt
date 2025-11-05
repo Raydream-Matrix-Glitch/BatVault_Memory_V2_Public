@@ -1,0 +1,9 @@
+HTTP/1.1 422 Unprocessable Entity
+date: Sun, 02 Nov 2025 17:53:17 GMT
+server: uvicorn
+content-length: 624
+content-type: application/json
+x-trace-id: 897021633df52f4a494fc8e4c9b92d90
+x-request-id: 9d8ce80640ff41bd
+
+{"version":"1.1","pass":false,"errors":[{"code":"validation_failed","msg":"'deadbeef' does not match '^[0-9a-f]{64}$' @ bundle.manifest.json.artifacts.2.sha256 (rule:properties/bundle.manifest.json/properties/artifacts/items/properties/sha256/pattern)"},{"code":"manifest_mismatch","issues":[{"code":"manifest_sha_mismatch","name":"trace.json"}]}],"checks":[{"name":"bundle_schema","ok":false},{"name":"policy_fp_applied","ok":true},{"name":"bundle_inventory","ok":true},{"name":"signature_verify","ok":true},{"name":"manifest_integrity","ok":false},{"name":"edge_schema","ok":true},{"name":"allowed_ids_subset","ok":true}]}

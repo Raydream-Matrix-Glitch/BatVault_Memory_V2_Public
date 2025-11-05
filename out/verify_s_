@@ -1,0 +1,8 @@
+{
+  "pass": true,
+  "checks": {
+    "signature_verify": true,
+    "bundle_schema": true,
+    "manifest_integrity": true
+  }
+}

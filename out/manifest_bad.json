@@ -1,0 +1,22 @@
+{
+  "artifacts": [
+    {
+      "name": "response.json",
+      "bytes": 2304,
+      "sha256": "3fff749f3e5fa0a61f381195345d6a2945420e626dd3c35260bccb50ac8ec960",
+      "content_type": "application/json"
+    },
+    {
+      "name": "receipt.json",
+      "bytes": 256,
+      "sha256": "20e8e4b6db47224f2231829bdcac6c7e367a6e0851fc6b5fe9f1fe492f6e227c",
+      "content_type": "application/json"
+    },
+    {
+      "name": "trace.json",
+      "bytes": 986,
+      "sha256": "deadbeef",
+      "content_type": "application/json"
+    }
+  ]
+}

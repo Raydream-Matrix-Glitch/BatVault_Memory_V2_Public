@@ -526,16 +526,23 @@ def _minio_put_batch(request_id: str, artifacts: Mapping[str, bytes]) -> None:
 
     # Build and upload named bundles (view/full) and sidecar index
     try:
-        # Ensure _meta.json is available in artifacts
-        if "_meta.json" not in artifacts:
+        # Work on a copy so we don't mutate the caller's artifacts
+        artifacts_for_bundles = dict(artifacts)
+        # IMPORTANT:
+        # if builder already dropped a full bundle.manifest.json into artifacts,
+        # we must not reuse it for the view archive – let core_storage.artifact_index
+        # derive the right manifest per bundle.
+        artifacts_for_bundles.pop("bundle.manifest.json", None)
+        # Ensure _meta.json is available in artifacts_for_bundles (keep existing behaviour)
+        if "_meta.json" not in artifacts_for_bundles:
             pass
         # Build (view/full) named bundles strictly by taxonomy
         bundle_map = {
-            "bundle_view": [fn for fn in VIEW_BUNDLE_FILES if fn in artifacts],
-            "bundle_full": sorted(list(artifacts.keys())),
+            "bundle_view": [fn for fn in VIEW_BUNDLE_FILES if fn in artifacts_for_bundles],
+            "bundle_full": sorted(list(artifacts_for_bundles.keys())),
         }
         _t_bundle = time.perf_counter()
-        named_bundles, meta_bytes = build_named_bundles(artifacts, bundle_map)
+        named_bundles, meta_bytes = build_named_bundles(artifacts_for_bundles, bundle_map)
         upload_named_bundles(client, settings.minio_bucket, request_id, named_bundles, meta_bytes)
         try:
             # Audit-only timing (cannot retrofit into already-sent meta)
@@ -611,20 +618,56 @@ async def verify_bundle(body: dict):
     from core_utils import jsonx
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="invalid_json")
+
+    # --- Shape adapter: accept FE bundle_view shape and normalise to direct shape ---
+    # bundle_view = { "response.json": "<json>", "receipt.json": "<json>", "trace.json": "<json>", "bundle.manifest.json": "<json>" }
+    if isinstance(body.get("bundle_view"), dict):
+        bv = body["bundle_view"]
+        def _decode_json_str(x):
+            if isinstance(x, str):
+                try:
+                    return jsonx.loads(x)
+                except (ValueError, TypeError):
+                    return None
+            return x if isinstance(x, dict) else None
+        body.setdefault("response", _decode_json_str(bv.get("response.json")))
+        body.setdefault("receipt",  _decode_json_str(bv.get("receipt.json")))
+        _t = _decode_json_str(bv.get("trace.json"))
+        if _t is not None:
+            body.setdefault("trace", _t)
+        _m = _decode_json_str(bv.get("bundle.manifest.json"))
+        if _m is not None:
+            body.setdefault("manifest", _m)
+
+    # Also accept JSON strings posted directly in fields (script-friendly).
+    for _k in ("response", "receipt", "trace", "manifest"):
+        v = body.get(_k)
+        if isinstance(v, str):
+            try:
+                body[_k] = jsonx.loads(v)
+            except (ValueError, TypeError):
+                # keep observable – malformed user payloads should be explainable
+                log_stage(
+                    logger, "verify", "json_field_decode_failed",
+                    field=_k,
+                )
+
+    # Required fields after normalisation (must be dicts)
     missing: list[str] = []
-    if "response" not in body:
+    if not isinstance(body.get("response"), dict):
         missing.append("response")
-    if "receipt" not in body:
+    if not isinstance(body.get("receipt"), dict):
         missing.append("receipt")
     if missing:
         _rid = generate_request_id()
-        # strategic logging: FE/script can see exactly which field was missing
         log_stage(
             logger, "verify", "missing_required_fields",
-            request_id=_rid,
-            missing=missing,
+            request_id=_rid, missing=missing, expect=["response","receipt"],
         )
-        raise HTTPException(status_code=400, detail="missing_required_fields")
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "missing_required_fields", "missing": missing}
+        )
 
     envelope = body.get("response") or {}
     receipt  = body.get("receipt") or {}
@@ -646,6 +689,16 @@ async def verify_bundle(body: dict):
     if isinstance(body.get("manifest"), dict):
         artifacts["bundle.manifest.json"] = jsonx.dumps(body["manifest"]).encode("utf-8")
     report = _run_validator(envelope, artifacts=artifacts, request_id=rid)
+    # If validation fails, emit a concise pointer to the first error for easier triage
+    if not report.get("pass"):
+        errs = report.get("errors") if isinstance(report.get("errors"), list) else []
+        _e0 = errs[0] if errs and isinstance(errs[0], dict) else {}
+        log_stage(
+            logger, "validate", "bundle_view_invalid",
+            request_id=rid,
+            sample_error=_e0.get("message"),
+            path=_e0.get("path"),
+        )
     log_stage(
         logger, "verify", "report_ready",
         passed=bool(report.get("pass")), checks=len(report.get("checks", [])),
@@ -1162,7 +1215,6 @@ async def v3_query(
                             pass
             except (OSError, RuntimeError, ValueError, TypeError) as exc:
                 log_stage(logger, "idem", "idem.error", request_id=req_id, error=type(exc).__name__)
-
         try:
             log_stage(logger, "request", "v3_query_end", request_id=req_id)
         except (RuntimeError, ValueError, TypeError):
@@ -1584,18 +1636,18 @@ async def get_bundle(request_id: str, name: str = Query("bundle_view", pattern="
         allowed = set(VIEW_BUNDLE_FILES)
         bundle = {k: v for k, v in (bundle or {}).items() if k in allowed}
     if not bundle:
-        log_stage(logger, "bundle", "pending_upload",
-                  request_id=rid, raw_rid=request_id, hint="No artifacts under prefix; likely async upload still in-flight")
-        # Prefer 202 to guide FE into short backoff rather than surfacing 404
-        return JSONResponse(
-            status_code=202,
-            headers={"Retry-After": "1"},
-            content={
-                "status": "pending",
-                "error": "bundle_not_found",
-                "message": "Artifacts not available yet for this request.",
-                "hint": "Retry shortly; check for 'minio_put_batch_ok' / 'index_build_or_upload_failed' in gateway logs.",
-            },
+        # CLI endpoints must fail hard – JSON 202 confuses tar consumers
+        log_stage(
+            logger,
+            "bundle",
+            "tar_not_available",
+            request_id=rid,
+            bundle=name,
+            hint="no archive and no expanded artifacts under prefix",
+        )
+        raise HTTPException(
+            status_code=404,
+            detail="bundle archive not available",
         )
     content: dict[str, Any] = {}
     for fname, blob in bundle.items():
@@ -1608,7 +1660,7 @@ async def get_bundle(request_id: str, name: str = Query("bundle_view", pattern="
                     # log the transformation for observability
                     try:
                         log_stage(logger, "bundle", "download.binary_base64", request_id=request_id, file=fname)
-                    except Exception as log_exc:  # keep tight: logging must not break download
+                    except (RuntimeError, ValueError, TypeError, OSError) as log_exc:
                         logger.warning(
                             "bundle.download.binary_base64.log_failed",
                             extra={"request_id": request_id, "file": fname, "error": type(log_exc).__name__},
@@ -1647,44 +1699,6 @@ async def get_bundle(request_id: str, name: str = Query("bundle_view", pattern="
     except (ValueError, TypeError):
         headers = {}
     return JSONResponse(content=content, headers=headers)
-
-@router.get("/bundles/{request_id}.tar", include_in_schema=False)
-async def get_bundle_tar(request_id: str, name: str = Query("bundle_view", pattern="^(bundle_view|bundle_full)$")):
-    """Return the artifact bundle as a TAR archive (exec-friendly).
-    Pull from hot cache; fall back to MinIO when needed."""
-    rid = _normalize_request_id_for_minio(request_id)
-    bundle = _load_bundle_dict(rid)
-    if not bundle:
-        log_stage(logger, "bundle", "pending_upload",
-                  request_id=rid, raw_rid=request_id, hint="No artifacts under prefix; likely async upload still in-flight")
-        return JSONResponse(
-            status_code=202,
-            headers={"Retry-After": "1"},
-            content={
-                "status": "pending",
-                "error": "bundle_not_found",
-                "message": "Artifacts not available yet for this request.",
-                "hint": "Retry shortly; check for 'minio_put_batch_ok' / 'index_build_or_upload_failed' in gateway logs.",
-            },
-        )
-
-    import tarfile, io, json as _json
-    buf = io.BytesIO()
-    with tarfile.open(mode="w", fileobj=buf) as tar:
-        # individual artifacts
-        for fname, blob in bundle.items():
-            data = blob if isinstance(blob, (bytes, bytearray)) else str(blob).encode()
-            ti = tarfile.TarInfo(name=fname)
-            ti.size = len(data)
-            ti.mtime = int(time.time())
-            tar.addfile(ti, io.BytesIO(data))
-    buf.seek(0)
-
-    from datetime import datetime as _dt, timezone as _tz
-    date_str = _dt.now(_tz.utc).strftime("%Y%m%d")
-    filename = f"evidence-{rid}-{date_str}.tar"
-    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
-    return Response(content=buf.getvalue(), headers=headers, media_type="application/x-tar")
 
 @router.get("/bundles/{request_id}/receipt.json", include_in_schema=False)
 async def get_bundle_receipt(request_id: str):

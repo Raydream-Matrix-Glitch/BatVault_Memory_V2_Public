@@ -1,0 +1,9 @@
+HTTP/1.1 412 Precondition Failed
+date: Sun, 02 Nov 2025 17:52:23 GMT
+server: uvicorn
+content-type: application/json
+content-length: 33
+x-trace-id: b4a19b4c5bc67824d40422c535919d32
+x-request-id: 73a59e17d667471a
+
+{"detail":"precondition:missing"}

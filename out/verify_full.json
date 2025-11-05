@@ -1,0 +1,1 @@
+{"version":"1.1","pass":true,"errors":[],"checks":[{"name":"bundle_schema","ok":true},{"name":"policy_fp_applied","ok":true},{"name":"bundle_inventory","ok":true},{"name":"signature_verify","ok":true},{"name":"manifest_integrity","ok":true},{"name":"edge_schema","ok":true},{"name":"allowed_ids_subset","ok":true}]}
