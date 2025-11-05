@@ -1,11 +1,112 @@
-python3 -m venv .venv
-. .venv/bin/activate
-python -m ensurepip --upgrade
-python -m pip install -r requirements/runtime.txt
-scripts/codegen_schemas.sh
-python3 scripts/generate_ed25519_keypair.py # You may generate your own private and public keypair and copy it into the .env or simply use the ones provided. In latter case, skip this step.
+# BatVault — Minimal local run (no curls)
+
+BatVault turns decisions into **first-class, verifiable records** (signed receipts) bound to a
+point-in-time snapshot and scoped by policy. AI is optional; deterministic fallbacks are built in.
+
+This README is intentionally short: **copy env → docker compose up --build → seed → open localhost**.
+
+---
+
+## 1) Prerequisites
+- **Docker** & **Docker Compose**
+
+---
+
+## 2) One-time setup
+From the repo root:
+```
+cp .env.example .env
+```
+> You can usually keep defaults.
+
+---
+
+## 2.1) Run code-gen scripts
+
+From the repo root:
+
 scripts/build_frontend.sh
-scripts/seed_memory.sh
+scripts/codegen_schemas.sh
 
+> if permission issues arise run below and rerun the initial commands:
 
-Change Log and Next Planned. 
+chmod +x scripts/build_frontend.sh scripts/codegen_schemas.sh
+
+## 3) Bring up the stack (builds the FE for you)
+This brings up the DB, cache, object store, policy engine, APIs and the frontend. The **frontend image build**
+automatically runs code generation and `vite build` inside the Dockerfile.
+
+```
+docker compose up --build
+```
+
+**What’s running (ports):**
+- **Frontend (UI)** → http://localhost:5173
+- **Gateway (v3)** → http://localhost:8081
+- **Memory API** → http://localhost:8082
+- **Edge (BFF)** → http://localhost:8080
+- **ArangoDB** → http://localhost:8529
+- **MinIO** → console http://localhost:9001 (S3 at :9000)
+- **OPA** → http://localhost:8181
+- **OTel Collector** → 4317/4318 (internal)
+
+Notes:
+- `frontend` depends on `api_edge` health; `api_edge` depends on `gateway`, `redis`, `minio`.
+- `bootstrap` waits for Arango and sets up schema/indexes.
+
+---
+
+## 4) Seed memory (sample data)
+This loads the provided fixtures so you can try a sample decision immediately.
+
+bash scripts/seed_memory.sh
+```
+This script runs:
+```
+docker compose exec -T ingest python -m ingest.cli seed /app/memory/fixtures
+```
+Fixtures live in `memory/fixtures` (e.g. `decisions.json`, `events.json`, `edges.json`).
+
+---
+
+## 5) Open the app
+Go to **http://localhost:5173**.
+
+- Enter a **decision reference** in the UI, e.g.:
+  - `eng#d-eng-010`
+- The UI talks to:
+  -  **Gateway** (8081)
+  -  **Edge** (8080)
+  - **Memory API** (8082)
+  - (Configured in the FE; already wired in the image.)
+
+---
+
+## 6) Stop / clean up
+docker compose down
+```
+To remove local data entirely:
+docker compose down -v
+rm -rf docker-data/
+```
+
+---
+
+## 7) Troubleshooting (minimal)
+- **Frontend shows proxy errors** → Ensure the services above are healthy; re-run `docker compose up -d`.
+- **Policy/403 on expand/enrich** → You’re hitting masked nodes; dev roles/policy are loaded from `policy/roles`.
+- **Health checks failing** → Give containers ~15–30s on first boot (images build + DB init).
+
+---
+
+## 8 Disclaimer
+
+This README intentionally omits a number of aspects, which will be added at a later stage.
+
+---
+
+## 9) Changelog
+- **v0.1.1** — Minimal README added
+
+## 10) Backlog
+- Improve observability streamlining logs and OTEL, Grafana, Dashboards audit
